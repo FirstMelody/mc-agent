@@ -1,0 +1,151 @@
+plugins {
+    id 'java-library'
+    id 'net.neoforged.moddev' version '2.0.140'
+}
+version = project.mod_version
+group = project.maven_group
+base { archivesName = project.archives_base_name }
+java { toolchain.languageVersion = JavaLanguageVersion.of(21); withSourcesJar() }
+
+neoForge {
+    version = project.neo_version
+    // Dev smoke server mirrors the target production server as closely as possible.
+    runs {
+        server {
+            server()
+            programArgument '--nogui'
+            gameDirectory = file('build/smoke-server')
+            jvmArgument '-Xmx2G'
+        }
+        // Mirrors the production mod set closely enough to reproduce mod-interaction failures
+        // (kubejs datapack sync, sable join hook) that a bare JEI environment cannot.
+        reproServer {
+            server()
+            programArgument '--nogui'
+            gameDirectory = file('build/repro-server')
+            jvmArgument '-Xmx2G'
+        }
+    }
+    mods { mcagent { sourceSet sourceSets.main } }
+}
+
+repositories {
+    mavenCentral()
+    maven {
+        name = 'BlameJared'
+        url = 'https://maven.blamejared.com'
+    }
+}
+
+dependencies {
+    // JEI is BOTH-sided; we only ever touch its server-safe mezz.jei.api surface.
+    compileOnly "mezz.jei:jei-1.21.1-neoforge-api:19.44.0.401"
+    // Runtime/dev-server uses the same full JEI jar the production server ships.
+    runtimeOnly "mezz.jei:jei-1.21.1-neoforge:19.44.0.401"
+}
+
+processResources {
+    inputs.property 'version', project.version
+    filesMatching('META-INF/neoforge.mods.toml') { expand mod_version: project.version }
+}
+tasks.withType(JavaCompile).configureEach { options.encoding = 'UTF-8' }
+tasks.withType(Javadoc).configureEach { options.encoding = 'UTF-8' }
+
+// --- hot-reload packaging --------------------------------------------------------------------
+// The mod jar keeps the permanent core; com.melody.mcagent.rt.* ships separately and is loaded at
+// runtime by RuntimeHost, so that changing behaviour does not need a server restart. Splitting is
+// done here, at packaging time, rather than with a second Gradle project: one compilation unit is
+// what keeps the runtime able to reference core types without a build-order dance.
+
+def runtimeJar = tasks.register('runtimeJar', Jar) {
+    group = 'build'
+    description = 'Packages the replaceable runtime (com.melody.mcagent.rt.*) into build/libs/mcagent-runtime.jar.'
+    archiveFileName = 'mcagent-runtime.jar'
+    destinationDirectory = layout.buildDirectory.dir('libs')
+    from sourceSets.main.output
+    include 'com/melody/mcagent/rt/**'
+    manifest {
+        attributes(
+                'Implementation-Title': 'MC Agent runtime',
+                'Implementation-Version': project.mod_version
+        )
+    }
+}
+
+// A runtime class must never end up in the mod jar as well: NeoForge would load that copy and the
+// loaded-from-disk one would be shadowed by it.
+tasks.named('jar', Jar) {
+    exclude 'com/melody/mcagent/rt/**'
+}
+tasks.named('assemble') { dependsOn runtimeJar }
+
+/**
+ * Fails the build if any core class references com.melody.mcagent.rt.
+ *
+ * <p>The rule this enforces is the whole design: core must not be able to keep a runtime object
+ * alive, or a reload leaks the previous class loader. A byte scan is enough because a reference to a
+ * type is stored in the constant pool as its internal name, with slashes.
+ */
+tasks.register('checkRuntimeBoundary') {
+    group = 'verification'
+    description = 'Fails if a core class under com/melody/mcagent references com/melody/mcagent/rt.'
+    dependsOn tasks.named('classes')
+    def classesDir = layout.buildDirectory.dir('classes/java/main')
+    inputs.dir(classesDir)
+    doLast {
+        def coreRoot = new File(classesDir.get().asFile, 'com/melody/mcagent')
+        def needle = 'com/melody/mcagent/rt'.getBytes('UTF-8')
+        def violations = []
+        if (coreRoot.exists()) {
+            coreRoot.eachFileRecurse { file ->
+                if (!file.name.endsWith('.class')) {
+                    return
+                }
+                def relative = coreRoot.toPath().relativize(file.toPath()).toString().replace('\\', '/')
+                if (relative.startsWith('rt/')) {
+                    return
+                }
+                if (containsBytes(file, needle)) {
+                    violations << relative
+                }
+            }
+        }
+        if (!violations.isEmpty()) {
+            throw new GradleException('Core classes reference com.melody.mcagent.rt: ' + violations
+                    + '. Core must only talk to the runtime through com.melody.mcagent.AgentRuntime.')
+        }
+        logger.lifecycle('Runtime boundary OK: no core class references com.melody.mcagent.rt')
+    }
+}
+tasks.named('check') { dependsOn 'checkRuntimeBoundary' }
+
+/** Naive byte search; class files are small enough that a smarter scan buys nothing. */
+static boolean containsBytes(File file, byte[] needle) {
+    // ISO-8859-1 maps bytes to chars one-to-one, so this is a byte-subsequence search.
+    return new String(file.bytes, 'ISO-8859-1').contains(new String(needle, 'ISO-8859-1'))
+}
+
+/**
+ * Stage a local deployment into the dev smoke server: core jar into mods/, runtime jar into
+ * mcagent-runtime/. A real server wants the same two files in the same two places.
+ */
+tasks.register('deploySmokeServer') {
+    group = 'mcagent'
+    description = 'Copies the mod jar to build/smoke-server/mods and the runtime jar to build/smoke-server/mcagent-runtime.'
+    dependsOn tasks.named('jar'), runtimeJar
+    def jarTask = tasks.named('jar', Jar)
+    doLast {
+        def modsDir = file('build/smoke-server/mods')
+        def runtimeDir = file('build/smoke-server/mcagent-runtime')
+        modsDir.mkdirs()
+        runtimeDir.mkdirs()
+        java.nio.file.Files.copy(jarTask.get().archiveFile.get().asFile.toPath(),
+                new File(modsDir, jarTask.get().archiveFileName.get()).toPath(),
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+        java.nio.file.Files.copy(runtimeJar.get().archiveFile.get().asFile.toPath(),
+                new File(runtimeDir, runtimeJar.get().archiveFileName.get()).toPath(),
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+        logger.lifecycle("Deployed ${jarTask.get().archiveFileName.get()} -> ${modsDir}")
+        logger.lifecycle("Deployed ${runtimeJar.get().archiveFileName.get()} -> ${runtimeDir}")
+    }
+}

@@ -1,0 +1,35 @@
+modLoader="javafml"
+loaderVersion="[4,)"
+license="MIT"
+
+[[mods]]
+modId="mcagent"
+version="${mod_version}"
+displayName="MC Agent"
+description='''
+Server-side LLM-driven virtual players for Minecraft.
+Bots are real ServerPlayer instances with genuine client-side pathfinding,
+strict sight-based perception, and a server-authoritative knowledge layer.
+'''
+authors="Melody"
+
+[[dependencies.mcagent]]
+    modId="neoforge"
+    type="required"
+    versionRange="[21.1.248,)"
+    ordering="NONE"
+    side="BOTH"
+
+[[dependencies.mcagent]]
+    modId="minecraft"
+    type="required"
+    versionRange="[1.21.1, 1.21.2)"
+    ordering="NONE"
+    side="BOTH"
+
+[[dependencies.mcagent]]
+    modId="jei"
+    type="optional"
+    versionRange="[19.0.0,)"
+    ordering="AFTER"
+    side="BOTH"

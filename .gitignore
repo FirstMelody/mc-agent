@@ -1,0 +1,42 @@
+# Gradle and compiled artifacts
+.gradle/
+build/
+*.class
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+
+# Local Minecraft server/runtime state
+run/
+deploy-backup/
+logs/
+crash-reports/
+world/
+world_*/
+config/
+mods/
+mcagent-runtime/
+eula.txt
+server.properties
+usercache.json
+usernamecache.json
+whitelist.json
+ops.json
+banned-*.json
+
+# IDE and OS files
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Local credentials and environment files
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.jks
+*.keystore
+credentials.*
+secrets.*
