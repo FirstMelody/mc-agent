@@ -8,6 +8,7 @@ import com.melody.mcagent.AgentRuntime;
 import com.melody.mcagent.rt.brain.AgentBrain;
 import com.melody.mcagent.rt.brain.BrainManager;
 import com.melody.mcagent.rt.bot.BotManager;
+import com.melody.mcagent.rt.bot.AnvilEnchantSmokeTest;
 import com.melody.mcagent.rt.bot.BotSmokeTest;
 import com.melody.mcagent.rt.bot.BrainSmokeTest;
 import com.melody.mcagent.rt.bot.ChatThrottleSmokeTest;
@@ -236,6 +237,7 @@ public final class RuntimeEntry implements AgentRuntime {
     private void armTests(MinecraftServer server) {
         this.tests.clear();
         add(BotSmokeTest.arm(server));
+        add(AnvilEnchantSmokeTest.arm(server));
         add(BrainSmokeTest.arm(server));
         add(CommandSmokeTest.arm(server));
         add(InventoryCommandSmokeTest.arm(server));

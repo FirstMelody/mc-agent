@@ -2482,3 +2482,48 @@ Undead Miner×1），不是「34 次重生 / 7 次被怪打死」。数字 34 �
 
 结论：给 bot 穿装备带食物仍然值得（它会掉东西、会浪费回合），但**它不是卡顿的解药**；
 卡顿的两个真实来源是「登录」和「reload」，后者本轮已经修掉。
+
+### 12.4 铁砧与附魔台：**不能用**，而且 `use` 会骗模型说成功了
+
+新增 `MCAGENT_ANVIL_TEST`（实跑日志见下）。脚本模型按最自然的顺序试了两个工具：
+`open_container` 然后 `use`。
+
+```
+Bot AnvilBot called open_container(x=72, y=-36, z=70) -> failed: there is no container at 72, -36, 70
+Bot AnvilBot called use(x=72, y=-36, z=70) -> used item on Anvil at 72, -36, 70
+Bot AnvilBot called open_container(x=68, y=-36, z=70) -> failed: there is no container at 68, -36, 70
+Bot AnvilBot called use(x=68, y=-36, z=70) -> used item on Enchanting Table at 68, -36, 70
+ANVILTEST bot's open menu is now InventoryMenu -> AnvilMenu -> EnchantmentMenu
+ANVILTEST tool surface: isContainer(anvil)=false isContainer(table)=false
+ANVILTEST tool surface: withdraw(anvil) -> FAILED the bot has not opened that container
+```
+
+三个结论：
+
+1. **`open_container` 两个都拒绝**：`Containers.containerAt` 只认 `Container`（箱子类方块实体），
+   铁砧根本没有方块实体，附魔台有 `EnchantingTableBlockEntity` 但它不是 `Container`。
+   所以 `withdraw`/`deposit` 也一起失效。
+2. **`use` 报告成功，而且真的把原版菜单装到了 bot 身上**（`AnvilMenu` / `EnchantmentMenu`），
+   但**没有任何工具能往菜单槽位里放东西、按附魔按钮、或把产物拿走** —— 模型被告知"做成了"，
+   实际什么都没发生。这是本项目最忌讳的那种静默失败。
+3. **这是接线问题，不是原版限制。** 手工驱动同一套菜单是通的：
+   ```
+   anvil menu probe: damaged sword + diamond -> result=[Diamond Sword] x1 cost=1 levels
+   anvil menu probe: taking the result by hand -> carried=[Diamond Sword] levels 98 -> 97
+   table menu probe: offers=6 8 30
+   table menu probe: clickMenuButton(0) by hand -> item=[Diamond Sword] enchanted=true levels 97 -> 96
+   ```
+   （还顺带拿到了 `[Enchanter]` 成就。）菜单是活的，bot 只是没有手。
+
+另外两点相关事实：
+
+- **没有 `/enchant` 兜底**：命令白名单是 `home, sethome, spawn, msg, tell, w, r, list, tps, help`，
+  而且 bot 不是 op。
+- **铁砧连"看得见"都吃亏**：`Perception.isLandmark` 认的是"有方块实体 / 流体 / 原木 / 树叶"，
+  铁砧没有方块实体，所以它**不会**出现在"things worth walking to"里，只会在普通方块清单里
+  占一格（还可能被 24 种类型的上限挤掉）。附魔台有方块实体，是 landmark，正常显示坐标。
+
+要修的话，缺的是一个"工作站"工具：铁砧放料 + `setItemName` + 读 `getCost()` + 取产物，
+附魔台放料 + 读三档 `costs` + `clickMenuButton(player, index)`，并把结果如实回报
+（"修好了钻石剑，花了 1 级"），完事 `closeContainer()`。顺带也该修 `use`：
+在一个 bot 无法操作的 GUI 上不该只报一句成功。

@@ -100,6 +100,8 @@ MCAGENT_SPEECH_TEST=true MCAGENT_NARRATION_GUARD=off ... runServer --offline  # 
 MCAGENT_CMD_UX_TEST=true    ... runServer --offline   # spawn resumes at the logout position; tab completion
 MCAGENT_RELOAD_TEST=true    ... runServer --offline   # a reload must not wait on an in-flight model call
 MCAGENT_RELOAD_TEST=true MCAGENT_RELOAD_INTERRUPT=off ... runServer --offline  # its positive control
+MCAGENT_ANVIL_TEST=true     ... runServer --offline   # what the bot can do with an anvil / enchanting
+                                                      # table: both refuse open_container, use() lies
 ```
 
 Decompiled Minecraft/NeoForge sources for API reference: `/ymtc/Repos/.mcai-scratch/mcsrc/`
