@@ -512,7 +512,7 @@ public final class LlmClient {
             String value = entry.getValue();
             int colon = value.indexOf(':');
             if (colon > 0) {
-                prop.addProperty("type", value.substring(0, colon).trim());
+                prop.addProperty("type", jsonSchemaType(value.substring(0, colon).trim(), entry.getKey()));
                 prop.addProperty("description", value.substring(colon + 1).trim());
             } else {
                 prop.addProperty("type", "string");
@@ -529,6 +529,27 @@ public final class LlmClient {
         schema.add("required", req);
         schema.addProperty("additionalProperties", false);
         return schema;
+    }
+
+    /**
+     * A hint that is not a JSON Schema type degrades to {@code string} instead of being sent.
+     *
+     * <p>This is not hypothetical. {@code "array of strings: ..."} reads naturally as a hint and was
+     * emitted verbatim as {@code "type": "array of strings"}; the provider answered every planning
+     * request with {@code 11129 invalid function call parameters}, so one mistyped description took
+     * the whole bot offline while the server logged nothing but 503s. A wrong-but-valid schema costs
+     * one tool its argument shape; an invalid one costs every request.
+     */
+    private static String jsonSchemaType(String hint, String property) {
+        return switch (hint.toLowerCase(java.util.Locale.ROOT)) {
+            case "string", "number", "integer", "boolean", "array", "object" -> hint;
+            default -> {
+                LOG.warn("Tool parameter '{}' declares '{}', which is not a JSON Schema type; "
+                        + "sending it as 'string'. Arrays need items and must be built by hand.",
+                        property, hint);
+                yield "string";
+            }
+        };
     }
 
     /** Convenience for building a schema with no required fields. */

@@ -17,7 +17,7 @@
 |---|---|
 | 与其他玩家沟通（真实聊天栏消息） | ✅ 已实测 |
 | 寻路（A* 绕障，真实碰撞物理） | ✅ 已实测 |
-| 环境感知（**仅限视线内**，无遮挡判定） | ✅ 已实测 |
+| 环境感知（轻度透视容错 + 遮挡标记 + 空间/出口/危险语义） | ✅ 已实测 |
 | 打开箱子（**内容必须先打开才可见**） | ✅ 已实测 |
 | 取放物品 | ✅ 已实测 |
 | 挖掘（**按工具和硬度计算真实耗时**） | ✅ 已实测 |
@@ -28,6 +28,13 @@
 | 单次 LLM 调用批量计划（最多 24 步 + 执行期预取下一批） | ✅ 已实测 |
 | 矿坑脱困（真实挖掘阶梯）/ 紧急返回重生点 | ✅ 已实测 |
 | 本地连续掘进（下行楼梯 / 水平矿道，无需 LLM 逐格猜坐标） | 已实现 |
+| 遮挡资源开采（自动挖两格高通道，不把透视坐标当可达点） | ✅ 已实测 |
+| JEV/System One 快速决策（OpenCode Zen，shadow / active） | 已实现；active 待生产采样校准 |
+| 玩家建筑保护（基地/房子/家具/地板下方禁止挖掘） | ✅ 隔离服验证通过（含反向对照） |
+| JEV 说话闸门（花 LLM 之前决定要不要说话） | ✅ 隔离服验证通过 |
+| 复读抑制（同一条话短时间内不重复发送） | ✅ 隔离服验证通过 |
+| 无坐标 `spawn` 回到上次下线位置（含维度） | ✅ 隔离服验证通过 |
+| 所有 bot 名参数的 tab 补全 | ✅ 隔离服验证通过 |
 
 ---
 
@@ -61,6 +68,79 @@ runtime jar **不能**放进 `mods/`——NeoForge 会把它当成一个独立�
 
 任何 **OpenAI 兼容**的 `/chat/completions` 接口都可以。这个文件含密钥，建议收紧权限。
 
+### 2.1 配置 JEV（可选，先以 shadow mode 运行）
+
+将 [示例配置](docs/mcagent-jev.properties.example) 复制为服务器的
+`config/mcagent-jev.properties`：
+
+```properties
+enabled=true
+endpoint=https://opencode.ai/zen/v1/systemone
+apiKey=
+model=jev-1.13-free
+timeoutMillis=5000
+shadowMode=true
+```
+
+`apiKey` 留空时复用 `mcagent-llm.toml` 的 key。这个文件由 runtime 自己读取，所以编辑后执行
+`/mcagent reloadconfig` 即可，不需要重启服务器。默认 shadow 只记录挖矿失败后的候选动作、choice、
+confidence 和概率分布。设为 `shadowMode=false` 后，它只可执行白名单恢复：一次不同入口重试、沿矿道
+breadcrumbs 回退、跳过目标、重新感知或升级给规划 LLM；低于 0.6 置信度、已过期或与新工作冲突的
+结果一律不执行。HTTP 失败也不会阻塞主 LLM 或确定性控制器。
+
+同一个文件里还有**说话闸门**（`speechGate`），它回答的是另一个问题：**这条聊天值不值得花一整轮
+LLM**。
+
+```properties
+speechGate=shadow   # off | shadow | active
+```
+
+- `off`：从不询问，仍然由规划模型决定要不要回话（闸门出现之前的行为）。
+- `shadow`：照常询问并记录 choice / confidence / 概率分布，但**不拦截**，供生产采样校准。
+- `active`：`STAY_SILENT` 会**直接跳过这一轮 LLM 调用**，只留一条日志和一条行动报告。
+
+安全规则是硬编码的：玩家点名 bot、问句，以及只对唯一在场 bot 说的话会直接交给规划模型，不经过
+闸门；JEV 超时或报错也退回规划模型。只有已经排除这些情况的后台聊天/重复指令才允许
+`STAY_SILENT` 生效，因此沉默方向不再设置信度门槛。日志形如：
+
+```
+JEV ACTIVE bot=Agent event=SPEECH_GATE choice=STAY_SILENT confidence=0.930 probabilities={...} newest_message=<FirstMelody> agent 我让你去挖钻石这些高级矿物
+```
+
+### 2.2 玩家建筑保护（默认开启，无需配置）
+
+bot 以前把玩家的基地当普通地形：在营地地板下开竖井、为了出去把房子墙挖穿。原因是
+`dig_tunnel` / `escape_up` 只认识流体、下落方块、方块实体和不可破坏地形，**没有「这是人建的」这个
+概念**。现在 `rt/perception/PlayerStructure.java` 用确定性规则补上：
+
+- **家具/机器（fixture）**：床、箱子、桶、熔炉、工作台、门、玻璃、灯笼、火把、告示牌，以及任何
+  带方块实体的方块（模组机器、容器）。这些在任何地方都不允许挖。
+- **建筑（structure）**：在 21×13×21 的范围内扫描「建筑调色板」方块（木板、楼梯、台阶、砖、羊毛、
+  玻璃、金属块……按方块 id 词根匹配，因此模组建筑也覆盖），只要同时存在至少 1 个家具、并且累计
+  ≥16 个建筑方块，就把整块包围盒列为保护区，**并且向下延伸 6 格**（地板和地基同样不能挖）。
+
+保护区一旦成立，四条破坏路径全部拒绝：`mine` / `mine_resource`（含半径扩散与清理方块）、
+`dig_tunnel`（不允许在建筑内开新矿道，沿已有矿道的「走回去」不受影响）、`escape_up`（改走门/开口，
+真的走出去而不是拆墙）、以及挖矿可达性规划器（不会规划穿墙路线）。拒绝时会说明是哪一个结构、
+哪些家具、以及应该怎么绕开。
+
+`escape_up` 在建筑内找不到可挖阶梯时，会改为**非破坏脱困**：在结构外找可站立点、用普通寻路走出去
+（会自己开门），失败才建议 `return_to_spawn`。
+
+运维开关：`MCAGENT_STRUCTURE_GUARD=off` 可以整体关掉保护（给需要拆除机器人的场景用）；它是环境
+变量门控，生产服不会误开。观察里也会明确写出来：
+
+```
+  - player-built structure: player-built structure around 889,63,362 (protected box ...; fixtures: white_bed@893,64,365, barrel@889,63,361, ...)
+    This is a player's building, not terrain. Breaking any block inside it, or in the 6 blocks under it, is refused ...
+```
+
+### 2.3 复读抑制（默认开启）
+
+bot 听不见自己说的话，所以以前可以对着同一条指令连发三次「收到……」。现在 `say` 会记录自己最近说过
+的话（规范化后比较，忽略标点和空格），几分钟内重复或包含关系直接拒绝，并把「你已经说过」写进提示词
+里，与 JEV 闸门互为补充：**闸门决定要不要说，复读抑制保证不会原样再说一遍**。
+
 ### 3. 使用
 
 **生命周期**
@@ -73,6 +153,13 @@ runtime jar **不能**放进 `mods/`——NeoForge 会把它当成一个独立�
 /mcagent removeall                # 移除全部
 ```
 
+> **不带坐标的 `spawn` 是"让它回来"，不是"把它放到我脚下"。** bot 自己的存档里记着它下线时的位置
+> 和维度，所以 `/mcagent spawn Agent` 会让它出现在上次消失的地方（跨维度也正确）；只有从来没进过
+> 这个世界的 bot 才会退回到"你站的位置"。命令的返回信息会说明用的是哪一种。
+>
+> **所有需要 bot 名字的地方都能 tab 补全**（`goto`/`pause`/`resume`/`think`/`stop`/`return`/`escape`/
+> `remove`/`inventory`/`goal` 补全到在线 bot，`spawn` 补全到"有存档、可以叫回来"的名字）。
+>
 > **bot 的数据是默认保留的。** 背包、经验、状态效果和重生点都写在 `playerdata/<uuid>.dat` 里，
 > 和真人玩家完全一样：**服务器重启、`remove`、`/mcagent reload` 都不会动它**，
 > 再 `spawn` 同名 bot 就会带着原来的东西回来（包括睡前设过的重生点）。
@@ -322,7 +409,10 @@ JEI 是 BOTH 端 mod，但**它的配方数据 100% 在客户端构建** ——
 - `escape_up` 会规划最多 8 级向上的安全阶梯，使用正常 `mine` + `goto` 执行；矿坑更深时可重复调用。
   实在没有安全路线时才用 `return_to_spawn`，它会直接回有效重生点，不受距离和墙体限制。
 - 下矿和分支挖矿使用 `dig_tunnel(direction, mode, length, item)`：`down` 连续挖下行楼梯，`level`
-  连续挖两格高水平矿道，一次最多 24 格。服务器负责每一格的可达坐标，LLM 不再逐格猜测。
+  连续挖两格高水平矿道，一次最多 24 格。服务器负责每一格的可达坐标，LLM 不再逐格猜测。bot 的
+  家（床/重生点）周围 96 格只允许一条持久化矿道入口；后续调用必须沿该入口和 breadcrumbs 返回
+  工作面。普通 `mine` / `mine_resource` / `escape_up` 不得破坏这一范围内的可见地表及其下方 4 层，
+  从而避免在基地周围反复开洞或挖出浅沟。
 
 ### bot 的存档就是它对这个世界的记忆
 
@@ -371,6 +461,10 @@ GRADLE_USER_HOME=/ymtc/Repos/.gradle-home \
 
 # 玩家机制冒烟测试（加入/行走/绕障/移除 + 寻路回归）
 MCAGENT_SMOKETEST=true ... runServer
+MCAGENT_STRUCTURE_TEST=true ... runServer            # 建筑保护（含 new_site 矿道与走门脱困）
+MCAGENT_STRUCTURE_TEST=true MCAGENT_STRUCTURE_GUARD=off ... runServer   # 反向对照：关掉保护就会拆房
+MCAGENT_SPEECH_TEST=true ... runServer               # 说话闸门（stub System One）+ 复读抑制
+MCAGENT_CMD_UX_TEST=true ... runServer               # spawn 回到下线位置 + 所有 bot 名参数 tab 补全
 
 # LLM 端到端测试（合成 + 开箱 + 挖掘 + 听聊天 + 死亡复活）
 MCAGENT_BRAIN_TEST=true ... runServer

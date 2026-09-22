@@ -1,0 +1,70 @@
+# Copy this file to the Minecraft server's config/mcagent-jev.properties.
+# It is read by the hot-reloadable runtime; /mcagent reloadconfig is enough.
+enabled=false
+
+# Which wire protocol the endpoint speaks:
+#   systemone - OpenCode Zen's typed-choice API (state + candidate answers in, choice + probability
+#               distribution out). What jev-1.13-free speaks.
+#   chat      - ordinary OpenAI-compatible /chat/completions, which is what every other provider
+#               offers. The same decision travels as one JSON object in the message content.
+protocol=systemone
+endpoint=https://opencode.ai/zen/v1/systemone
+# Leave blank to reuse mcagent-llm.toml's API key.
+apiKey=
+model=jev-1.13-free
+timeoutMillis=5000
+# chat protocol only: the reply is short, but a reasoning model spends part of this thinking, and an
+# empty answer is reported as such rather than silently treated as a decision.
+maxTokens=800
+
+# The jev model itself lives on Vercel AI Gateway as typesafe-ai/jev, and it is an EVALUATION
+# model: /v1/chat/completions rejects it ("not a language model"). Its typed-question API is
+# /v1/evaluate and speaks the same System One shape as OpenCode Zen, so protocol stays systemone:
+#     endpoint=https://ai-gateway.vercel.sh/v1/evaluate
+#     model=typesafe-ai/jev
+#     timeoutMillis=8000      # first call after a cold start took 6.1 s, warm calls 0.4-0.6 s
+# Pricing there is output-free and input at 0.000000042 per token (~0.0000063 per gate call).
+#
+# Examples that work with protocol=chat:
+#   Vercel AI Gateway (needs a credit card on file - without one every call is
+#   HTTP 403 customer_verification_required):
+#     endpoint=https://ai-gateway.vercel.sh/v1/chat/completions
+#     model=google/gemini-2.5-flash-lite
+#   A local OpenAI-compatible proxy, which is what this server uses:
+#     endpoint=http://10.0.6.6:7863/v1/chat/completions
+#     model=cn:deepseek-v4-flash
+
+# Keep true until logged choices have been evaluated against real outcomes. Set false to apply only
+# the runtime's whitelisted mining recoveries (one access retry, breadcrumb backtrack, skip,
+# re-observe, or planning-LLM escalation). Low-confidence/stale choices never move the bot.
+shadowMode=true
+
+# Whether Jev decides that a chat line deserves a model turn at all.
+#   off    - never ask; the planning model decides whether to answer (behaviour before the gate)
+#   shadow - ask and log the answer, but still let the planning model decide (calibration)
+#   active - a confident STAY_SILENT skips the model call for that message entirely
+# Never filtered: a message that names the bot, one that reaches the only bot in earshot, and any
+# question. A failed, slow or low-confidence answer always falls through to the planning model.
+speechGate=shadow
+
+# Whether Jev decides that an ORDINARY decision needs the planning model at all.
+#   off    - never ask; every idle tick spends a planning turn, exactly as before this layer existed
+#   shadow - ask and log the answer, but still make the planning turn (calibration)
+#   active - a confident CONTINUE (>= 0.85) skips the planning turn and the bot carries on with the
+#            work it already has
+# The question is asked only when there is something to continue: with an empty queue and nothing
+# running (no mining, no fight, no walk) an idle bot MUST plan, so the adviser is not consulted and
+# the planning turn happens as usual. Chat is the speech gate's case, and two triggers are never
+# routed at all - "/mcagent think" (an explicit operator instruction) and the liveness watchdog
+# (a detected hang) both go straight to the planning model.
+#
+# A failed, slow, stale or low-confidence answer always falls through to the planning model, so
+# routing=active can cost a little latency but can never leave the bot with no plan.
+routing=shadow
+
+# Every routing decision is logged on one line, greppable as "event=ROUTING":
+#   JEV ACTIVE bot=Agent event=ROUTING trigger=IDLE choice=CONTINUE confidence=0.950 \
+#       probabilities={CONTINUE=0.95, ESCALATE_LLM=0.05} applied=true
+# "applied" is true|false|low_confidence|stale|unavailable; the guard and the two bypassed triggers
+# log their own lines ("skipped=no_work_to_continue", "bypass=explicit_input|detected_hang").
+# Per-trigger tallies (asked/continued/escalated/failed) are in /mcagent status.

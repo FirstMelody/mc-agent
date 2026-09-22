@@ -234,6 +234,73 @@ public final class Perception {
         return canSeeBlock(bot, pos, bot.getEyePosition());
     }
 
+    /**
+     * The first solid block between the bot and a perceived target, or {@code null} when the target
+     * is physically exposed from the bot's current eye position.
+     *
+     * <p>This is deliberately stricter than {@link #canSeeBlock(Player, BlockPos)}. Perception is
+     * allowed to look through a handful of blockers so movement jitter and leaves do not erase an
+     * otherwise obvious object. Acting is different: mining an ore through a stone wall would skip
+     * the access problem entirely. Callers use this method to turn an x-ray observation into an
+     * explicit clearance job before touching the target.
+     */
+    @Nullable
+    public static BlockPos firstBlockingBlock(Player bot, BlockPos target) {
+        ServerLevel level = (ServerLevel) bot.level();
+        Vec3 eye = bot.getEyePosition();
+        Vec3 center = Vec3.atCenterOf(target);
+        // A centre-only action ray falsely calls the base of a tree occluded: from player eye
+        // height, the line to the lower log's centre can graze the log above even though a whole
+        // face is exposed. Accept any visible face centre, just like a player can aim at any face.
+        for (Direction face : Direction.values()) {
+            Vec3 aim = center.add(face.getStepX() * 0.49D, face.getStepY() * 0.49D,
+                    face.getStepZ() * 0.49D);
+            BlockHitResult faceHit = level.clip(new ClipContext(
+                    eye, aim, ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, bot));
+            if (faceHit.getType() == HitResult.Type.MISS || faceHit.getBlockPos().equals(target)) {
+                return null;
+            }
+        }
+        BlockHitResult centerHit = level.clip(new ClipContext(
+                eye, center, ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, bot));
+        return centerHit.getType() == HitResult.Type.MISS || centerHit.getBlockPos().equals(target)
+                ? null : centerHit.getBlockPos().immutable();
+    }
+
+    /**
+     * Count blockers before a target, capped at {@code limit}.
+     *
+     * <p>Used only while rendering the small, grouped block summary. The main cubic scan keeps its
+     * allocation-free visibility loop; this diagnostic pass makes the important distinction visible
+     * to the model: "noticed through two blocks" is an interest target, not a walkable coordinate.
+     */
+    public static int blockerCount(Player bot, BlockPos target, int limit) {
+        ServerLevel level = (ServerLevel) bot.level();
+        Vec3 eye = bot.getEyePosition();
+        Vec3 center = Vec3.atCenterOf(target);
+        Vec3 aim = center.subtract(eye);
+        if (aim.lengthSqr() < 0.0025D) {
+            return 0;
+        }
+        Vec3 direction = aim.normalize();
+        Vec3 from = eye;
+        int blockers = 0;
+        while (blockers < Math.max(1, limit)) {
+            BlockHitResult hit = level.clip(new ClipContext(
+                    from, center, ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, bot));
+            if (hit.getType() == HitResult.Type.MISS || hit.getBlockPos().equals(target)) {
+                return blockers;
+            }
+            blockers++;
+            Vec3 probe = hit.getLocation();
+            for (int step = 0; step < 64 && BlockPos.containing(probe).equals(hit.getBlockPos()); step++) {
+                probe = probe.add(direction.scale(0.05D));
+            }
+            from = probe;
+        }
+        return blockers;
+    }
+
     // --- observations ---------------------------------------------------------------------------
 
     /** A block the bot can currently see. */

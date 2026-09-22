@@ -8,6 +8,7 @@ import com.melody.mcagent.rt.Config;
 import com.melody.mcagent.rt.action.Actions;
 import com.melody.mcagent.rt.bot.BotManager;
 import com.mojang.brigadier.CommandDispatcher;
+import com.mojang.brigadier.tree.CommandNode;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.context.CommandContext;
@@ -40,21 +41,170 @@ public final class BotCommands {
     private static final org.slf4j.Logger LOG =
             org.slf4j.LoggerFactory.getLogger("mcagent/commands");
 
+    /**
+     * Every subcommand whose first argument is a bot name, in the order the tree defines them.
+     *
+     * <p>Kept as data because the live dispatcher has to be *read back*: Brigadier merges a
+     * re-registered tree into the existing one by name and never replaces a node, so a hot reload
+     * can silently keep yesterday's argument node - including one that carried no completion.
+     */
+    private static final java.util.List<String> BOT_NAME_COMMANDS = java.util.List.of(
+            "inventory", "remove", "goto", "stop", "return", "escape", "pause", "resume", "think",
+            "goal");
+
     private BotCommands() {
     }
 
+    /**
+     * A bot-name argument that completes to the bots that are online right now.
+     *
+     * <p>Without this the operator has to remember exact names - and bot names are case-sensitive
+     * here, because they are player names. Every command that acts on a running bot uses it.
+     */
+    private static com.mojang.brigadier.builder.RequiredArgumentBuilder<CommandSourceStack, String>
+            botNameArgument() {
+        return Commands.argument("name", StringArgumentType.word())
+                .suggests((ctx, builder) -> net.minecraft.commands.SharedSuggestionProvider
+                        .suggest(onlineBotNames(), builder));
+    }
+
+    /**
+     * The {@code spawn} name argument: bots that are known but offline and still have saved data, so
+     * the completion lists exactly the names a spawn would bring back.
+     */
+    private static com.mojang.brigadier.builder.RequiredArgumentBuilder<CommandSourceStack, String>
+            spawnNameArgument() {
+        return Commands.argument("name", StringArgumentType.word()).suggests((ctx, builder) -> {
+            java.util.Set<String> online = new java.util.HashSet<>(onlineBotNames());
+            java.util.List<String> resumable = new java.util.ArrayList<>();
+            BotManager manager = manager();
+            for (String known : knownNames(ctx.getSource())) {
+                // Only names whose save file exists: those are exactly the ones a spawn resumes.
+                if (!online.contains(known) && manager != null && manager.hasSavedData(known)) {
+                    resumable.add(known);
+                }
+            }
+            return net.minecraft.commands.SharedSuggestionProvider.suggest(resumable, builder);
+        });
+    }
+
+    /**
+     * Names this server has seen before, read from its own {@code usercache.json}.
+     *
+     * <p>Vanilla's {@code GameProfileCache} holds the same information but keeps its entry type
+     * package-private, and a bot that is offline is exactly the case that file exists for. Cached
+     * for half a minute: completion runs on every keystroke and the file only changes when someone
+     * joins.
+     */
+    private static java.util.List<String> knownNames(CommandSourceStack source) {
+        long now = System.currentTimeMillis();
+        if (now - KNOWN_NAMES_LOADED_AT < 30_000L) {
+            return KNOWN_NAMES;
+        }
+        KNOWN_NAMES_LOADED_AT = now;
+        try {
+            java.nio.file.Path file = source.getServer().getServerDirectory()
+                    .resolve("usercache.json");
+            if (!java.nio.file.Files.isRegularFile(file)) {
+                return KNOWN_NAMES = java.util.List.of();
+            }
+            String json = java.nio.file.Files.readString(file,
+                    java.nio.charset.StandardCharsets.UTF_8);
+            com.google.gson.JsonElement parsed = com.google.gson.JsonParser.parseString(json);
+            java.util.List<String> names = new java.util.ArrayList<>();
+            if (parsed.isJsonArray()) {
+                for (com.google.gson.JsonElement element : parsed.getAsJsonArray()) {
+                    if (element.isJsonObject() && element.getAsJsonObject().has("name")) {
+                        names.add(element.getAsJsonObject().get("name").getAsString());
+                    }
+                }
+            }
+            return KNOWN_NAMES = java.util.List.copyOf(names);
+        } catch (Throwable t) {
+            LOG.warn("Could not read usercache.json for spawn completion: {}", t.toString());
+            return KNOWN_NAMES = java.util.List.of();
+        }
+    }
+
+    private static long KNOWN_NAMES_LOADED_AT;
+    private static java.util.List<String> KNOWN_NAMES = java.util.List.of();
+
+    /** Names of the bots currently in the world, newest first is not needed: the list is tiny. */
+    private static Collection<String> onlineBotNames() {
+        BotManager manager = manager();
+        if (manager == null) {
+            return java.util.List.of();
+        }
+        java.util.List<String> names = new java.util.ArrayList<>();
+        for (BotManager.BotHandle handle : manager.handles()) {
+            names.add(handle.player().getName().getString());
+        }
+        return names;
+    }
+
+    /**
+     * Register the runtime's command tree, replacing any nodes a previous generation left behind.
+     *
+     * <p>Brigadier's {@code addChild} is a merge, not a replacement: when a child with the same name
+     * already exists it keeps that node and copies over only the executor, recursively merging
+     * grandchildren. A hot reload therefore silently kept whatever the *first* registration created.
+     * The visible consequence in production: an argument node created before {@code .suggests()} was
+     * added kept its empty suggestion provider, so {@code /mcagent pause <TAB>} offered nothing while
+     * the dev-server test - which always gets a fresh dispatcher - passed.
+     *
+     * <p>Fix: build this generation's tree first, and delete from the live node exactly the children
+     * this generation is about to re-register. That covers changed completions, changed argument
+     * types and changed executors. It deliberately leaves every other child alone: the core module
+     * registers its own {@code runtime} and {@code reload} under the same {@code /mcagent} literal,
+     * and removing the whole node once deleted them from the running server - the command then failed
+     * with "Incorrect argument", which is how the operator reloads this jar at all.
+     *
+     * <p>{@code getChildren()} is the live child map view (RootCommandNode does not override it), so
+     * no reflection is involved and both parsing and completion read the same map.
+     */
     public static void register(RegisterCommandsEvent event) {
         CommandDispatcher<CommandSourceStack> dispatcher = event.getDispatcher();
+        var tree = tree();
+        refreshSubcommands(dispatcher, tree.build());
+        dispatcher.register(tree);
+    }
 
-        dispatcher.register(Commands.literal("mcagent")
+    /**
+     * Remove the live copies of the subcommands this generation is about to register.
+     *
+     * <p>Only names this tree actually defines are touched, so the core's own children survive.
+     */
+    private static void refreshSubcommands(CommandDispatcher<CommandSourceStack> dispatcher,
+                                           CommandNode<CommandSourceStack> fresh) {
+        CommandNode<CommandSourceStack> live = dispatcher.getRoot().getChild("mcagent");
+        if (live == null) {
+            return;
+        }
+        int refreshed = 0;
+        for (CommandNode<CommandSourceStack> child : fresh.getChildren()) {
+            CommandNode<CommandSourceStack> old = live.getChild(child.getName());
+            if (old != null && old != child && live.getChildren().remove(old)) {
+                refreshed++;
+            }
+        }
+        if (refreshed > 0) {
+            LOG.info("Refreshed {} /mcagent subcommand node(s) from this jar instead of merging into "
+                    + "the previous generation's nodes", refreshed);
+        }
+    }
+
+    /** The runtime's whole command tree, unregistered. */
+    private static com.mojang.brigadier.builder.LiteralArgumentBuilder<CommandSourceStack> tree() {
+        return Commands.literal("mcagent")
                 .requires(source -> source.hasPermission(2))
                 .then(Commands.literal("list").executes(BotCommands::list))
+                .then(Commands.literal("commands").executes(BotCommands::commandCompletion))
                 .then(Commands.literal("status").executes(BotCommands::status))
                 .then(Commands.literal("inventory")
-                        .then(Commands.argument("name", StringArgumentType.word())
+                        .then(botNameArgument()
                                 .executes(BotCommands::openInventory)))
                 .then(Commands.literal("spawn")
-                        .then(Commands.argument("name", StringArgumentType.word())
+                        .then(spawnNameArgument()
                                 .executes(ctx -> spawn(ctx, null, false))
                                 // "fresh" is the one deliberate way to destroy a bot's saved state,
                                 // so it is spelled out on the command line rather than implied by
@@ -67,41 +217,41 @@ public final class BotCommands {
                                                 .executes(ctx -> spawn(ctx, Vec3Argument.getVec3(ctx, "pos"),
                                                         true))))))
                 .then(Commands.literal("remove")
-                        .then(Commands.argument("name", StringArgumentType.word())
+                        .then(botNameArgument()
                                 .executes(BotCommands::remove)))
                 .then(Commands.literal("goto")
-                        .then(Commands.argument("name", StringArgumentType.word())
+                        .then(botNameArgument()
                                 .then(Commands.argument("pos", Vec3Argument.vec3())
                                         .executes(BotCommands::gotoPos))))
                 .then(Commands.literal("stop")
-                        .then(Commands.argument("name", StringArgumentType.word())
+                        .then(botNameArgument()
                                 .executes(BotCommands::stop)))
                 .then(Commands.literal("return")
-                        .then(Commands.argument("name", StringArgumentType.word())
+                        .then(botNameArgument()
                                 .executes(BotCommands::returnToSpawn)))
                 .then(Commands.literal("escape")
-                        .then(Commands.argument("name", StringArgumentType.word())
+                        .then(botNameArgument()
                                 .executes(ctx -> escapeUp(ctx, ""))
                                 .then(Commands.argument("item", StringArgumentType.word())
                                         .executes(ctx -> escapeUp(ctx,
                                                 StringArgumentType.getString(ctx, "item"))))))
                 .then(Commands.literal("removeall").executes(BotCommands::removeAll))
                 .then(Commands.literal("pause")
-                        .then(Commands.argument("name", StringArgumentType.word())
+                        .then(botNameArgument()
                                 .executes(ctx -> setPaused(ctx, true)))
                         .then(Commands.literal("all").executes(ctx -> setPausedAll(ctx, true))))
                 .then(Commands.literal("resume")
-                        .then(Commands.argument("name", StringArgumentType.word())
+                        .then(botNameArgument()
                                 .executes(ctx -> setPaused(ctx, false)))
                         .then(Commands.literal("all").executes(ctx -> setPausedAll(ctx, false))))
                 .then(Commands.literal("think")
-                        .then(Commands.argument("name", StringArgumentType.word())
+                        .then(botNameArgument()
                                 .executes(BotCommands::thinkNow)))
                 // Convention across this mod is "<verb> <bot> [args]", so the goal text follows the
                 // bot name rather than being buried after a keyword. Two explicit subcommands
                 // ("show"/"clear") are kept for the cases where the intent is not the text itself.
                 .then(Commands.literal("goal")
-                        .then(Commands.argument("name", StringArgumentType.word())
+                        .then(botNameArgument()
                                 .executes(BotCommands::goalShow)
                                 .then(Commands.literal("show").executes(BotCommands::goalShow))
                                 .then(Commands.literal("clear").executes(BotCommands::goalClear))
@@ -143,7 +293,7 @@ public final class BotCommands {
                                                 StringArgumentType.getString(ctx, "namevalue")))))
                         .then(Commands.literal("opencodego")
                                 .executes(ctx -> llmPresetOpencodeGo(ctx)))
-                        .then(Commands.literal("clear").executes(BotCommands::llmClear))));
+                        .then(Commands.literal("clear").executes(BotCommands::llmClear)));
     }
 
     private static BotManager manager() {
@@ -336,21 +486,40 @@ public final class BotCommands {
             return 0;
         }
 
-        Vec3 requestedPos = requested;
-        if (requestedPos == null) {
-            var sourcePos = ctx.getSource().getPosition();
-            requestedPos = new Vec3(sourcePos.x, sourcePos.y, sourcePos.z);
-        }
-        Vec3 pos = requestedPos;
-
         if (fresh) {
             manager.wipeSavedData(name);
+        }
+
+        // No coordinates given means "bring this bot back", not "put it where I am standing": a bot
+        // that had been mining 200 blocks away used to reappear at the operator's feet. Its own save
+        // file records where it logged out, so that is the default; the operator's position is only
+        // the fallback for a bot that has never been in this world.
+        Vec3 pos = requested;
+        ServerLevel spawnLevel = level;
+        String where;
+        float yaw = 0.0F;
+        float pitch = 0.0F;
+        if (pos != null) {
+            where = " at the requested position ";
+        } else {
+            BotManager.SavedLogout saved = manager.savedLogout(name);
+            if (saved != null) {
+                pos = saved.position();
+                yaw = saved.yaw();
+                pitch = saved.pitch();
+                spawnLevel = saved.level();
+                where = " back at its last logout position ";
+            } else {
+                var sourcePos = ctx.getSource().getPosition();
+                pos = new Vec3(sourcePos.x, sourcePos.y, sourcePos.z);
+                where = " at your position (no saved position yet) ";
+            }
         }
 
         // Persist by default. A bot's save file is its inventory, its XP, its effects and its
         // respawn point - its memory of the world - and it must survive both a restart and the
         // removal that a hot reload performs.
-        BotManager.BotHandle handle = manager.spawn(name, level, pos, true);
+        BotManager.BotHandle handle = manager.spawn(name, spawnLevel, pos, yaw, pitch, true);
         if (handle == null) {
             ctx.getSource().sendFailure(Component.literal("Failed to spawn bot '" + name + "'"));
             return 0;
@@ -360,8 +529,13 @@ public final class BotCommands {
         // be steered by /mcagent goto, which is useful for testing movement in isolation.
         boolean brainAttached = Agent.attachBrain(handle.player());
 
+        final Vec3 landed = pos;
+        final ServerLevel landedLevel = spawnLevel;
         ctx.getSource().sendSuccess(
-                () -> Component.literal("Spawned bot '" + name + "' at " + pos
+                () -> Component.literal("Spawned bot '" + name + "'" + where
+                        + String.format(java.util.Locale.ROOT, "%.1f %.1f %.1f",
+                                landed.x, landed.y, landed.z)
+                        + " in " + landedLevel.dimension().location()
                         + (fresh ? " with a fresh save (its previous inventory and respawn point are gone)"
                                  : " (its saved inventory and respawn point, if any, were restored)")
                         + (brainAttached ? " with an LLM brain" : " (no LLM configured - command-driven only)")),
@@ -492,6 +666,51 @@ public final class BotCommands {
             return null;
         }
         return handle;
+    }
+
+    /**
+     * What the live dispatcher will actually offer for {@code /mcagent <verb> <TAB>}.
+     *
+     * <p>Asked for by name because a hot reload cannot fix this by itself. Brigadier's
+     * {@code addChild} keeps the node it already has and only copies over the executor and merges
+     * the grandchildren, so an argument node registered before completion existed keeps its empty
+     * suggestion provider forever. The dev-server test cannot see that: it builds a fresh dispatcher.
+     * This command reads the running one, so "tab completion is still missing" becomes a statement
+     * with an address instead of an impression.
+     */
+    private static int commandCompletion(CommandContext<CommandSourceStack> ctx) {
+        CommandSourceStack source = ctx.getSource();
+        var dispatcher = source.getServer().getCommands().getDispatcher();
+        java.util.Collection<String> online = onlineBotNames();
+        int missing = 0;
+        StringBuilder out = new StringBuilder(
+                "Bot-name completion on the live dispatcher (" + online.size() + " bot(s) online):\n");
+        for (String verb : BOT_NAME_COMMANDS) {
+            var parsed = dispatcher.parse("mcagent " + verb + " ", source);
+            java.util.Set<String> candidates = new java.util.LinkedHashSet<>(
+                    dispatcher.getCompletionSuggestions(parsed).join().getList().stream()
+                            .map(com.mojang.brigadier.suggestion.Suggestion::getText)
+                            .toList());
+            boolean offersBots = !online.isEmpty() && candidates.containsAll(online);
+            boolean anyOffered = !candidates.isEmpty();
+            if (!offersBots) {
+                missing++;
+            }
+            out.append("  ").append(verb).append(": ")
+                    .append(candidates.isEmpty() ? "(nothing offered)"
+                            : String.join(", ", new java.util.TreeSet<>(candidates)))
+                    .append(offersBots ? "  [ok]"
+                            : anyOffered ? "  [partial - the online bot name is missing]"
+                            : "  [stale node: re-registered arguments do not replace the old ones]")
+                    .append('\n');
+        }
+        out.append(missing == 0
+                ? "All of them complete the online bots."
+                : missing + " command(s) do not complete the online bots. A hot reload merges "
+                        + "instead of replacing, so run the server's own `/reload` once to rebuild "
+                        + "the dispatcher from this jar, then re-run this check.");
+        source.sendSuccess(() -> Component.literal(out.toString()), false);
+        return missing == 0 ? 1 : 0;
     }
 
     /** The brain for a bot, or null with a message explaining that it has none. */

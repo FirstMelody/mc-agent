@@ -198,6 +198,13 @@ public final class BotMemory {
         this.save();
     }
 
+    /** Remove runtime-owned durable state. Intended for deterministic reset/migration code. */
+    public void removeSystemValue(String key) {
+        if (key != null && this.systemValues.remove(key) != null) {
+            this.save();
+        }
+    }
+
     /** Where this bot's notes live. Exposed for diagnostics and tests. */
     public Path file() {
         return this.file;

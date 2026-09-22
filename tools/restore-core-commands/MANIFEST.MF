@@ -1,0 +1,2 @@
+Agent-Class: RestoreCoreCommands
+Can-Retransform-Classes: false

@@ -1,10 +1,12 @@
 package com.melody.mcagent.rt;
 
 import java.util.List;
+import java.nio.file.Path;
 
 import com.melody.mcagent.AgentConfig;
 import com.melody.mcagent.rt.action.ActionPolicy;
 import com.melody.mcagent.rt.brain.BrainManager;
+import com.melody.mcagent.rt.llm.JevClient;
 
 import net.minecraft.server.MinecraftServer;
 import org.slf4j.Logger;
@@ -61,11 +63,21 @@ public final class Config {
         // The watcher can fire more than once for a single edit, and the initial load overlaps with
         // server start. Rebuilding the HTTP client and re-pointing every brain is not free, so skip
         // when nothing actually changed.
-        if (newSettings.equals(brains.settings())) {
-            return;
+        if (!newSettings.equals(brains.settings())) {
+            brains.applySettings(newSettings);
         }
-
-        brains.applySettings(newSettings);
+        JevClient.Settings jev = JevClient.Settings.load(
+                Path.of("config", "mcagent-jev.properties"));
+        // Most deployments use the same OpenCode Zen account for the planning model and Jev. A
+        // blank Jev key deliberately reuses the already-loaded LLM key, avoiding a second secret in
+        // another file; an explicit Jev key still wins for split-provider setups.
+        if (jev.enabled() && (jev.apiKey() == null || jev.apiKey().isBlank())
+                && newSettings.apiKey() != null && !newSettings.apiKey().isBlank()) {
+            jev = new JevClient.Settings(true, jev.endpoint(), newSettings.apiKey(), jev.model(),
+                    jev.timeoutMillis(), jev.shadowMode(), jev.speechGate(), jev.routing(),
+                    jev.protocol(), jev.maxTokens());
+        }
+        brains.applyJevSettings(jev);
         brains.setPolicy(policy());
         LOG.debug("Configuration applied: {}", newSettings.describeMasked());
     }

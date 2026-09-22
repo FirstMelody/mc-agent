@@ -9,6 +9,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import com.melody.mcagent.rt.action.ActionPolicy;
 import com.melody.mcagent.rt.bot.BotManager;
 import com.melody.mcagent.rt.llm.LlmClient;
+import com.melody.mcagent.rt.llm.JevClient;
 
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
@@ -81,6 +82,10 @@ public final class BrainManager {
     @Nullable
     private volatile LlmClient client;
     @Nullable
+    private volatile JevClient jevClient;
+    @Nullable
+    private volatile JevClient.Settings jevSettings;
+    @Nullable
     private volatile Settings settings;
     @Nullable
     private volatile ActionPolicy policy;
@@ -134,6 +139,37 @@ public final class BrainManager {
         this.policy = policy;
     }
 
+    /** Apply the separate runtime-only Jev settings without disturbing LLM conversations. */
+    public void applyJevSettings(JevClient.Settings settings) {
+        if (settings.equals(this.jevSettings)) {
+            return;
+        }
+        this.jevSettings = settings;
+        this.jevClient = settings.isUsable() ? new JevClient(settings) : null;
+        for (AgentBrain brain : this.brains.values()) {
+            brain.setJevClient(this.jevClient);
+        }
+        if (settings.enabled() && !settings.isUsable()) {
+            LOG.warn("Jev requested but not usable: {}", settings.describeMasked());
+        } else {
+            LOG.info("Jev settings applied: {} ({} active brain(s) re-pointed)",
+                    settings.describeMasked(), this.brains.size());
+        }
+    }
+
+    public boolean isJevConfigured() {
+        return this.jevClient != null;
+    }
+
+    /** Compact operator-facing mode for runtime status. */
+    public String jevMode() {
+        JevClient.Settings current = this.jevSettings;
+        if (this.jevClient == null || current == null) {
+            return "disabled";
+        }
+        return current.shadowMode() ? "shadow" : "active";
+    }
+
     /** Whether a model can currently be called. */
     public boolean isConfigured() {
         return this.client != null;
@@ -178,6 +214,7 @@ public final class BrainManager {
             return false;
         }
         AgentBrain brain = new AgentBrain(bot, current, currentPolicy);
+        brain.setJevClient(this.jevClient);
         brain.setTokenBudget(this.contextTokenBudget());
         brain.setObserveRadius(this.observeRadius());
         this.brains.put(bot.getUUID(), brain);

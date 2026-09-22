@@ -157,6 +157,68 @@ public final class PathFinder {
     }
 
     /**
+     * Find an ordinary walkable path to any standing cell from which {@code target} is in
+     * interaction range.
+     *
+     * <p>A mining target is usually an occupied block, so resolving one arbitrary cell "near" it
+     * and then routing to that cell is subtly wrong: the chosen side may be sealed while another
+     * side is open. This single multi-goal search stops at the first actually reachable standing
+     * position and avoids retrying the same blocked side for five seconds.
+     */
+    @Nullable
+    public static Path findPathWithinReach(ServerLevel level, BlockPos start, BlockPos target,
+                                           int maxRange, double reach) {
+        if (isWithinReach(start, target, reach)) {
+            return new Path(List.of(), 0.0D, 0);
+        }
+
+        PriorityQueue<Node> open = new PriorityQueue<>();
+        Map<BlockPos, Double> best = new HashMap<>();
+        Set<BlockPos> closed = new HashSet<>();
+        Node startNode = new Node(start, 0.0D, reachHeuristic(start, target, reach), null);
+        open.add(startNode);
+        best.put(start, 0.0D);
+        int expanded = 0;
+
+        while (!open.isEmpty()) {
+            Node current = open.poll();
+            if (!closed.add(current.pos)) {
+                continue;
+            }
+            if (++expanded > MAX_EXPANDED) {
+                return null;
+            }
+            if (isWithinReach(current.pos, target, reach)) {
+                return new Path(reconstruct(current), current.g, expanded);
+            }
+            for (BlockPos next : neighbours(level, current.pos)) {
+                if (closed.contains(next)
+                        || next.distSqr(start) > (double) maxRange * maxRange) {
+                    continue;
+                }
+                double tentative = current.g + stepCost(current.pos, next);
+                if (tentative >= best.getOrDefault(next, Double.MAX_VALUE)) {
+                    continue;
+                }
+                best.put(next, tentative);
+                open.add(new Node(next, tentative,
+                        tentative + reachHeuristic(next, target, reach), current));
+            }
+        }
+        return null;
+    }
+
+    private static boolean isWithinReach(BlockPos feet, BlockPos target, double reach) {
+        Vec3 eye = new Vec3(feet.getX() + 0.5D, feet.getY() + 1.62D, feet.getZ() + 0.5D);
+        return eye.distanceTo(Vec3.atCenterOf(target)) <= reach;
+    }
+
+    private static double reachHeuristic(BlockPos feet, BlockPos target, double reach) {
+        Vec3 eye = new Vec3(feet.getX() + 0.5D, feet.getY() + 1.62D, feet.getZ() + 0.5D);
+        return Math.max(0.0D, eye.distanceTo(Vec3.atCenterOf(target)) - reach);
+    }
+
+    /**
      * Find a standable cell near the requested goal.
      *
      * <p>Callers naturally name the block they care about (a chest, a machine), whose own cell is

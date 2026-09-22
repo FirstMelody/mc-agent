@@ -20,8 +20,11 @@ import com.melody.mcagent.rt.action.Containers;
 import com.melody.mcagent.rt.action.Crafting;
 import com.melody.mcagent.rt.bot.MovementDriver;
 import com.melody.mcagent.rt.llm.LlmClient;
+import com.melody.mcagent.rt.llm.JevClient;
+import com.melody.mcagent.rt.path.MiningAccessPlanner;
 import com.melody.mcagent.rt.perception.ObservationBuilder;
 import com.melody.mcagent.rt.perception.Perception;
+import com.melody.mcagent.rt.perception.PlayerStructure;
 
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
@@ -113,14 +116,22 @@ public final class AgentBrain {
     private static final int MAX_QUEUED_ACTIONS = 32;
     /** Start asking for the next batch while this many or fewer steps remain. */
     private static final int PLAN_LOW_WATERMARK = 6;
-    /** Give the first action a few ticks to start, then overlap the next LLM request with it. */
-    private static final int PLAN_PREFETCH_DELAY_TICKS = 5;
+    /**
+     * Give physical work time to change the world before prefetching another plan.
+     *
+     * <p>Five ticks caused a fast endpoint to issue a new decision several times during every
+     * single block break, filling logs and queues with observations of effectively identical state.
+     * Two seconds still overlaps a normal remote LLM request with long work without turning a
+     * mining controller into an API-call loop.
+     */
+    private static final int PLAN_PREFETCH_DELAY_TICKS = 40;
     /** Tools that make sense as deterministic steps inside a server-side plan. */
     private static final List<String> PLANNABLE_TOOLS = List.of(
             "observe", "goto", "look_at", "say", "eat", "stop", "mine", "hold", "discard", "pickup",
             "sleep", "wake", "place", "use", "open_container", "withdraw", "deposit",
             "craft", "craftable_now", "attack", "chat_command", "find_item", "find_uses",
-            "remember", "recall", "forget", "dig_tunnel", "escape_up", "return_to_spawn");
+            "remember", "recall", "forget", "find_resource", "mine_resource", "dig_tunnel",
+            "escape_up", "return_to_spawn");
     /** One escape call stays small enough to fit beside other queued work. */
     private static final int MAX_ESCAPE_STEPS = 8;
     /** One local tunnel macro covers useful ground while remaining bounded and interruptible. */
@@ -140,6 +151,42 @@ public final class AgentBrain {
     private static final int GOTO_PLAN_RANGE = 128;
     /** How long a breaking job will try to walk into reach of one block before giving up on it. */
     private static final int MINE_APPROACH_TIMEOUT_TICKS = 100;
+    /** Grace after STOP_DESTROY_BLOCK for vanilla/mod hooks to publish the block change. */
+    private static final int MINE_BREAK_VERIFY_TICKS = 10;
+    /** X-ray perception is shallow; access excavation is deliberately bounded to match it. */
+    private static final int MINE_ACCESS_RANGE = 10;
+    /** The base/bed neighbourhood in which surface terrain must remain intact. */
+    private static final int HOME_TERRAIN_RADIUS = 96;
+    /** Protect the visible surface and the first few supporting layers from ad-hoc excavation. */
+    private static final int HOME_SURFACE_DEPTH = 4;
+
+    /**
+     * Whether the runtime-owned persistent mining skill is offered at all.
+     *
+     * <p>Only ever switched off by {@code MCAGENT_MINING_GOAL_TEST}'s positive control, and by the
+     * same mechanism the structure guard uses ({@code MCAGENT_STRUCTURE_GUARD}) — an env variable,
+     * so no server config can turn a production bot's mining skill off by accident. With the skill
+     * gone the model has no single-call trip and falls back to per-block plans, which is exactly the
+     * behaviour the skill exists to replace; the control run exists to show the test can tell those
+     * two apart.
+     */
+    public static boolean miningSkillEnabled() {
+        return !"off".equalsIgnoreCase(System.getenv("MCAGENT_MINING_GOAL"));
+    }
+
+    /**
+     * Whether a watchdog-forced turn keeps the chat it was shown for the next turn.
+     *
+     * <p>Only ever switched off by {@code MCAGENT_CHAT_INVOKE_TEST}'s positive control, the same way
+     * the structure guard and the mining skill are gated. A production player hit the opposite
+     * behaviour: the endpoint hung, so the bot never got a conversational turn, the watchdog forced a
+     * recovery turn, and that turn marked both of the player's questions read. The questions were
+     * shown to a model that was being told it was stuck, and then destroyed - the player saw a bot
+     * that ignored them twice, which is indistinguishable from a dead one.
+     */
+    public static boolean keepChatThroughForcedTurn() {
+        return !"off".equalsIgnoreCase(System.getenv("MCAGENT_CHAT_KEEP"));
+    }
     /** How long the fallback collection phase of a breaking job will chase one drop before giving up. */
     private static final int MINE_COLLECT_TIMEOUT_TICKS = 200;
     /**
@@ -179,6 +226,65 @@ public final class AgentBrain {
     private static final int COMBAT_LOST_SIGHT_TICKS = 100;
     /** Maximum distance for one combat pursuit. */
     private static final int COMBAT_PATH_RANGE = 48;
+    /**
+     * Confidence a mining recovery needs before the bot physically acts on it.
+     *
+     * <p>Calibrated the same way as the speech gate: eight realistic failure states were asked of the
+     * real model. Its confidence for defensible answers landed at 0.50-0.85 (median ~0.64), a flatter
+     * band than chat's 0.89-0.99, because choosing a recovery is genuinely harder than deciding
+     * whether to talk.
+     *
+     * <p>The cost asymmetry is also the other way round here, which is what sets the floor: abstaining
+     * costs a whole planning turn (~12k tokens), while acting costs one bounded, whitelisted,
+     * logged action - a single retry per target, a marker, a walk back along known breadcrumbs. So the
+     * floor sits at 0.6 rather than chat's 0.85, and the one answer that was clearly wrong (retrying a
+     * block whose break was rejected) is excluded deterministically instead of by confidence.
+     */
+    private static final double MIN_ACTIVE_JEV_CONFIDENCE = 0.6D;
+    /** A skipped ore candidate may be reconsidered after five minutes or when its block changes. */
+    private static final long JEV_SKIP_TARGET_TICKS = 6000L;
+    // The speech gate deliberately has no confidence floor on the silence direction. It used to: a
+    // STAY_SILENT below 0.85 was discarded and the turn fell through to the planning model, which is
+    // how production got its chatter back - the gate answered STAY_SILENT at 0.14 and 0.02 on
+    // messages nobody was waiting on, both answers were thrown away, and a 12k-token turn produced
+    // "一组太多了…" and "好，正在往下挖，挖到就给你". A floor made sense when the gate was the only
+    // thing standing between a player and silence; it is not. Every question put to this bot is
+    // routed to the planning model before the gate is even asked (see trySpeechGate), so a message
+    // that reaches the gate is one the player is not waiting on, and the model's own choice is the
+    // best answer available. The message stays in the chat log either way, so the next turn still
+    // sees it and can act on it.
+    /** Pause after the gate chose silence, so the bot gets on with its work instead of re-deciding. */
+    private static final int GATE_SILENCE_COOLDOWN_TICKS = 40;
+    /**
+     * Confidence a CONTINUE needs before it may skip a planning turn.
+     *
+     * <p>Same calibration discipline as the speech gate: the floor is set by measuring real answers,
+     * not by taste. On the gate's nine-case battery the two outcomes separated cleanly - cases that
+     * should be left alone landed at 0.89-0.99 and cases that genuinely needed the planning model at
+     * 0.47-0.77 - and the gate's floor of 0.85 sits in that gap. A routing answer is the same kind of
+     * question asked about work instead of talk, so it inherits the same floor rather than a new
+     * guess.
+     *
+     * <p>The asymmetry is why it is not lower. Skipping the planning turn while work is genuinely in
+     * flight is cheap and reversible (the next idle tick asks again), but skipping it when the bot has
+     * nothing to carry on with is a bot that stands still - so a low-confidence CONTINUE always
+     * escalates, and the empty-queue case never reaches the adviser at all.
+     */
+    private static final double MIN_ACTIVE_ROUTE_CONFIDENCE = 0.85D;
+    /**
+     * Pause after routing said CONTINUE, so the bot works instead of asking again immediately.
+     *
+     * <p>Deliberately the same cadence as the existing busy prefetch ({@code PLAN_PREFETCH_DELAY_TICKS}):
+     * the routing layer changes what a decision costs, not how often the bot re-examines what it is
+     * doing. Without a pause the latch would be released and re-taken every tick.
+     */
+    private static final int ROUTE_CONTINUE_COOLDOWN_TICKS = 40;
+    /** A confident CONTINUE covers the same physical job for at most one minute. */
+    private static final int ROUTE_LEASE_TICKS = 1200;
+    /** Ceiling on the state string a routing decision is asked with: it is not an observation. */
+    private static final int ROUTING_STATE_MAX_CHARS = 600;
+    /** How far back "the player sent this same line again" is counted, in ticks (two minutes). */
+    private static final int CHAT_REPEAT_WINDOW_TICKS = 2400;
 
     /**
      * What the bot is doing right now, and what became of steps it started earlier.
@@ -201,6 +307,164 @@ public final class AgentBrain {
 
     /** Not final: a config change swaps the endpoint without disturbing this bot's conversation. */
     private volatile LlmClient client;
+    /** Optional System One adviser. Shadow/active behaviour is selected in its runtime config. */
+    @Nullable
+    private volatile JevClient jevClient;
+    /** One automatic access retry per exact target prevents an adviser-driven retry loop. */
+    private final java.util.Set<BlockPos> jevRetriedTargets = new java.util.HashSet<>();
+    /**
+     * How many times each exact target has failed, so a recovery decision can tell a first failure
+     * from a third one. Bounded: the oldest entries are dropped rather than growing with the world.
+     */
+    private final java.util.Map<BlockPos, Integer> mineFailureCounts = new java.util.LinkedHashMap<>();
+    /**
+     * Exact targets Jev told the miner to skip, scoped by dimension and bounded by time.
+     *
+     * <p>The old SKIP_TARGET handler only wrote a sentence to the next prompt. The next
+     * {@code find_resource}/{@code mine_resource} scan therefore selected the same nearest ore and
+     * immediately failed again. Keeping the block type lets a changed world invalidate the marker;
+     * the TTL prevents a temporary access failure from blacklisting a coordinate forever.
+     */
+    private final java.util.Map<String, SkippedMiningTarget> jevSkippedTargets =
+            new java.util.LinkedHashMap<>();
+
+    private record SkippedMiningTarget(net.minecraft.world.level.block.Block block, long expiresAt) {
+    }
+    /**
+     * Blocks this bot removed itself in the last {@link #SELF_CLEARED_TICKS}, newest last.
+     *
+     * <p>Two clearance systems can name the same cell: the tunnel macro and the mining access route
+     * queue the blocks they mean to clear, and a {@link MineJob} clears its own approach blocker on
+     * the fly while removing an occluded target. When the second one ran, the block was air, the
+     * step returned {@code failed: there is no block at ...}, and because every macro step aborts the
+     * plan on failure the whole tunnel died - production measured a 12-block tunnel abandoned after
+     * two blocks, every 40 seconds, each one costing a full planning turn. A queued step that names a
+     * block this bot just removed is not a failure: its intended end state already holds.
+     *
+     * <p>Only blocks the bot itself broke are in here, so a coordinate the model invented still fails
+     * honestly. Bounded and pruned by age, not by count: a plan step can be queued long before it
+     * runs, and the window has to outlive that.
+     */
+    private final java.util.Map<BlockPos, Long> selfCleared = new java.util.LinkedHashMap<>();
+    /** How long a block this bot broke still counts as "already done". 1200 ticks = 60 s. */
+    private static final long SELF_CLEARED_TICKS = 1200L;
+    /**
+     * Off only for the harness's positive control ({@code MCAGENT_SELFCLEARED=off}), which has to see
+     * the plan die on an already-cleared step to prove the test can detect the bug at all.
+     */
+    private static final boolean SELF_CLEARED_ENABLED =
+            !"off".equalsIgnoreCase(System.getenv("MCAGENT_SELFCLEARED"));
+    /** True while a speech-gate answer is in flight, so one message is gated once. */
+    private volatile boolean speechGatePending;
+    /**
+     * When the in-flight mining-recovery request was fired, or -1.
+     *
+     * <p>A recovery answer arrives about a second after the failure, and the bot starts planning the
+     * moment the job ends - a turn that takes ten to fifteen seconds. Without holding the ordinary
+     * decision for that second, every recovery arrives while the bot is "thinking" and is discarded as
+     * stale, which is exactly what production showed: {@code not_applied=newer_work mineJob=false
+     * combat=false moving=false queue=0 thinking=true}. The cheap layer could never act at all.
+     */
+    private volatile long jevRecoveryRequestedAt = -1L;
+    /**
+     * How long an ordinary decision waits for an in-flight recovery, in ticks (ten seconds).
+     *
+     * <p>Derived from the client's own request timeout (8 s in production) plus a margin, not guessed.
+     * A three-second bound looked reasonable and was wrong: production kept dropping answers with
+     * {@code not_applied=newer_work … thinking=true} - seven of them with confidence above the floor -
+     * because a cold start on the gateway can take six seconds, by which time the hold had expired and
+     * the bot was already planning. Waiting longer is cheap here: the guard only asks when there is
+     * work in flight, so the bot keeps executing its queue while it waits, and a planning turn it may
+     * replace costs ten to fifteen seconds and ~12k tokens.
+     */
+    private static final int RECOVERY_HOLD_TICKS = 200;
+    /** How long the runtime waits before carrying the same standing goal again. */
+    private static final int IDLE_CONTINUATION_COOLDOWN_TICKS = 1800;
+    /** How often the cheap-layer counters are written to the log, so a reduction is measurable. */
+    private static final int STATS_WINDOW_TICKS = 6000;
+    /**
+     * Which input the decision now in flight started from.
+     *
+     * <p>Set at every call site that starts a decision and consumed - read, then reset to
+     * {@link Trigger#IDLE} - at the top of {@link #startDecision()}. A marker that outlived its
+     * decision would mislabel an unrelated one, and the label decides whether the cheap layer may
+     * answer at all.
+     */
+    private volatile Trigger pendingTrigger = Trigger.IDLE;
+    /**
+     * The trigger of the decision currently being built.
+     *
+     * <p>{@link #startDecision()} consumes {@link #pendingTrigger} immediately, so a later step of the
+     * same turn cannot ask what started it. That question is worth answering: a turn the stuck
+     * watchdog forced is a recovery turn, not a conversational one, and it must not be the turn that
+     * consumes a player's message.
+     */
+    private Trigger currentTrigger = Trigger.IDLE;
+    /** What the routing layer did, per trigger. Mutated on the server thread only. */
+    private final Map<Trigger, RouteCounts> routingCounts =
+            new java.util.EnumMap<>(Trigger.class);
+    /**
+     * Game time of the last decision turn that completed, or -1 before the first one.
+     *
+     * <p>Distinct from {@code ticksSinceDecision}, which the watchdog also resets while the bot is
+     * busy: a routing decision has to be told how long the bot has genuinely been without a fresh
+     * plan, not how long since anything at all happened.
+     */
+    private long lastCompletedTurnTick = -1L;
+    /**
+     * Whether the runtime may start a trip for the standing goal when the bot goes idle.
+     *
+     * <p>Gated so a wrong guess cannot become a loop: a trip that ends immediately (a full pack, no
+     * reachable ore) would otherwise be restarted on the next tick forever.
+     */
+    private long lastIdleContinuationTick = Long.MIN_VALUE / 2;
+    /**
+     * What the last persistent mining trip actually collected.
+     *
+     * <p>The idle continuation refuses to start another trip when the previous one came back with
+     * nothing. Production showed exactly why: three trips in a row dug four to twelve tunnel chunks,
+     * spent three minutes each and collected zero ore - the runtime was repeating a search that had
+     * already been shown not to work here. Escalating to the planning model instead lets it try a
+     * different place, which is the one thing the runtime cannot decide on its own.
+     */
+    private int lastMiningGoalGained = -1;
+    /**
+     * Earliest tick at which an idle zero-yield standing goal may buy another planning turn.
+     *
+     * <p>A zero-yield mining trip used to fall straight into a several-second planning loop: every
+     * turn rediscovered the same standing goal, started equivalent work, and came back empty. The
+     * first re-plan is still immediate; later attempts are rate-limited until new input arrives.
+     */
+    private long zeroYieldNextPlannerTick = Long.MIN_VALUE / 2;
+    /** Which bounded backoff to use after the next zero-yield planning attempt. */
+    private int zeroYieldBackoffIndex;
+    private static final int[] ZERO_YIELD_BACKOFF_TICKS = {1200, 3600, 6000};
+    /** Key and expiry of the physical work for which Jev already said CONTINUE. */
+    @Nullable
+    private String routeLeaseKey;
+    private long routeLeaseExpiresAt = -1L;
+    /**
+     * Rolling window counters, logged every {@link #STATS_WINDOW_TICKS}.
+     *
+     * <p>"Did the cheap layer reduce LLM calls?" was unanswerable from the log: a call that did not
+     * happen leaves no line, so the only visible number was the absolute call rate, which moves with
+     * how much the bot is doing. These are the numbers that answer it - real calls, decisions the
+     * routing layer intercepted, idle decisions that still became calls, and idle decisions the
+     * runtime carried itself.
+     */
+    private int statsPlannerRequests;
+    private int statsPlannerSucceeded;
+    private int statsPlannerFailed;
+    private int statsPlannerNoAction;
+    private int statsJevRequests;
+    private int statsIntercepted;
+    private int statsSpeechAvoided;
+    private int statsLeaseContinuations;
+    private int statsBackoffAvoided;
+    private int statsIdleSkipped;
+    private int statsIdleContinuations;
+    private int statsEscalated;
+    private long statsWindowStartTick = -1L;
     private volatile ActionPolicy policy;
     private final List<LlmClient.Message> history = new ArrayList<>();
 
@@ -210,6 +474,15 @@ public final class AgentBrain {
     /** The block-breaking job in progress, if any. */
     @Nullable
     private MineJob mineJob;
+
+    /**
+     * Surface blocks which the deterministic tunnel macro, and only that macro, may remove.
+     *
+     * <p>Coordinates are issued after the route has passed all safety checks and consumed when the
+     * queued mine step begins. Model-provided arguments cannot grant this permission, which keeps the
+     * home-terrain rule a server-side invariant rather than another prompt instruction.
+     */
+    private final java.util.Set<BlockPos> authorisedTunnelClearance = new java.util.HashSet<>();
 
     /** A target the bot is pursuing and attacking until it dies or gets away. */
     @Nullable
@@ -232,6 +505,39 @@ public final class AgentBrain {
     private boolean abortQueueIfMovementFails;
     /** Emergency tools preserve the remaining tail when they are deliberately nested in a plan. */
     private boolean executingPlanStep;
+
+    /**
+     * What started the decision now being made.
+     *
+     * <p>Every input that makes a bot think is labelled, because the cheap decision layer is not
+     * allowed to touch all of them equally. Chat is the speech gate's case, an expired cooldown is
+     * the routing layer's case, and two triggers are never second-guessed at all - see
+     * {@link #startDecision()}.
+     */
+    public enum Trigger {
+        /** A player said something this bot should answer. */
+        CHAT,
+        /** The ordinary cooldown expired: the bot finished a turn and has to decide what is next. */
+        IDLE,
+        /** An operator asked for a decision now, via {@code /mcagent think}. */
+        COMMAND,
+        /** The liveness watchdog fired: no decision has completed for a minute. */
+        STUCK,
+        /** The bot was just unpaused. */
+        RESUME
+    }
+
+    /** Per-trigger tally of what the routing layer did, for {@link #debugState()} and diagnostics. */
+    private static final class RouteCounts {
+        /** Decisions actually sent to the adviser (never counted for the guard or a bypass). */
+        int asked;
+        /** Confident CONTINUE answers that really did skip a planning turn. */
+        int continued;
+        /** Decisions that reached the planning model instead. */
+        int escalated;
+        /** Adviser calls that failed, timed out or were refused by the breaker. */
+        int failed;
+    }
 
     /** One waiting step and whether a failure invalidates everything planned after it. */
     private static final class QueuedCall {
@@ -263,11 +569,50 @@ public final class AgentBrain {
     private record TunnelStep(BlockPos feet, List<BlockPos> clear) {
     }
 
-    /** One durable mine entrance and its latest reached working face. */
-    private record MineRoute(String dimension, BlockPos entrance, BlockPos face, Direction direction) {
+    /** One durable mine entrance, working face, and breadcrumbs through the excavated corridor. */
+    private record MineRoute(String dimension, BlockPos entrance, BlockPos face, Direction direction,
+                             List<BlockPos> waypoints) {
+    }
+
+    /** A long-lived mining trip owned by the runtime rather than by a model-generated step list. */
+    private static final class MiningGoal {
+        final List<String> priorities;
+        final String primary;
+        final int requestedAmount;
+        final int startingAmount;
+        final int maxTunnelChunks;
+        final long startedAt;
+        int tunnelChunks;
+        int resourcesStarted;
+        boolean returning;
+        boolean returnScheduled;
+
+        MiningGoal(List<String> priorities, String primary, int requestedAmount,
+                   int startingAmount, int maxTunnelChunks, long startedAt) {
+            this.priorities = List.copyOf(priorities);
+            this.primary = primary;
+            this.requestedAmount = requestedAmount;
+            this.startingAmount = startingAmount;
+            this.maxTunnelChunks = maxTunnelChunks;
+            this.startedAt = startedAt;
+        }
     }
 
     private static final String MINE_ROUTE_STATE = "mine_route_v1";
+    /** The operator's standing objective, remembered across reloads and restarts. */
+    private static final String STANDING_GOAL_STATE = "standing_goal_v1";
+    @Nullable
+    private MiningGoal miningGoal;
+    /**
+     * How the last persistent mining trip ended, kept after the goal is gone.
+     *
+     * <p>{@code actionReports} is drained into the next prompt, so by the time a test or an operator
+     * wants to know why a trip stopped, the line has been handed to the model and removed. A trip
+     * that ends silently is exactly the kind of thing this project has learned not to trust, so the
+     * outcome is kept here too.
+     */
+    @Nullable
+    private String lastMiningGoalOutcome;
 
     /**
      * Results for the calls of the turn currently being resolved.
@@ -282,6 +627,17 @@ public final class AgentBrain {
     @Nullable
     private String[] turnResults;
     private int nextResultToFlush;
+    /**
+     * Index of the sibling call whose {@code execute()} is running right now, or -1.
+     *
+     * <p>Only {@code interrupt} tears down its own turn from inside the dispatcher, and it is the one
+     * call whose answer the model most needs to see: "cancelled" is the outcome of the request, not
+     * the request itself. Knowing which slot belongs to the running call is what lets
+     * {@link #abandonPlan(String)} cancel the *other* steps without throwing away that answer.
+     */
+    private int executingCallIndex = -1;
+    /** Set when a step tore its own turn down; the remaining siblings must not run. */
+    private boolean turnAbandoned;
 
     /** Ticks to wait before the next decision, so the bot does not spam the model. */
     private int cooldownTicks;
@@ -330,9 +686,20 @@ public final class AgentBrain {
     /**
      * How long the bot stays quiet when nobody has spoken to it, in ticks.
      *
-     * <p>Two minutes. Genuine direct questions bypass this; autonomous progress narration does not.
+     * <p>Five minutes. Genuine direct questions bypass this; autonomous progress narration does not.
+     * Two minutes was measured against production and was not enough: the six unsolicited lines in
+     * one two-hour session were spaced 83, 11, 2.5, 10 and 6 minutes apart, so only one of them was
+     * inside the old window. The narration rule above catches what those lines actually were; this
+     * is the backstop for the ones it does not recognise.
      */
-    private static final int UNPROMPTED_CHAT_COOLDOWN = 2400;
+    private static final int UNPROMPTED_CHAT_COOLDOWN = 6000;
+
+    /**
+     * Off only for the harness's positive control ({@code MCAGENT_NARRATION_GUARD=off}), which has to
+     * see the production narration lines go out to prove the test can detect them at all.
+     */
+    private static final boolean NARRATION_GUARD_ENABLED =
+            !"off".equalsIgnoreCase(System.getenv("MCAGENT_NARRATION_GUARD"));
 
     /** Game time of the bot's last chat message, and the message itself. */
     private long lastSpokenTick = -UNPROMPTED_CHAT_COOLDOWN;
@@ -385,11 +752,16 @@ public final class AgentBrain {
     private static final class MineJob {
         /** Where the job was asked to start; the radius is measured from here. */
         final BlockPos origin;
+        /** Dimension in which the origin was observed; async recovery must not cross dimensions. */
+        final String dimension;
         /** How far from the origin the job may spread. 0 means the single requested block. */
         final int radius;
         /** The block type being removed, or null when only the one block was asked for. */
         @Nullable
         final net.minecraft.world.level.block.Block type;
+        /** The originally requested block, distinct from access-clearance blocks. */
+        @Nullable
+        final net.minecraft.world.level.block.Block originType;
         /**
          * The tick the job started, or -1 for a job that only collects.
          *
@@ -398,6 +770,8 @@ public final class AgentBrain {
          * {@code pickup} has no such thing as "its own" items, so it takes the -1 and skips the test.
          */
         final long startTick;
+        /** This job is one server-planned cell of the one established tunnel. */
+        final boolean allowHomeSurface;
 
         final java.util.Set<BlockPos> known = new java.util.HashSet<>();
         final java.util.ArrayDeque<BlockPos> pending = new java.util.ArrayDeque<>();
@@ -405,14 +779,24 @@ public final class AgentBrain {
         /** The block currently being broken, if any. */
         @Nullable
         BlockPos current;
+        @Nullable
+        net.minecraft.world.level.block.Block currentType;
         Direction face = Direction.UP;
         int ticksRemaining;
+        boolean finishSent;
+        int verifyTicksRemaining;
+        boolean originCompleted;
         /** Blocks actually broken so far. */
         int broken;
         /** Ticks spent failing to reach the next block, so a job cannot hang forever. */
         int approachTicks;
         /** Targets skipped because no reachable standing position could be found. */
         int unreachable;
+        /** Blocks removed only to expose/reach the requested resource. */
+        final java.util.Set<BlockPos> clearanceTargets = new java.util.HashSet<>();
+        int clearanceBroken;
+        /** Structured failure counts, rendered into logs and the next model observation. */
+        final Map<String, Integer> failures = new LinkedHashMap<>();
 
         /** True once breaking is finished and the job is collecting what it dropped. */
         boolean collecting;
@@ -422,14 +806,23 @@ public final class AgentBrain {
         int collectTicks;
         int collected;
 
-        MineJob(BlockPos origin, int radius, @Nullable net.minecraft.world.level.block.Block type,
-                long startTick) {
+        MineJob(BlockPos origin, String dimension, int radius,
+                @Nullable net.minecraft.world.level.block.Block type,
+                @Nullable net.minecraft.world.level.block.Block originType, long startTick,
+                boolean allowHomeSurface) {
             this.origin = origin;
+            this.dimension = dimension;
             this.radius = radius;
             this.type = type;
+            this.originType = originType;
             this.startTick = startTick;
+            this.allowHomeSurface = allowHomeSurface;
             this.known.add(origin);
             this.pending.add(origin);
+        }
+
+        void failed(String code) {
+            this.failures.merge(code, 1, Integer::sum);
         }
     }
 
@@ -472,6 +865,14 @@ public final class AgentBrain {
         this.observeRadius = Math.max(4, Math.min(48, radius));
     }
 
+    /** Re-point typed decisions when the runtime-only Jev config is reloaded. */
+    public void setJevClient(@Nullable JevClient client) {
+        this.jevClient = client;
+        // A lease is an answer from one exact adviser/configuration. A reload may change mode,
+        // threshold, endpoint or prompt contract, so never carry the old answer across it.
+        this.clearRouteLease();
+    }
+
     /** How far this bot currently looks. */
     public int observeRadius() {
         return this.observeRadius;
@@ -487,7 +888,239 @@ public final class AgentBrain {
      * for reasons that had nothing to do with mining.
      */
     public String mineAsTool(BlockPos pos, int radius) {
-        return this.startMine(pos, Math.max(0, Math.min(MAX_MINE_RADIUS, radius)));
+        return this.startMine(pos, Math.max(0, Math.min(MAX_MINE_RADIUS, radius)), "", false);
+    }
+
+    /**
+     * One entry point for the backpack tools.
+     *
+     * <p>Every path answers honestly when the mod is missing or the bot has no backpack: "you have
+     * none, ask a player or craft one" is actionable, while an exception would just look like the bot
+     * is broken. The backpack lives in the Curios {@code back} slot and is found by
+     * {@link com.melody.mcagent.rt.action.Backpacks}, which is reflective because the dev server does
+     * not have this mod on its classpath.
+     */
+    private String backpackTool(String tool, JsonObject args) {
+        if (!com.melody.mcagent.rt.action.Backpacks.available()) {
+            return "failed: this server does not have the Sophisticated Backpacks mod, so you have no "
+                    + "backpack to use";
+        }
+        net.minecraft.world.item.ItemStack backpack =
+                com.melody.mcagent.rt.action.Backpacks.equipped(this.bot);
+        if (backpack == null) {
+            return "failed: you have no Sophisticated Backpack. Ask a player for one, or craft one, "
+                    + "then wear it in the back slot";
+        }
+        String item = string(args, "item", "");
+        int count = (int) arg(args, "count", 0);
+        String result = switch (tool) {
+            case "backpack" -> com.melody.mcagent.rt.action.Backpacks.describe(this.bot, backpack);
+            case "backpack_wear" -> com.melody.mcagent.rt.action.Backpacks
+                    .equip(this.bot, item);
+            case "backpack_sort" -> com.melody.mcagent.rt.action.Backpacks.sort(backpack);
+            case "backpack_put" -> com.melody.mcagent.rt.action.Backpacks
+                    .move(this.bot, backpack, true, item, count);
+            case "backpack_take" -> com.melody.mcagent.rt.action.Backpacks
+                    .move(this.bot, backpack, false, item, count);
+            default -> com.melody.mcagent.rt.action.Backpacks
+                    .insertUpgrade(this.bot, backpack, item);
+        };
+        this.actionReports.addLast(tool + " -> " + firstLine(result));
+        return result;
+    }
+
+    /** Start a non-blocking mining trip; subsequent steps are selected by the runtime on ticks. */
+    private String startMiningGoal(JsonObject args) {
+        if (!this.policy.canBreakBlocks()) {
+            return "failed: you are not allowed to break blocks";
+        }
+        List<String> priorities = new ArrayList<>();
+        String primary = string(args, "primary", "").trim().toLowerCase(java.util.Locale.ROOT);
+        if (!primary.isBlank()) {
+            priorities.add(primary);
+        }
+        if (args.has("secondary") && args.get("secondary").isJsonArray()) {
+            for (JsonElement raw : args.getAsJsonArray("secondary")) {
+                if (raw.isJsonPrimitive()) {
+                    String value = raw.getAsString().trim().toLowerCase(java.util.Locale.ROOT);
+                    if (!value.isBlank() && !priorities.contains(value) && priorities.size() < 8) {
+                        priorities.add(value);
+                    }
+                }
+            }
+        }
+        if (priorities.isEmpty()) {
+            priorities.addAll(List.of("iron_ore", "coal_ore", "copper_ore", "gold_ore",
+                    "redstone_ore", "diamond_ore"));
+            primary = priorities.get(0);
+        }
+        int amount = (int) Math.max(0, Math.min(4096, arg(args, "amount", 0)));
+        int maxChunks = (int) Math.max(1, Math.min(64, arg(args, "max_tunnel_chunks", 12)));
+        this.miningGoal = new MiningGoal(priorities, primary, amount,
+                this.matchingResourceCount(primary), maxChunks, this.bot.level().getGameTime());
+        this.cooldownTicks = 0;
+        LOG.info("Bot {} started a persistent mining goal: priorities={}, target={}, "
+                        + "max_tunnel_chunks={}", this.bot.getName().getString(), priorities,
+                amount > 0 ? amount + " new item(s) matching " + primary : "a normal trip", maxChunks);
+        return "started persistent mining goal: priorities=" + priorities
+                + (amount > 0 ? ", collect at least " + amount + " new matching item(s)" : "")
+                + ", return after inventory pressure, danger, or " + maxChunks
+                + " tunnel chunk(s). The runtime now owns navigation, resource selection, mining "
+                + "and return; do not submit per-block mining plans.";
+    }
+
+    /** Inventory count used for an amount goal; tools/armour are deliberately not ore progress. */
+    private int matchingResourceCount(String resource) {
+        String token = resource == null ? "" : resource.toLowerCase(java.util.Locale.ROOT);
+        int colon = token.indexOf(':');
+        if (colon >= 0) {
+            token = token.substring(colon + 1);
+        }
+        token = token.replace("deepslate_", "").replace("nether_", "")
+                .replace("_ore", "").replace("raw_", "");
+        if (token.isBlank()) {
+            return 0;
+        }
+        int count = 0;
+        for (var stack : this.bot.getInventory().items) {
+            if (stack.isEmpty() || stack.isDamageableItem()) {
+                continue;
+            }
+            String id = net.minecraft.core.registries.BuiltInRegistries.ITEM
+                    .getKey(stack.getItem()).toString().toLowerCase(java.util.Locale.ROOT);
+            if (id.contains(token)) {
+                count += stack.getCount();
+            }
+        }
+        return count;
+    }
+
+    private int emptyInventorySlots() {
+        int empty = 0;
+        for (var stack : this.bot.getInventory().items) {
+            if (stack.isEmpty()) {
+                empty++;
+            }
+        }
+        return empty;
+    }
+
+    /**
+     * Advance one semantic mining step. Returns true while the skill still owns ordinary idle
+     * decisions; player chat and explicit operator decisions remain able to interrupt it.
+     */
+    private boolean advanceMiningGoal() {
+        MiningGoal goal = this.miningGoal;
+        if (goal == null) {
+            return false;
+        }
+        int gained = this.matchingResourceCount(goal.primary) - goal.startingAmount;
+        boolean unsafe = this.bot.getHealth() <= 6.0F || this.bot.getFoodData().getFoodLevel() <= 4;
+        if (!goal.returning && ((goal.requestedAmount > 0 && gained >= goal.requestedAmount)
+                || this.emptyInventorySlots() <= 2 || unsafe
+                || goal.tunnelChunks >= goal.maxTunnelChunks)) {
+            goal.returning = true;
+            String returning = "mining skill is returning: gained=" + gained
+                    + ", empty_slots=" + this.emptyInventorySlots() + ", health="
+                    + String.format(java.util.Locale.ROOT, "%.1f", this.bot.getHealth())
+                    + ", food=" + this.bot.getFoodData().getFoodLevel()
+                    + ", tunnel_chunks=" + goal.tunnelChunks;
+            LOG.info("Bot {} {}", this.bot.getName().getString(), returning);
+            this.actionReports.addLast(returning);
+        }
+
+        if (goal.returning) {
+            BlockPos home = this.homePosition();
+            if (home != null && this.bot.blockPosition().distSqr(home) <= 256.0D) {
+                this.completeMiningGoal(goal, gained, "arrived back near home");
+                return false;
+            }
+            if (!goal.returnScheduled) {
+                String backtrack = this.scheduleJevBacktrack();
+                if (!backtrack.startsWith("failed:")) {
+                    goal.returnScheduled = true;
+                    this.actionReports.addLast("mining skill return -> " + backtrack);
+                    return true;
+                }
+            }
+            String returned = this.returnToSpawnNow();
+            this.completeMiningGoal(goal, gained, returned);
+            return false;
+        }
+
+        // Prefer concrete perceived resources. The skill chooses only semantic targets; startMine
+        // still owns access planning, protection, tool timing, drops and failure reporting.
+        // One scan serves every priority: this runs on the server thread, and a fresh raycast walk
+        // per resource would repeat the same work up to eight times in a single tick.
+        List<Perception.SeenBlock> visible = Perception.visibleBlocks(this.bot, this.observeRadius);
+        for (String resource : goal.priorities) {
+            List<Perception.SeenBlock> matches = this.matchesIn(visible, resource);
+            for (int i = 0; i < Math.min(3, matches.size()); i++) {
+                Perception.SeenBlock target = matches.get(i);
+                String result = this.startMine(target.pos(), 6, "", false);
+                if (!isFailure(result)) {
+                    goal.resourcesStarted++;
+                    this.actionReports.addLast("mining skill selected " + resource + " at "
+                            + target.pos().toShortString() + " -> " + firstLine(result));
+                    return true;
+                }
+            }
+        }
+
+        MineRoute route = this.loadMineRoute();
+        Direction direction = route != null && route.dimension().equals(this.currentDimension())
+                ? route.direction() : this.bot.getDirection();
+        String mode = route != null && route.dimension().equals(this.currentDimension())
+                && route.face().getY() <= -48 ? "level" : "down";
+        String tunnel = this.digTunnel(direction.getName(), mode, 8, "", false);
+        if (isFailure(tunnel)) {
+            String outcome = "persistent mining goal handed back to the model: " + tunnel;
+            this.lastMiningGoalOutcome = outcome;
+            this.actionReports.addLast(outcome);
+            LOG.info("Bot {} {}", this.bot.getName().getString(), outcome);
+            this.miningGoal = null;
+            this.cooldownTicks = 0;
+            return false;
+        }
+        goal.tunnelChunks++;
+        this.actionReports.addLast("mining skill found no priority ore; " + firstLine(tunnel));
+        return true;
+    }
+
+    private void completeMiningGoal(MiningGoal goal, int gained, String reason) {
+        if (this.miningGoal != goal) {
+            return;
+        }
+        long seconds = Math.max(0L, (this.bot.level().getGameTime() - goal.startedAt) / 20L);
+        this.miningGoal = null;
+        String outcome = "persistent mining goal complete after " + seconds
+                + "s: gained " + gained + " item(s) matching " + goal.primary + ", started "
+                + goal.resourcesStarted + " resource job(s), dug " + goal.tunnelChunks
+                + " tunnel chunk(s); " + reason;
+        this.lastMiningGoalOutcome = outcome;
+        this.lastMiningGoalGained = gained;
+        this.recordMiningGoalYield(gained);
+        this.actionReports.addLast(outcome);
+        LOG.info("Bot {} {}", this.bot.getName().getString(), outcome);
+        this.cooldownTicks = 0;
+    }
+
+    /** Update the bounded re-plan gate when a runtime-owned mining trip finishes. */
+    private void recordMiningGoalYield(int gained) {
+        if (gained > 0) {
+            this.zeroYieldNextPlannerTick = Long.MIN_VALUE / 2;
+            this.zeroYieldBackoffIndex = 0;
+            return;
+        }
+        // The first planning turn after the failure is immediate. shouldBackoffZeroYieldPlanning()
+        // consumes that opportunity and arms the first delay before a second one.
+        this.zeroYieldNextPlannerTick = this.bot.level().getGameTime();
+    }
+
+    /** Test seam for the production failure: a completed mining trip brought back no target ore. */
+    public void recordZeroYieldMiningGoalForTest() {
+        this.lastMiningGoalGained = 0;
+        this.recordMiningGoalYield(0);
     }
 
     /** Start combat exactly as the tool would, for deterministic smoke tests. */
@@ -498,6 +1131,18 @@ public final class AgentBrain {
         return this.startCombat(target);
     }
 
+    /**
+     * Test seam: pretend the quiet period has already elapsed.
+     *
+     * <p>Exists so a harness can reach the narration rule without waiting five real minutes. Without
+     * it the quiet period masks the narration rule in a test that sends its lines seconds apart, and
+     * a control run would "pass" for the wrong reason - which is exactly the kind of false confidence
+     * this project has paid for before.
+     */
+    public void clearQuietPeriodForTest() {
+        this.lastSpokenTick = this.bot.level().getGameTime() - UNPROMPTED_CHAT_COOLDOWN;
+    }
+
     /** True while a mining or collection job is running. For tests and diagnostics. */
     public boolean isMining() {
         return this.mineJob != null;
@@ -506,6 +1151,17 @@ public final class AgentBrain {
     /** True while the bot is pursuing or striking a combat target. */
     public boolean isFighting() {
         return this.combatJob != null;
+    }
+
+    /** How the last persistent mining trip ended, or null if none has run. */
+    @Nullable
+    public String lastMiningGoalOutcome() {
+        return this.lastMiningGoalOutcome;
+    }
+
+    /** True while the runtime-owned persistent mining skill is driving this bot. */
+    public boolean isRunningMiningGoal() {
+        return this.miningGoal != null;
     }
 
     /** What the bot is busy with right now, or "idle". */
@@ -647,6 +1303,20 @@ public final class AgentBrain {
      */
     public void setStandingGoal(@Nullable String goal) {
         this.standingGoal = goal;
+        // A changed operator objective is new information: an old empty mining trip and an old
+        // CONTINUE answer must not suppress the first decision about it.
+        this.lastMiningGoalGained = -1;
+        this.zeroYieldNextPlannerTick = Long.MIN_VALUE / 2;
+        this.zeroYieldBackoffIndex = 0;
+        this.clearRouteLease();
+        // Remembered, not just pinned. The pin lives in the transcript, which a reload throws away
+        // with the brain: an operator's "去挖矿" survived until the next hot deploy and then vanished,
+        // and with it the runtime's ability to carry the job without a planning call.
+        if (goal == null || goal.isBlank()) {
+            this.memory().removeSystemValue(STANDING_GOAL_STATE);
+        } else {
+            this.memory().putSystemValue(STANDING_GOAL_STATE, goal);
+        }
 
         // Rebuild the pinned prefix: identity, abilities, then the goal if one is set.
         while (this.history.size() > 2 && this.pinnedCount > 2) {
@@ -716,6 +1386,12 @@ public final class AgentBrain {
         } else {
             // Decide promptly on resume rather than waiting out a stale cooldown.
             this.cooldownTicks = 0;
+            // Unpausing is a trigger in its own right: the bot has to work out what, if anything, it
+            // still has to carry on with. Only when it really was paused, so a redundant
+            // setPaused(false) cannot overwrite a trigger that belongs to the current tick.
+            if (wasPaused) {
+                this.pendingTrigger = Trigger.RESUME;
+            }
         }
 
         String name = this.bot.getName().getString();
@@ -778,6 +1454,7 @@ public final class AgentBrain {
         // escape_up expands into ordinary mine/goto calls which must run before the retained tail.
         if (!this.executingPlanStep) {
             this.queue.clear();
+            this.authorisedTunnelClearance.clear();
         }
         this.abortQueueIfMovementFails = false;
         this.pendingSleep = null;
@@ -825,9 +1502,16 @@ public final class AgentBrain {
 
         EscapeRoute route = this.findEscapeRoute(level, this.bot.blockPosition());
         if (route == null || route.steps().isEmpty()) {
+            // Every staircase would dig through something. If that something is a player's building,
+            // the honest escape is the one a player would take: walk out of the door.
+            String walkedOut = this.walkOutOfStructure(level);
+            if (walkedOut != null) {
+                return walkedOut;
+            }
             return "failed: no safe rising staircase can be dug from here. Fluids, a gap under the "
-                    + "next tread, falling blocks, protected blocks or unbreakable terrain block "
-                    + "every direction; use return_to_spawn.";
+                    + "next tread, falling blocks, a player-built structure or unbreakable terrain "
+                    + "block every direction; walk out through the building's door, or use "
+                    + "return_to_spawn.";
         }
 
         int sequence = 0;
@@ -889,8 +1573,8 @@ public final class AgentBrain {
         return this.digTunnel(directionName, modeName, requestedLength, requestedItem, false);
     }
 
-    private String digTunnel(String directionName, String modeName, int requestedLength,
-                             String requestedItem, boolean newSite) {
+    public String digTunnel(String directionName, String modeName, int requestedLength,
+                            String requestedItem, boolean newSite) {
         if (!this.policy.canBreakBlocks()) {
             return "failed: you are not allowed to break blocks";
         }
@@ -922,6 +1606,18 @@ public final class AgentBrain {
         BlockPos start = this.bot.blockPosition();
         MineRoute saved = this.loadMineRoute();
         String dimension = level.dimension().location().toString();
+        // `new_site` used to be merely a prompt-level promise. Production showed the planner setting
+        // it dozens of times around the base, overwriting the remembered route and opening a fresh
+        // staircase each time. Once a home-area route exists it is immutable from gameplay tools:
+        // continuing must reuse it, and changing it requires explicit operator maintenance rather
+        // than one model-generated boolean.
+        if (newSite && saved != null && saved.dimension().equals(dimension)
+                && (this.isNearHome(start) || this.isNearHome(saved.entrance()))) {
+            return "failed: home already has one established mine entrance at "
+                    + saved.entrance().toShortString()
+                    + "; a second entrance is forbidden. Call dig_tunnel without new_site so the "
+                    + "existing route is reused";
+        }
         if (!newSite && saved != null && saved.dimension().equals(dimension)
                 && start.distSqr(saved.face()) > 64.0D) {
             List<QueuedCall> resume = new ArrayList<>();
@@ -931,9 +1627,21 @@ public final class AgentBrain {
                         "plan_step_mine_resume_" + (++sequence), "goto",
                         positionArgs(saved.entrance())), -1, true));
             }
-            resume.add(new QueuedCall(new LlmClient.ToolCall(
-                    "plan_step_mine_resume_" + (++sequence), "goto",
-                    positionArgs(saved.face())), -1, true));
+            BlockPos lastResume = saved.entrance();
+            for (BlockPos waypoint : saved.waypoints()) {
+                if (waypoint.distSqr(lastResume) < 4.0D || waypoint.distSqr(start) < 4.0D) {
+                    continue;
+                }
+                resume.add(new QueuedCall(new LlmClient.ToolCall(
+                        "plan_step_mine_resume_" + (++sequence), "goto",
+                        positionArgs(waypoint)), -1, true));
+                lastResume = waypoint;
+            }
+            if (lastResume.distSqr(saved.face()) >= 4.0D) {
+                resume.add(new QueuedCall(new LlmClient.ToolCall(
+                        "plan_step_mine_resume_" + (++sequence), "goto",
+                        positionArgs(saved.face())), -1, true));
+            }
             JsonObject continueDigging = new JsonObject();
             continueDigging.addProperty("direction", directionName);
             continueDigging.addProperty("mode", modeName);
@@ -950,10 +1658,34 @@ public final class AgentBrain {
                     + saved.face().toShortString() + ", then continuing the existing tunnel; "
                     + "no new surface hole will be opened";
         }
+        // A new hole may not be opened inside somebody's building. The resume path above is walking
+        // rather than digging, so it is deliberately allowed through: that is how an existing mine
+        // outside the base is re-entered.
+        PlayerStructure.Region inside = PlayerStructure.detectCached(level, start);
+        if (inside == null) {
+            LOG.info("Bot {} dig_tunnel from {}: no player-built structure detected around the bot",
+                    this.bot.getName().getString(), start.toShortString());
+        } else {
+            LOG.info("Bot {} dig_tunnel from {}: structure {} containsStart={}",
+                    this.bot.getName().getString(), start.toShortString(), inside.describe(),
+                    inside.contains(start));
+        }
+        if (inside != null && inside.contains(start)) {
+            LOG.info("Bot {} refused to open a tunnel from {}: {}",
+                    this.bot.getName().getString(), start.toShortString(), inside.describe());
+            return "failed: you are standing inside the " + inside.describe()
+                    + ". Digging here would put a hole in the player's building, so no tunnel may be "
+                    + "started from this spot. Walk out through its door or opening first and dig in "
+                    + "natural ground away from the base; if a mine already exists, call dig_tunnel "
+                    + "again from outside so it walks back to the established working face instead of "
+                    + "opening a new hole.";
+        }
+
         BlockPos entrance = saved == null || newSite || !saved.dimension().equals(dimension)
                 ? start.immutable() : saved.entrance();
         if (saved == null || newSite || !saved.dimension().equals(dimension)) {
-            this.saveMineRoute(new MineRoute(dimension, entrance, start.immutable(), direction));
+            this.saveMineRoute(new MineRoute(
+                    dimension, entrance, start.immutable(), direction, List.of(entrance)));
         }
         List<TunnelStep> route = new ArrayList<>();
         int blocks = 0;
@@ -978,6 +1710,10 @@ public final class AgentBrain {
                 stoppedBy = "an unsafe or missing floor at " + floor.toShortString();
                 break;
             }
+            if (PlayerStructure.isProtected(level, start, floor)) {
+                stoppedBy = "the player-built structure floor at " + floor.toShortString();
+                break;
+            }
 
             // A level tunnel needs feet+head. Descending one full block while moving horizontally
             // also needs the sloped-ceiling block above the destination head: until gravity has
@@ -992,6 +1728,14 @@ public final class AgentBrain {
                 if (com.melody.mcagent.rt.path.PathFinder.canPass(level, pos)) {
                     continue;
                 }
+                // A horizontal tunnel in the surface band is a trench. The one entrance may descend
+                // through this band, but branch/strip mining starts only after it is underground.
+                if ("level".equals(mode) && this.isProtectedHomeSurface(pos)) {
+                    safe = false;
+                    stoppedBy = "the protected home surface at " + pos.toShortString()
+                            + "; descend through the established entrance before branch mining";
+                    break;
+                }
                 BlockState state = level.getBlockState(pos);
                 if (!state.getFluidState().isEmpty()
                         || state.getBlock() instanceof FallingBlock
@@ -1000,6 +1744,11 @@ public final class AgentBrain {
                     safe = false;
                     stoppedBy = "fluid, falling, protected or unbreakable terrain at "
                             + pos.toShortString();
+                    break;
+                }
+                if (PlayerStructure.isProtected(level, start, pos)) {
+                    safe = false;
+                    stoppedBy = "the player-built structure at " + pos.toShortString();
                     break;
                 }
                 clear.add(pos.immutable());
@@ -1020,6 +1769,7 @@ public final class AgentBrain {
         int sequence = 0;
         for (TunnelStep step : route) {
             for (BlockPos clear : step.clear()) {
+                this.authorisedTunnelClearance.add(clear.immutable());
                 JsonObject mine = new JsonObject();
                 mine.addProperty("x", clear.getX());
                 mine.addProperty("y", clear.getY());
@@ -1044,6 +1794,11 @@ public final class AgentBrain {
         checkpoint.addProperty("face_y", finalFace.getY());
         checkpoint.addProperty("face_z", finalFace.getZ());
         checkpoint.addProperty("direction", direction.getName());
+        List<BlockPos> previousWaypoints = saved != null && saved.dimension().equals(dimension)
+                && !newSite ? saved.waypoints() : List.of(entrance);
+        checkpoint.addProperty("waypoints", encodeMineWaypoints(
+                mergeMineWaypoints(previousWaypoints,
+                        route.stream().map(TunnelStep::feet).toList(), entrance, finalFace)));
         excavation.add(new QueuedCall(new LlmClient.ToolCall(
                 "mine_checkpoint_" + (++sequence), "mine_checkpoint", checkpoint), -1, true));
 
@@ -1086,7 +1841,7 @@ public final class AgentBrain {
         }
         try {
             String[] part = encoded.split("\\|", -1);
-            if (part.length != 8) {
+            if (part.length != 8 && part.length != 9) {
                 return null;
             }
             Direction direction = parseHorizontalDirection(part[7]);
@@ -1097,10 +1852,21 @@ public final class AgentBrain {
                     new BlockPos(Integer.parseInt(part[1]), Integer.parseInt(part[2]),
                             Integer.parseInt(part[3])),
                     new BlockPos(Integer.parseInt(part[4]), Integer.parseInt(part[5]),
-                            Integer.parseInt(part[6])), direction);
+                            Integer.parseInt(part[6])), direction,
+                    part.length == 9 ? decodeMineWaypoints(part[8]) : List.of(
+                            new BlockPos(Integer.parseInt(part[1]), Integer.parseInt(part[2]),
+                                    Integer.parseInt(part[3])),
+                            new BlockPos(Integer.parseInt(part[4]), Integer.parseInt(part[5]),
+                                    Integer.parseInt(part[6]))));
         } catch (RuntimeException ignored) {
             return null;
         }
+    }
+
+    /** Reset only the durable tunnel route for an isolated harness world. */
+    public void clearMineRouteForTest() {
+        this.memory().removeSystemValue(MINE_ROUTE_STATE);
+        this.authorisedTunnelClearance.clear();
     }
 
     private void saveMineRoute(MineRoute route) {
@@ -1108,7 +1874,58 @@ public final class AgentBrain {
                 route.dimension() + "|" + route.entrance().getX() + "|" + route.entrance().getY()
                 + "|" + route.entrance().getZ() + "|" + route.face().getX() + "|"
                 + route.face().getY() + "|" + route.face().getZ() + "|"
-                + route.direction().getName());
+                + route.direction().getName() + "|" + encodeMineWaypoints(route.waypoints()));
+    }
+
+    private static String encodeMineWaypoints(List<BlockPos> points) {
+        return points.stream().map(pos -> pos.getX() + "," + pos.getY() + "," + pos.getZ())
+                .collect(java.util.stream.Collectors.joining(";"));
+    }
+
+    private static List<BlockPos> decodeMineWaypoints(String encoded) {
+        List<BlockPos> points = new ArrayList<>();
+        if (encoded == null || encoded.isBlank()) {
+            return points;
+        }
+        for (String raw : encoded.split(";")) {
+            String[] xyz = raw.split(",", -1);
+            if (xyz.length == 3) {
+                points.add(new BlockPos(Integer.parseInt(xyz[0]), Integer.parseInt(xyz[1]),
+                        Integer.parseInt(xyz[2])));
+            }
+        }
+        return List.copyOf(points);
+    }
+
+    /** Keep a useful breadcrumb every few blocks, bounded so resume never creates an endless plan. */
+    private static List<BlockPos> mergeMineWaypoints(List<BlockPos> previous, List<BlockPos> added,
+                                                      BlockPos entrance, BlockPos face) {
+        List<BlockPos> merged = new ArrayList<>();
+        merged.add(entrance.immutable());
+        for (BlockPos point : previous) {
+            if (merged.get(merged.size() - 1).distSqr(point) >= 9.0D) {
+                merged.add(point.immutable());
+            }
+        }
+        for (BlockPos point : added) {
+            if (merged.get(merged.size() - 1).distSqr(point) >= 9.0D) {
+                merged.add(point.immutable());
+            }
+        }
+        if (!merged.get(merged.size() - 1).equals(face)) {
+            merged.add(face.immutable());
+        }
+        if (merged.size() <= 24) {
+            return List.copyOf(merged);
+        }
+        List<BlockPos> bounded = new ArrayList<>(24);
+        bounded.add(merged.get(0));
+        double stride = (merged.size() - 1) / 23.0D;
+        for (int i = 1; i < 23; i++) {
+            bounded.add(merged.get(Math.min(merged.size() - 2, (int) Math.round(i * stride))));
+        }
+        bounded.add(merged.get(merged.size() - 1));
+        return List.copyOf(bounded);
     }
 
     @Nullable
@@ -1140,10 +1957,24 @@ public final class AgentBrain {
                     if (com.melody.mcagent.rt.path.PathFinder.canPass(level, pos)) {
                         continue;
                     }
+                    // Emergency excavation may not punch another exit through the ground around
+                    // home. A natural/open exit is still usable; otherwise the bot must backtrack
+                    // through the established mine or use return_to_spawn.
+                    if (this.isProtectedHomeSurface(pos)) {
+                        safe = false;
+                        break;
+                    }
                     BlockState state = level.getBlockState(pos);
                     if (!state.getFluidState().isEmpty()
                             || state.getBlock() instanceof FallingBlock
                             || level.getBlockEntity(pos) != null) {
+                        safe = false;
+                        break;
+                    }
+                    // An escape stair that would break the player's house is not an escape route.
+                    // Every direction being blocked by a building is what sends escapeUp to the
+                    // walk-out fallback below instead.
+                    if (PlayerStructure.isProtected(level, start, pos)) {
                         safe = false;
                         break;
                     }
@@ -1184,6 +2015,63 @@ public final class AgentBrain {
         return best;
     }
 
+    /**
+     * Leave a player-built structure on foot instead of digging through it.
+     *
+     * <p>Called when every staircase would break the building. A player walks out of their own house
+     * through the door, and the bot has ordinary pathfinding that opens doors itself, so the honest
+     * answer to "get me out" is a walk. Nothing is broken here; if no walkable exit exists the
+     * caller reports the failure and the model falls back to {@code return_to_spawn}.
+     *
+     * @return what was queued, or {@code null} when there is no walkable way out
+     */
+    @Nullable
+    private String walkOutOfStructure(net.minecraft.server.level.ServerLevel level) {
+        BlockPos here = this.bot.blockPosition();
+        PlayerStructure.Region region = PlayerStructure.detectCached(level, here);
+        if (region == null) {
+            return null;
+        }
+        BlockPos min = region.min();
+        BlockPos max = region.max();
+        int[][] offsets = {{0, 1}, {0, -1}, {1, 0}, {-1, 0}, {1, 1}, {-1, 1}, {1, -1}, {-1, -1}};
+        for (int[] offset : offsets) {
+            int x = offset[0] > 0 ? max.getX() + 3 : offset[0] < 0 ? min.getX() - 3 : here.getX();
+            int z = offset[1] > 0 ? max.getZ() + 3 : offset[1] < 0 ? min.getZ() - 3 : here.getZ();
+            int surface = level.getHeight(
+                    net.minecraft.world.level.levelgen.Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
+            // The building's own floor level first: that is where a door leads. The height map
+            // is only a fallback, because next to a base on a hillside - or in a chunk that has
+            // never been generated - it says nothing useful.
+            for (int y : new int[] {here.getY(), surface, surface - 1, surface + 1}) {
+                BlockPos candidate = new BlockPos(x, y, z);
+                if (!com.melody.mcagent.rt.path.PathFinder.canStandAt(level, candidate)) {
+                    LOG.info("Bot {} walk-out candidate {} is not standable",
+                            this.bot.getName().getString(), candidate.toShortString());
+                    continue;
+                }
+                com.melody.mcagent.rt.path.PathFinder.Path path =
+                        com.melody.mcagent.rt.path.PathFinder.findPath(level, here, candidate, 128);
+                if (path == null || path.isEmpty()) {
+                    LOG.info("Bot {} walk-out candidate {} has no walking route from {}",
+                            this.bot.getName().getString(), candidate.toShortString(),
+                            here.toShortString());
+                    continue;
+                }
+                this.prependOrAppendMacro(List.of(new QueuedCall(new LlmClient.ToolCall(
+                        "leave_structure_1", "goto", positionArgs(candidate)), -1, true)));
+                this.cooldownTicks = PLAN_PREFETCH_DELAY_TICKS;
+                String message = "you are inside the " + region.describe()
+                        + "; walking out through its own door/opening to " + candidate.toShortString()
+                        + " instead of digging through the building";
+                LOG.info("Bot {} {}", this.bot.getName().getString(), message);
+                this.actionReports.addLast(message);
+                return message;
+            }
+        }
+        return null;
+    }
+
     private static boolean isEscapeHazard(BlockState state) {
         return state.is(net.minecraft.world.level.block.Blocks.FIRE)
                 || state.is(net.minecraft.world.level.block.Blocks.SOUL_FIRE)
@@ -1200,7 +2088,27 @@ public final class AgentBrain {
         if (this.paused) {
             return;
         }
+
         this.cooldownTicks = 0;
+        // An operator asking for a decision by name is the one input the cheap layer must never
+        // argue with; the trigger travels with the decision so startDecision can say so in the log.
+        this.pendingTrigger = Trigger.COMMAND;
+        this.startDecision();
+    }
+
+    /**
+     * Test seam: start a decision labelled exactly as the stuck watchdog labels its own.
+     *
+     * <p>The real path needs a request to hang for a full minute before the watchdog fires; this
+     * makes the label reachable without waiting, so the rule that a forced recovery turn must not
+     * consume a player's message can be asserted directly.
+     */
+    public void forceStuckDecisionForTest() {
+        if (this.paused) {
+            return;
+        }
+        this.cooldownTicks = 0;
+        this.pendingTrigger = Trigger.STUCK;
         this.startDecision();
     }
 
@@ -1220,6 +2128,8 @@ public final class AgentBrain {
         if (this.paused) {
             return;
         }
+
+        this.logStatsWindow();
 
         // Advance whatever long-running thing owns the bot, and notice when a journey ends.
         boolean busy = this.tickCombatJob();
@@ -1246,6 +2156,15 @@ public final class AgentBrain {
         // exactly how a bot frozen by a pause went unnoticed for fifteen minutes while this
         // watchdog was believed to make a silent freeze impossible, so the pause state is stated
         // in the message rather than left to be inferred from the guard's position.
+        // A decision that never completes is what this watchdog is for. A bot that is busy with a
+        // long action that is visibly progressing is not stuck: counting those ticks aborted the
+        // plan every sixty seconds during ordinary mining, and the bot then re-decided from scratch -
+        // mining blocks that were already gone, planning empty plans, walking back and forth. That
+        // churn is what "the bot has crashed" looks like from in game. Movement and mining have
+        // their own no-progress checks, so nothing is left unguarded by resetting here.
+        if (busy) {
+            this.ticksSinceDecision = 0;
+        }
         this.ticksSinceDecision++;
         if (this.ticksSinceDecision > DECISION_WATCHDOG_TICKS) {
             LOG.warn("Bot {} has not completed a decision in {} ticks (state: {}, paused: {}); forcing one",
@@ -1253,6 +2172,9 @@ public final class AgentBrain {
                     this.describeCurrentAction(), this.paused);
             this.ticksSinceDecision = 0;
             this.cooldownTicks = 0;
+            // A detected hang is not a moment to economise on: label the forced decision so the cheap
+            // layer leaves it alone (see startDecision).
+            this.pendingTrigger = Trigger.STUCK;
             // Drop whatever is in the way, so the forced decision is not immediately blocked again.
             this.abandonCurrentAction();
             this.abandonPlan("the bot was stuck and had to be restarted");
@@ -1275,6 +2197,21 @@ public final class AgentBrain {
         if (!busy && !this.queue.isEmpty()) {
             this.runQueued();
             busy = this.isLongActionRunning();
+        }
+
+        // A MiningGoal is a runtime-owned skill, not a prompt-generated plan. While it is active,
+        // ordinary IDLE ticks advance the skill and never buy another planning turn. Direct player
+        // chat still proceeds below and can use interrupt to cancel or replace the goal.
+        if (!addressed && !busy && this.queue.isEmpty() && this.miningGoal != null
+                && !this.thinking.get()) {
+            this.advanceMiningGoal();
+            if (!this.queue.isEmpty()) {
+                this.runQueued();
+            }
+            busy = this.isLongActionRunning();
+        }
+        if (!addressed && this.miningGoal != null) {
+            return;
         }
 
         // Queue-aware lookahead. Do not spend another request while a healthy amount of work is
@@ -1307,6 +2244,14 @@ public final class AgentBrain {
         // the bot is doing, so it can decide whether to interrupt or to line up the next step. The
         // pause is applied where a turn *ends* (see the busy cooldown in handleCompletion) rather
         // than by refusing to think here, so a fresh instruction is never blocked outright.
+        //
+        // Which layer owns this decision is decided by what woke it: a watchdog restart or an
+        // operator's think already claimed the trigger earlier in this tick, and a prompt-worthy chat
+        // line belongs to the speech gate. Everything else is the ordinary idle cooldown, which is
+        // the routing layer's case.
+        if (this.pendingTrigger == Trigger.IDLE && addressed) {
+            this.pendingTrigger = Trigger.CHAT;
+        }
         this.startDecision();
     }
 
@@ -1347,6 +2292,7 @@ public final class AgentBrain {
             if (!arrived && this.abortQueueIfMovementFails) {
                 int discarded = this.queue.size();
                 this.queue.clear();
+                this.authorisedTunnelClearance.clear();
                 this.cooldownTicks = 0;
                 this.actionReports.addLast("walking failed at "
                         + this.bot.blockPosition().toShortString() + "; discarded " + discarded
@@ -1386,6 +2332,13 @@ public final class AgentBrain {
     }
 
     /** Kick off one observe → decide → act cycle without blocking the server thread. */
+    /**
+     * Kick off one observe → decide → act cycle without blocking the server thread.
+     *
+     * <p>The first layer is always the cheap typed decision, and only the triggers it is allowed to
+     * answer are offered to it. Chat belongs to the speech gate, an expired cooldown belongs to the
+     * routing layer, and two triggers are never second-guessed at all - see below.
+     */
     public void startDecision() {
         if (this.paused) {
             return;
@@ -1393,7 +2346,79 @@ public final class AgentBrain {
         if (!this.thinking.compareAndSet(false, true)) {
             return;
         }
+        // Consume the label now. Whatever started this decision, the next one starts from a clean
+        // slate rather than inheriting a marker that belonged to a moment already gone.
+        Trigger trigger = this.pendingTrigger;
+        this.pendingTrigger = Trigger.IDLE;
+        this.currentTrigger = trigger;
 
+        // A mining recovery is in flight: hold the ordinary decision for the fraction of a second it
+        // needs, so the cheap answer is not overtaken by the very planning turn it exists to save.
+        // Chat is never held - a player waiting for an answer outranks a recovery - and the hold is
+        // bounded, so a request that never returns cannot stall the bot.
+        if (trigger == Trigger.IDLE && this.jevRecoveryRequestedAt >= 0
+                && this.bot.level().getGameTime() - this.jevRecoveryRequestedAt
+                        < RECOVERY_HOLD_TICKS) {
+            this.thinking.set(false);
+            this.cooldownTicks = 2;
+            return;
+        }
+
+        switch (trigger) {
+            case CHAT -> {
+                // Before spending a whole planning turn on chat, let Jev answer the cheap question
+                // the planning model keeps getting wrong: does this message need an answer at all?
+                // A false return means the gate declined or was not applicable, in which case the
+                // turn goes ahead exactly as it did before the gate existed.
+                if (!this.trySpeechGate()) {
+                    this.beginDecision();
+                }
+            }
+            case IDLE, RESUME -> {
+                // Is there work in flight worth carrying on with, or does this need a fresh plan?
+                if (!this.tryRoutingDecision(trigger)) {
+                    this.beginDecision();
+                }
+            }
+            case COMMAND, STUCK -> {
+                // An explicit operator instruction and a detected hang are exactly the cases that
+                // must never be second-guessed. "/mcagent think" is a human asking for a fresh look
+                // at the world right now, and the watchdog fires only when no decision has completed
+                // for a minute - in both, a cheap "carry on with what you have" would silently
+                // cancel the very thing the operator or the watchdog asked for. They therefore go
+                // straight to the planning model, and the bypass is logged rather than left to be
+                // inferred from the absence of a JEV line.
+                this.logRoutingBypassed(trigger);
+                this.beginDecision();
+            }
+        }
+    }
+
+    /**
+     * Say, once and greppably, that the cheap layer deliberately did not touch this decision.
+     *
+     * <p>Only logged while routing is actually live: with {@code routing=off} or no adviser there is
+     * nothing to have bypassed, and a line per {@code /mcagent think} would be noise claiming an
+     * action that never existed.
+     */
+    private void logRoutingBypassed(Trigger trigger) {
+        JevClient adviser = this.jevClient;
+        if (adviser == null || !adviser.settings().isUsable()
+                || adviser.settings().routing() == JevClient.GateMode.OFF) {
+            return;
+        }
+        LOG.info("JEV ROUTING bot={} trigger={} bypass={}", this.bot.getName().getString(),
+                trigger, trigger == Trigger.COMMAND ? "explicit_input" : "detected_hang");
+    }
+
+    /**
+     * The model turn itself.
+     *
+     * <p>Split out of {@link #startDecision()} so the speech gate can hand the turn on without
+     * releasing and re-acquiring {@link #thinking}, which would let two turns start at once.
+     * The caller must already hold that latch.
+     */
+    private void beginDecision() {
         // Snapshot the world state on the server thread; the model only ever sees this snapshot.
         String observation;
         try {
@@ -1405,6 +2430,10 @@ public final class AgentBrain {
                     .shouldRespondPromptly(this.bot);
             this.directlyAddressed = !com.melody.mcagent.rt.perception.ChatLog
                     .unheardDirected(this.bot).isEmpty();
+            // Take the message list before the observation is built and mark exactly these read
+            // afterwards. Anything arriving during the observation stays unheard, so it is shown
+            // next turn instead of being consumed unread.
+            int shownMessages = com.melody.mcagent.rt.perception.ChatLog.unheard(this.bot).size();
             this.spokenThisDecision = false;
             String ongoing = this.describeOngoing();
             if (this.respondPromptly && ongoing.isBlank()) {
@@ -1420,8 +2449,18 @@ public final class AgentBrain {
                 this.cooldownTicks = 0;
             }
             // Mark what the model has just been shown, so the next observation flags only genuinely
-            // new messages instead of repeating the same lines every turn.
-            com.melody.mcagent.rt.perception.ChatLog.markRead(this.bot);
+            // new messages instead of repeating the same lines every turn. A turn the stuck
+            // watchdog forced is the exception: it is about recovery, and production showed a
+            // player's two questions being consumed by exactly such a turn without a spoken answer
+            // (the endpoint was hanging, so the bot never got a conversational turn). Those
+            // messages stay unheard so the next turn can actually answer them.
+            if (keepChatThroughForcedTurn() && this.currentTrigger == Trigger.STUCK
+                    && shownMessages > 0) {
+                this.actionReports.addLast("kept " + shownMessages + " chat message(s) unheard: this "
+                        + "turn was forced by the stuck watchdog, so the next one can answer them");
+            } else {
+                com.melody.mcagent.rt.perception.ChatLog.markRead(this.bot, shownMessages);
+            }
         } catch (Throwable t) {
             LOG.error("Failed to build observation for {}", this.bot.getName().getString(), t);
             this.thinking.set(false);
@@ -1434,6 +2473,15 @@ public final class AgentBrain {
             this.history.add(LlmClient.Message.system("Abilities: " + this.policy.describe()));
             this.pinnedCount = 2;
             this.initialised = true;
+            // Restore the operator's standing objective, if one was remembered from before this
+            // reload. Done after the identity prefix exists so the pin order stays identity,
+            // abilities, objective.
+            String rememberedGoal = this.memory().systemValue(STANDING_GOAL_STATE);
+            if (rememberedGoal != null && !rememberedGoal.isBlank()) {
+                this.setStandingGoal(rememberedGoal);
+                LOG.info("Bot {} restored its standing goal from memory: {}",
+                        this.bot.getName().getString(), rememberedGoal);
+            }
         }
         this.history.add(LlmClient.Message.user(observation));
         this.compact();
@@ -1441,7 +2489,10 @@ public final class AgentBrain {
         List<LlmClient.ToolSpec> tools = buildTools();
         List<LlmClient.Message> snapshot = List.copyOf(this.history);
 
+        this.statsPlannerRequests++;
         CompletableFuture
+                // Count attempts, not only successful answers with tool calls. Errors, truncation
+                // and prose-only completions still consumed a real provider request.
                 .supplyAsync(() -> this.client.complete(snapshot, tools), executor())
                 .thenAccept(completion -> {
                     // Back onto the server thread: everything below touches the world.
@@ -1463,6 +2514,7 @@ public final class AgentBrain {
                     });
                 })
                 .exceptionally(error -> {
+                    this.statsPlannerFailed++;
                     LOG.error("Brain task failed for {}", this.bot.getName().getString(), error);
                     this.thinking.set(false);
                     this.cooldownTicks = 100;
@@ -1470,14 +2522,710 @@ public final class AgentBrain {
                 });
     }
 
+    /**
+     * Ask Jev whether a chat message needs an answer at all, before a planning turn is spent on it.
+     *
+     * <p>This is the decision the planning model is worst at and the one a bot gets judged on:
+     * whether to say anything. One instruction produced three near-identical acknowledgements,
+     * because each chat-triggered turn asked a 12k-token model "should I reply?" and it kept saying
+     * yes. A cheap typed choice answers it in a few hundred milliseconds and, when it is confident,
+     * the planning turn is not made at all.
+     *
+     * <p>Safety rules, in order: a message that names the bot and asks a question is never filtered
+     * here; a failed, slow or low-confidence answer falls through to the planning model; and in
+     * shadow mode the answer is only logged. Losing a player's message is much worse than one extra
+     * model turn, so every uncertain path keeps the old behaviour.
+     *
+     * @return true when the gate has taken responsibility for this decision
+     */
+    private boolean trySpeechGate() {
+        JevClient adviser = this.jevClient;
+        if (adviser == null || !adviser.settings().isUsable()) {
+            return false;
+        }
+        JevClient.GateMode mode = adviser.settings().speechGate();
+        if (mode == JevClient.GateMode.OFF
+                || !com.melody.mcagent.rt.perception.ChatLog.shouldRespondPromptly(this.bot)) {
+            return false;
+        }
+        List<com.melody.mcagent.rt.perception.ChatLog.Heard> unheard =
+                com.melody.mcagent.rt.perception.ChatLog.unheard(this.bot);
+        if (unheard.isEmpty()) {
+            return false;
+        }
+        // A question put to this bot goes to the planning model, never to the gate: that is what a
+        // player is waiting on. "Addressed" now includes a message that reaches only this bot, so an
+        // unnamed question from the player talking to it still qualifies - while a question between
+        // two players ("渊夜你那个浮空艇放哪了") does not, and is left to the cheap decision.
+        //
+        // A language request is the other case that must never be silenced. It is a message about how
+        // to talk rather than about the work, so a gate looking for "does this need an action" reads
+        // it as chatter: production had a player answer the bot's question with "转中文" and the bot
+        // said nothing, which reads as being ignored. Deliberately limited to language requests -
+        // ordinary task instructions ("继续挖钻石") still go through the gate, where the calibrated
+        // silence and repetition rules live.
+        for (com.melody.mcagent.rt.perception.ChatLog.Heard heard : unheard) {
+            if (heard.directedAtBot()
+                    && (looksLikeQuestion(heard.text()) || looksLikeLanguageRequest(heard.text()))) {
+                return false;
+            }
+        }
+
+        // Deterministic case, no model involved: the same instruction, sent again verbatim within a
+        // couple of minutes. In production three identical lines produced three "收到..." replies;
+        // a player repeating themselves is not waiting for a second acknowledgement. This costs
+        // nothing and cannot misread a message that has already been answered.
+        com.melody.mcagent.rt.perception.ChatLog.Heard newest = unheard.get(unheard.size() - 1);
+        int repeats = this.countRecentRepeats(newest.text());
+        if (repeats >= 2) {
+            LOG.info("SPEECH GATE bot={} event=SPEECH_GATE decision=STAY_SILENT "
+                    + "source=duplicate_instruction repeats={} newest_message={}",
+                    this.bot.getName().getString(), repeats, newest.format());
+            this.staySilent("the same instruction arrived " + repeats + " times", newest);
+            return true;
+        }
+        this.speechGatePending = true;
+        String state = this.speechGateState(unheard);
+        Map<String, String> candidates = new LinkedHashMap<>();
+        candidates.put("SPEAK", "Answer now: something new needs a reply, or this has not been answered yet");
+        candidates.put("STAY_SILENT", "Say nothing: background chatter, or the bot already dealt with this");
+        this.statsJevRequests++;
+        CompletableFuture
+                .supplyAsync(() -> adviser.choose(state, "speech_gate",
+                        com.melody.mcagent.rt.llm.JevPrompts.SPEECH_GATE,
+                        candidates), executor())
+                .thenAccept(choice -> this.bot.server.execute(
+                        () -> this.applySpeechGate(adviser, mode, choice, unheard)));
+        return true;
+    }
+
+    /**
+     * How many times this exact line was heard in the last two minutes, including the newest.
+     *
+     * <p>Comparison ignores punctuation and spacing, the same rule the repetition guard uses for the
+     * bot's own lines.
+     */
+    private int countRecentRepeats(String text) {
+        String wanted = com.melody.mcagent.rt.perception.ChatLog.normalise(text);
+        if (wanted.isEmpty()) {
+            return 0;
+        }
+        long now = this.bot.level().getGameTime();
+        int count = 0;
+        for (com.melody.mcagent.rt.perception.ChatLog.Heard heard
+                : com.melody.mcagent.rt.perception.ChatLog.recent(this.bot, 12)) {
+            if (now - heard.gameTime() > CHAT_REPEAT_WINDOW_TICKS) {
+                continue;
+            }
+            if (com.melody.mcagent.rt.perception.ChatLog.normalise(heard.text()).equals(wanted)) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    /**
+     * End a chat-triggered decision without spending a model turn, and say why in the log and in the
+     * next observation. Shared by the deterministic repeat rule and the gate's own STAY_SILENT.
+     */
+    private void staySilent(String reason, com.melody.mcagent.rt.perception.ChatLog.Heard newest) {
+        com.melody.mcagent.rt.perception.ChatLog.markRead(this.bot);
+        this.statsSpeechAvoided++;
+        this.actionReports.addLast("you stayed silent on " + newest.format() + " (" + reason
+                + "); keep working instead of answering again");
+        this.thinking.set(false);
+        this.cooldownTicks = GATE_SILENCE_COOLDOWN_TICKS;
+    }
+
+    /** Apply a gate answer on the server thread: either skip the turn, or make it. */
+    private void applySpeechGate(JevClient adviser, JevClient.GateMode mode, JevClient.Choice choice,
+                                 List<com.melody.mcagent.rt.perception.ChatLog.Heard> unheard) {
+        this.speechGatePending = false;
+        String botName = this.bot.getName().getString();
+        String newest = unheard.get(unheard.size() - 1).format();
+        if (this.jevClient != adviser || this.paused || this.bot.isRemoved()
+                || this.bot.hasDisconnected()) {
+            this.thinking.set(false);
+            return;
+        }
+        boolean failed = choice.failed();
+        boolean silent = !failed && "STAY_SILENT".equals(choice.choice());
+        if (failed) {
+            LOG.info("JEV SPEECH_GATE bot={} event=CHAT unavailable={} newest_message={}",
+                    botName, choice.error(), newest);
+        } else {
+            LOG.info("JEV {} bot={} event=SPEECH_GATE choice={} confidence={} probabilities={} "
+                    + "newest_message={}",
+                    mode == JevClient.GateMode.ACTIVE ? "ACTIVE" : "SHADOW", botName,
+                    choice.choice(), String.format(java.util.Locale.ROOT, "%.3f", choice.confidence()),
+                    choice.probabilities(), newest);
+        }
+
+        if (mode == JevClient.GateMode.ACTIVE && silent) {
+            // The choice is honoured, not the confidence. Every question put to this bot was already
+            // routed to the planning model before the gate was asked (see trySpeechGate), so what
+            // reaches here is a message nobody is waiting on: an instruction already being carried
+            // out, a repeat, or background chatter. Discarding a low-confidence STAY_SILENT is how
+            // production got its chatter back - the gate answered STAY_SILENT at 0.14 and 0.02, the
+            // 0.85 floor threw both answers away, and the 12k-token planner answered anyway
+            // ("一组太多了…", "好，正在往下挖，挖到就给你"). Acting on the answer is the whole point
+            // of asking before the model runs; the message stays in the chat log, so the next turn
+            // still sees it and can act on it. No planning turn, no tokens, no acknowledgement.
+            LOG.info("JEV ACTIVE bot={} event=SPEECH_GATE applied=stay_silent confidence={} "
+                            + "probabilities={} (the choice decides; a question never reaches the gate)",
+                    botName, String.format(java.util.Locale.ROOT, "%.3f", choice.confidence()),
+                    choice.probabilities());
+            this.staySilent("jev said STAY_SILENT with confidence "
+                    + String.format(java.util.Locale.ROOT, "%.2f", choice.confidence()),
+                    unheard.get(unheard.size() - 1));
+            return;
+        }
+        // Anything else - SPEAK, an error, a stale answer - keeps the old behaviour exactly: the
+        // planning model sees the message and decides for itself.
+        this.beginDecision();
+    }
+
+    /** The compact state a speak/silent decision needs: what was said, and what the bot answered. */
+    private String speechGateState(List<com.melody.mcagent.rt.perception.ChatLog.Heard> unheard) {
+        StringBuilder sb = new StringBuilder("Minecraft chat event. bot=")
+                .append(this.bot.getName().getString())
+                .append("; current_action=").append(this.describeCurrentAction())
+                .append("; new_messages=[");
+        for (int i = 0; i < unheard.size(); i++) {
+            com.melody.mcagent.rt.perception.ChatLog.Heard heard = unheard.get(i);
+            if (i > 0) {
+                sb.append(" | ");
+            }
+            sb.append('<').append(heard.speaker()).append("> ").append(heard.text());
+            if (heard.directedAtBot()) {
+                sb.append(" (names this bot)");
+            }
+        }
+        sb.append(']');
+        // The recent conversation, so a repeat is visible as a repeat rather than a fresh request.
+        sb.append("; recent_conversation=[");
+        List<com.melody.mcagent.rt.perception.ChatLog.Heard> recent =
+                com.melody.mcagent.rt.perception.ChatLog.recent(this.bot, 6);
+        for (int i = 0; i < recent.size(); i++) {
+            if (i > 0) {
+                sb.append(" | ");
+            }
+            sb.append('<').append(recent.get(i).speaker()).append("> ")
+              .append(recent.get(i).text());
+        }
+        sb.append(']');
+        sb.append("; this_exact_message_heard_times=")
+          .append(this.countRecentRepeats(unheard.get(unheard.size() - 1).text()));
+        List<com.melody.mcagent.rt.perception.ChatLog.Said> own =
+                com.melody.mcagent.rt.perception.ChatLog.recentOwn(this.bot, 4);
+        if (!own.isEmpty()) {
+            sb.append("; you_already_said=[");
+            for (int i = 0; i < own.size(); i++) {
+                if (i > 0) {
+                    sb.append(" | ");
+                }
+                sb.append('"').append(own.get(i).text()).append('"');
+            }
+            sb.append(']');
+            long secondsAgo = Math.max(0L,
+                    (this.bot.level().getGameTime() - own.get(own.size() - 1).gameTime()) / 20L);
+            sb.append("; you_last_spoke_seconds_ago=").append(secondsAgo);
+        }
+        String goal = this.standingGoal;
+        if (goal != null && !goal.isBlank()) {
+            sb.append("; standing_goal=").append(goal);
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Ask Jev whether the work already under way is worth continuing, before a whole planning turn is
+     * spent re-deciding it.
+     *
+     * <p>The failure this exists for is churn, not stupidity: a bot that has a plan running is asked
+     * "what next?" every couple of seconds anyway, and a 12k-token model answering that question
+     * tends to invent new work, re-mine blocks that are already gone, or walk back and forth. The
+     * cheap typed question - "is there something to carry on with, or does this need thinking about?"
+     * - is one a small evaluation model answers well.
+     *
+     * <p>Safety rules, in order: with nothing queued and nothing running the bot <em>must</em> plan,
+     * so the adviser is not asked at all; a failed, slow or low-confidence answer falls through to
+     * the planning model; and in shadow mode the answer is only logged. Standing still is the one
+     * outcome worse than an unnecessary planning turn, so every uncertain path keeps the old
+     * behaviour.
+     *
+     * @return true when the routing layer has taken responsibility for this decision
+     */
+    private boolean tryRoutingDecision(Trigger trigger) {
+        JevClient adviser = this.jevClient;
+        if (adviser == null || !adviser.settings().isUsable()) {
+            return false;
+        }
+        JevClient.GateMode mode = adviser.settings().routing();
+        if (mode == JevClient.GateMode.OFF) {
+            return false;
+        }
+        // Only ask when there is something to continue. With an empty queue and nothing running an
+        // idle bot has nothing to carry on with, so the only honest answer is "plan" - and a question
+        // whose wrong answer is a bot that stands still forever is not worth asking.
+        if (this.queue.isEmpty() && !this.isLongActionRunning()) {
+            // ...unless the runtime can carry the job itself. This branch is where the money went:
+            // measured over three production hours, 412 of 831 decisions were "the bot finished a
+            // one-to-three step plan and is idle again", every one of them a ~12k-token planning turn
+            // for a bot whose standing goal already said what its job was.
+            if (this.startIdleContinuation(trigger)) {
+                return true;
+            }
+            if (this.backoffZeroYieldPlanning(trigger)) {
+                return true;
+            }
+            LOG.info("JEV ROUTING bot={} trigger={} skipped=no_work_to_continue",
+                    this.bot.getName().getString(), trigger);
+            this.statsIdleSkipped++;
+            return false;
+        }
+
+        String leaseKey = this.currentRouteLeaseKey();
+        long now = this.bot.level().getGameTime();
+        if (leaseKey != null && leaseKey.equals(this.routeLeaseKey)
+                && now < this.routeLeaseExpiresAt) {
+            this.statsLeaseContinuations++;
+            this.thinking.set(false);
+            this.cooldownTicks = ROUTE_CONTINUE_COOLDOWN_TICKS;
+            LOG.debug("JEV ROUTING bot={} trigger={} lease=continue remaining_ticks={} work={}",
+                    this.bot.getName().getString(), trigger, this.routeLeaseExpiresAt - now,
+                    leaseKey);
+            return true;
+        }
+
+        this.countersFor(trigger).asked++;
+        this.statsJevRequests++;
+        String state = this.routingState(trigger);
+        Map<String, String> candidates = new LinkedHashMap<>();
+        candidates.put("CONTINUE", "Carry on with the work already queued; no new plan is needed");
+        candidates.put("ESCALATE_LLM", "Think again before acting: this situation needs a new plan");
+        CompletableFuture
+                .supplyAsync(() -> adviser.choose(state, "routing",
+                        // Shared with tools/jev-replay: a re-scored recording is only comparable when
+                        // the wording is identical (see JevPrompts).
+                        com.melody.mcagent.rt.llm.JevPrompts.ROUTING,
+                        candidates), executor())
+                .thenAccept(choice -> this.bot.server.execute(
+                        () -> this.applyRoutingDecision(
+                                adviser, mode, trigger, choice, state, leaseKey)));
+        return true;
+    }
+
+    /**
+     * Apply a routing answer on the server thread: skip the planning turn, or make it.
+     *
+     * <p>Runs with the {@link #thinking} latch still held, exactly like the speech gate's apply step,
+     * so it either hands the turn on to {@link #beginDecision()} or releases the latch itself. Every
+     * exit path does one or the other; a path that did neither would freeze the bot.
+     */
+    private void applyRoutingDecision(JevClient adviser, JevClient.GateMode mode, Trigger trigger,
+                                      JevClient.Choice choice, String state,
+                                      @Nullable String askedWorkKey) {
+        String botName = this.bot.getName().getString();
+        String modeName = mode == JevClient.GateMode.ACTIVE ? "ACTIVE" : "SHADOW";
+        // A config reload, a pause or a dead body makes the answer stale: never act on advice about a
+        // moment that has already passed, and never let it swallow the decision it was asked for.
+        if (this.jevClient != adviser || this.paused || this.bot.isRemoved()
+                || this.bot.hasDisconnected()) {
+            LOG.info("JEV {} bot={} event=ROUTING trigger={} applied=stale",
+                    modeName, botName, trigger);
+            this.thinking.set(false);
+            return;
+        }
+
+        RouteCounts counts = this.countersFor(trigger);
+        boolean failed = choice.failed();
+        boolean confident = !failed && choice.confidence() >= MIN_ACTIVE_ROUTE_CONFIDENCE;
+        boolean keepWorking = !failed && "CONTINUE".equals(choice.choice());
+        boolean sameWork = askedWorkKey != null
+                && askedWorkKey.equals(this.currentRouteLeaseKey());
+        boolean applied = mode == JevClient.GateMode.ACTIVE && keepWorking && confident && sameWork;
+        // "false" means the layer deliberately did not skip the turn (a confident ESCALATE_LLM, a
+        // shadow-mode answer, or an unknown choice); "low_confidence" is reserved for the case where
+        // the answer was not trusted, so the two are never confused when reading the log back.
+        String outcome = failed ? "unavailable" : applied ? "true"
+                : confident ? "false" : "low_confidence";
+
+        if (failed) {
+            counts.failed++;
+        }
+        // The state goes into the log too: without it a shadow sample cannot be re-scored offline by
+        // tools/jev-replay, and the confidence band this layer will be judged on is exactly what that
+        // replay produces. Truncated to one line, like the mining-recovery samples.
+        LOG.info("JEV {} bot={} event=ROUTING trigger={} choice={} confidence={} probabilities={} "
+                + "applied={} state={}{}",
+                modeName, botName, trigger, choice.choice(),
+                String.format(java.util.Locale.ROOT, "%.3f", choice.confidence()),
+                choice.probabilities(), outcome, oneLineState(state),
+                failed ? " error=" + firstLine(choice.error()) : "");
+
+        if (applied) {
+            counts.continued++;
+            this.statsIntercepted++;
+            this.routeLeaseKey = askedWorkKey;
+            this.routeLeaseExpiresAt = this.bot.level().getGameTime() + ROUTE_LEASE_TICKS;
+            // The point of the routing layer: no planning turn, no tokens, and the bot carries on
+            // with the job it was already doing. The report is what the next observation shows, so
+            // the model (when it is next asked) knows the gap was deliberate.
+            this.actionReports.addLast("Jev routing said CONTINUE with confidence "
+                    + String.format(java.util.Locale.ROOT, "%.2f", choice.confidence())
+                    + "; keep working on what is already queued instead of planning again");
+            this.thinking.set(false);
+            this.cooldownTicks = ROUTE_CONTINUE_COOLDOWN_TICKS;
+            return;
+        }
+
+        // ESCALATE_LLM, shadow mode, a low-confidence CONTINUE, an error or an unknown choice: the
+        // planning model sees the situation and decides for itself, exactly as before routing existed.
+        counts.escalated++;
+        this.statsEscalated++;
+        this.beginDecision();
+    }
+
+    /**
+     * Suppress repeated open-ended planning after a bounded mining trip proved this site fruitless.
+     * The first turn is immediate; subsequent turns use 60/180/300 second delays. Direct chat and
+     * COMMAND/STUCK decisions never enter this IDLE/RESUME guard and therefore remain immediate.
+     */
+    private boolean backoffZeroYieldPlanning(Trigger trigger) {
+        if (this.lastMiningGoalGained != 0 || this.standingGoal == null
+                || !looksLikeMiningJob(this.standingGoal)) {
+            return false;
+        }
+        long now = this.bot.level().getGameTime();
+        if (now >= this.zeroYieldNextPlannerTick) {
+            int index = Math.min(this.zeroYieldBackoffIndex,
+                    ZERO_YIELD_BACKOFF_TICKS.length - 1);
+            int delay = ZERO_YIELD_BACKOFF_TICKS[index];
+            this.zeroYieldBackoffIndex = Math.min(this.zeroYieldBackoffIndex + 1,
+                    ZERO_YIELD_BACKOFF_TICKS.length - 1);
+            this.zeroYieldNextPlannerTick = now + delay;
+            LOG.info("JEV ROUTING bot={} trigger={} zero_yield_replan=allowed "
+                            + "next_after_ticks={} goal={}",
+                    this.bot.getName().getString(), trigger, delay, this.standingGoal);
+            return false;
+        }
+        long remaining = this.zeroYieldNextPlannerTick - now;
+        this.statsBackoffAvoided++;
+        this.actionReports.addLast("the last mining trip found none of the requested resource; "
+                + "waiting " + Math.max(1L, remaining / 20L)
+                + "s before buying another identical planning turn unless new input arrives");
+        LOG.info("JEV ROUTING bot={} trigger={} zero_yield_replan=backoff "
+                        + "remaining_ticks={} goal={}",
+                this.bot.getName().getString(), trigger, remaining, this.standingGoal);
+        this.thinking.set(false);
+        this.cooldownTicks = (int) Math.min(Integer.MAX_VALUE, Math.max(1L, remaining));
+        return true;
+    }
+
+    /** Stable identity of the exact physical work a CONTINUE answer was about. */
+    @Nullable
+    private String currentRouteLeaseKey() {
+        MineJob mine = this.mineJob;
+        if (mine != null) {
+            return "mine:" + System.identityHashCode(mine) + ':' + mine.failures.hashCode()
+                    + ':' + mine.unreachable;
+        }
+        CombatJob combat = this.combatJob;
+        if (combat != null) {
+            return "combat:" + combat.targetId + ':' + combat.blockedPlans;
+        }
+        if (this.isMoving()) {
+            var manager = com.melody.mcagent.rt.Agent.botManager();
+            var handle = manager == null ? null : manager.get(this.bot.getName().getString());
+            Vec3 target = handle == null ? null : handle.movement().getTarget();
+            return target == null ? "move:unknown"
+                    : String.format(java.util.Locale.ROOT, "move:%.2f:%.2f:%.2f",
+                            target.x, target.y, target.z);
+        }
+        QueuedCall first = this.queue.peekFirst();
+        return first == null ? null : "queue:" + first.call.id() + ':' + this.queue.size();
+    }
+
+    private void clearRouteLease() {
+        this.routeLeaseKey = null;
+        this.routeLeaseExpiresAt = -1L;
+    }
+
+    /**
+     * Carry an idle bot's standing goal with the runtime instead of buying a planning turn for it.
+     *
+     * <p>This is the other half of the idle loop. The routing layer deliberately does not ask JEV
+     * when nothing is queued and nothing is running, because a cheap "carry on" answer there would be
+     * a bot standing still forever - but the answer does not have to come from a model at all when the
+     * runtime owns a skill for the job the operator asked for.
+     *
+     * <p>Bounded on purpose: only an operator-set standing goal ({@code /mcagent goal <bot> ...}) that
+     * reads as a mining job counts, the pack must have room, and a trip may only be started once every
+     * {@link #IDLE_CONTINUATION_COOLDOWN_TICKS}. Anything else - no goal, a goal about something the
+     * runtime has no skill for, a full pack - falls through to the planning model exactly as before,
+     * with a line saying which precondition failed. Guessing at a goal the runtime cannot actually
+     * carry is how a cheap layer turns into a bot that does nothing all day.
+     */
+    private boolean startIdleContinuation(Trigger trigger) {
+        String goal = this.standingGoal;
+        if (goal == null || goal.isBlank() || !miningSkillEnabled() || !this.policy.canBreakBlocks()
+                || this.miningGoal != null || !looksLikeMiningJob(goal)) {
+            return false;
+        }
+        String botName = this.bot.getName().getString();
+        long now = this.bot.level().getGameTime();
+        if (now - this.lastIdleContinuationTick < IDLE_CONTINUATION_COOLDOWN_TICKS) {
+            return false;
+        }
+        if (this.emptyInventorySlots() <= 2) {
+            LOG.info("JEV ROUTING bot={} trigger={} idle_continuation=blocked "
+                    + "reason=inventory_full empty_slots={} goal={}",
+                    botName, trigger, this.emptyInventorySlots(), goal);
+            return false;
+        }
+        if (this.lastMiningGoalGained == 0) {
+            LOG.info("JEV ROUTING bot={} trigger={} idle_continuation=blocked "
+                    + "reason=last_trip_found_nothing gained={} goal={}",
+                    botName, trigger, this.lastMiningGoalGained, goal);
+            return false;
+        }
+
+        this.lastIdleContinuationTick = now;
+        JsonObject args = new JsonObject();
+        // No resource is guessed from the goal text: the skill's own priority list (iron, coal,
+        // copper, gold, redstone, diamond) is the honest general answer, and it stops after a bounded
+        // number of tunnel chunks rather than mining forever.
+        args.addProperty("max_tunnel_chunks", 4);
+        String result = this.startMiningGoal(args);
+        if (isFailure(result)) {
+            LOG.info("JEV ROUTING bot={} trigger={} idle_continuation=failed goal={} result={}",
+                    botName, trigger, goal, firstLine(result));
+            return false;
+        }
+        this.statsIdleContinuations++;
+        this.actionReports.addLast("the runtime carried your standing goal itself instead of planning "
+                + "again: " + firstLine(result));
+        LOG.info("JEV ROUTING bot={} trigger={} idle_continuation=mining goal={} result={}",
+                botName, trigger, goal, firstLine(result));
+        this.thinking.set(false);
+        this.cooldownTicks = ROUTE_CONTINUE_COOLDOWN_TICKS;
+        return true;
+    }
+
+    /**
+     * Whether a standing goal reads as a mining job.
+     *
+     * <p>A token test, deliberately narrow and deliberately not clever: the cost of a false positive
+     * is a bot that goes mining when the operator asked for something else, and the cost of a false
+     * negative is one planning turn - which is exactly what happens today anyway.
+     */
+    private static boolean looksLikeMiningJob(String goal) {
+        String text = goal.toLowerCase(java.util.Locale.ROOT);
+        for (String token : new String[] {"挖矿", "采矿", "开采", "下矿", "矿石", "矿脉", "挖点矿",
+                "mine", "mining", "ore", "quarry", "dig down"}) {
+            if (text.contains(token)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The compact state a continue/think-again decision is asked with.
+     *
+     * <p>Bounded on purpose: this question is asked on ordinary idle ticks, so it gets a few hundred
+     * characters rather than an observation. It has to answer one thing - is there real work in
+     * progress that a new plan would interrupt - and everything here is chosen for that.
+     */
+    private String routingState(Trigger trigger) {
+        StringBuilder sb = new StringBuilder("Minecraft bot decision. bot=")
+                .append(this.bot.getName().getString())
+                .append("; dimension=").append(this.bot.level().dimension().location())
+                .append("; trigger=").append(trigger)
+                .append("; current_action=").append(this.describeCurrentAction())
+                .append("; queue_size=").append(this.queue.size())
+                .append("; long_action_running=").append(this.isLongActionRunning());
+        if (!this.queue.isEmpty()) {
+            sb.append("; queued_in_order=[");
+            int shown = 0;
+            for (QueuedCall queued : this.queue) {
+                if (shown == 4) {
+                    sb.append(" | ...");
+                    break;
+                }
+                if (shown++ > 0) {
+                    sb.append(" | ");
+                }
+                sb.append(queued.call.name());
+            }
+            sb.append(']');
+        }
+        String goal = this.standingGoal;
+        sb.append("; standing_goal=")
+          .append(goal == null || goal.isBlank() ? "(none)" : goal);
+        long now = this.bot.level().getGameTime();
+        sb.append("; seconds_since_last_completed_turn=")
+          .append(this.lastCompletedTurnTick < 0 ? "never"
+                  : Math.max(0L, (now - this.lastCompletedTurnTick) / 20L));
+        List<String> reports = this.recentReports(3);
+        if (!reports.isEmpty()) {
+            sb.append("; recent_reports=[");
+            for (int i = 0; i < reports.size(); i++) {
+                if (i > 0) {
+                    sb.append(" | ");
+                }
+                sb.append(firstLine(reports.get(i)));
+            }
+            sb.append(']');
+        }
+        String state = sb.toString();
+        return state.length() <= ROUTING_STATE_MAX_CHARS ? state
+                : state.substring(0, ROUTING_STATE_MAX_CHARS - 3) + "...";
+    }
+
+    /** The newest action reports, without consuming them the way an observation does. */
+    private List<String> recentReports(int limit) {
+        int size = this.actionReports.size();
+        if (size == 0 || limit <= 0) {
+            return List.of();
+        }
+        List<String> out = new ArrayList<>(Math.min(limit, size));
+        int skip = Math.max(0, size - limit);
+        int index = 0;
+        for (String report : this.actionReports) {
+            if (index++ >= skip) {
+                out.add(report);
+            }
+        }
+        return out;
+    }
+
+    /** This trigger's routing tally, created on first use. Server thread only. */
+    private RouteCounts countersFor(Trigger trigger) {
+        return this.routingCounts.computeIfAbsent(trigger, key -> new RouteCounts());
+    }
+
+    /**
+     * Write the cheap-layer counters to the log every few minutes, and start a new window.
+     *
+     * <p>This exists because "is the cheap layer reducing LLM calls?" could not be answered from the
+     * log at all: a call that did not happen leaves no line, so the only visible number was the
+     * absolute call rate, which moves with how busy the bot happens to be. One line per window makes
+     * the answer a subtraction: calls that were made, versus decisions the routing layer intercepted
+     * and decisions the runtime carried itself.
+     */
+    private void logStatsWindow() {
+        long now = this.bot.level().getGameTime();
+        if (this.statsWindowStartTick < 0) {
+            this.statsWindowStartTick = now;
+            return;
+        }
+        long elapsed = now - this.statsWindowStartTick;
+        if (elapsed < STATS_WINDOW_TICKS) {
+            return;
+        }
+        int avoided = this.statsIntercepted + this.statsSpeechAvoided
+                + this.statsLeaseContinuations + this.statsIdleContinuations
+                + this.statsBackoffAvoided;
+        int opportunities = this.statsPlannerRequests + avoided;
+        LOG.info("JEV STATS bot={} window={}m planner_requests={} planner_succeeded={} "
+                        + "planner_failed={} planner_no_action={} jev_requests={} routed={} "
+                        + "lease={} speech_silent={} idle_continuation={} zero_yield_backoff={} "
+                        + "idle_escalated={} jev_escalated={} avoided={} avoided_percent={}",
+                this.bot.getName().getString(), Math.max(1, elapsed / 1200),
+                this.statsPlannerRequests, this.statsPlannerSucceeded, this.statsPlannerFailed,
+                this.statsPlannerNoAction, this.statsJevRequests, this.statsIntercepted,
+                this.statsLeaseContinuations, this.statsSpeechAvoided,
+                this.statsIdleContinuations, this.statsBackoffAvoided, this.statsIdleSkipped,
+                this.statsEscalated, avoided,
+                opportunities == 0 ? 0 : (100 * avoided / opportunities));
+        this.statsPlannerRequests = 0;
+        this.statsPlannerSucceeded = 0;
+        this.statsPlannerFailed = 0;
+        this.statsPlannerNoAction = 0;
+        this.statsJevRequests = 0;
+        this.statsIntercepted = 0;
+        this.statsSpeechAvoided = 0;
+        this.statsLeaseContinuations = 0;
+        this.statsBackoffAvoided = 0;
+        this.statsIdleSkipped = 0;
+        this.statsIdleContinuations = 0;
+        this.statsEscalated = 0;
+        this.statsWindowStartTick = now;
+    }
+
+    /** Every trigger's routing tally, including the ones never seen (as zeroes). */
+    private Map<String, Object> routingCounters() {
+        Map<String, Object> out = new LinkedHashMap<>();
+        for (Trigger trigger : Trigger.values()) {
+            RouteCounts counts = this.routingCounts.get(trigger);
+            Map<String, Object> one = new LinkedHashMap<>();
+            one.put("asked", counts == null ? 0 : counts.asked);
+            one.put("continued", counts == null ? 0 : counts.continued);
+            one.put("escalated", counts == null ? 0 : counts.escalated);
+            one.put("failed", counts == null ? 0 : counts.failed);
+            out.put(trigger.name(), one);
+        }
+        return out;
+    }
+
+    /**
+     * Whether a line asks this bot to speak a particular language.
+     *
+     * <p>A token list rather than anything clever, and deliberately only about language: the cost of
+     * a false positive is one planning turn, the cost of a false negative is a player who is certain
+     * the bot is broken. Production needed exactly this case - a player answered the bot's question
+     * with "转中文" and the silence gate read it as chatter.
+     */
+    private static boolean looksLikeLanguageRequest(String text) {
+        if (text == null || text.isBlank()) {
+            return false;
+        }
+        String lower = text.toLowerCase(java.util.Locale.ROOT);
+        for (String marker : new String[] {"中文", "汉语", "普通话", "chinese", "mandarin", "中文回",
+                "中文说"}) {
+            if (lower.contains(marker)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Whether a line reads as a question in the languages this server's players use. */
+    private static boolean looksLikeQuestion(String text) {
+        if (text == null) {
+            return false;
+        }
+        if (text.indexOf('?') >= 0 || text.indexOf('？') >= 0) {
+            return true;
+        }
+        for (String marker : new String[] {"吗", "呢", "怎么", "为什么", "如何", "什么", "哪", "几点",
+                "多少", "是不是", "能不能", "可不可以"}) {
+            if (text.contains(marker)) {
+                return true;
+            }
+        }
+        String lower = text.toLowerCase(java.util.Locale.ROOT);
+        for (String marker : new String[] {"what ", "why ", "how ", "where ", "when ", "who ",
+                "can you", "could you", "do you", "are you", "is it"}) {
+            if (lower.contains(marker)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private void handleCompletion(LlmClient.Completion completion) {
         try {
             if (completion.failed()) {
+                this.statsPlannerFailed++;
                 LOG.warn("Bot {} got an LLM error: {}", this.bot.getName().getString(), completion.error());
                 // Back off so a broken endpoint does not hammer the API.
                 this.cooldownTicks = 200;
                 return;
             }
+            this.statsPlannerSucceeded++;
 
             // Record what the provider actually charged us for this turn: ground truth for how big the
             // transcript really is, as opposed to our character-based estimate.
@@ -1521,6 +3269,7 @@ public final class AgentBrain {
                     completion.content(), completion.toolCalls(), completion.reasoningContent()));
 
             if (!completion.hasToolCalls()) {
+                this.statsPlannerNoAction++;
                 // Prose is private thought, including on chat-triggered turns. A player message must
                 // invoke the model immediately, but it must not force a public answer; speaking is
                 // an explicit say tool call so the model can deliberately stay silent.
@@ -1555,6 +3304,9 @@ public final class AgentBrain {
 
             this.turnsCompleted.incrementAndGet();
             this.ticksSinceDecision = 0;
+            // How long the bot has been without a fresh plan, which is what a routing decision needs
+            // to know; ticksSinceDecision also resets while a long action runs, so it cannot answer it.
+            this.lastCompletedTurnTick = this.bot.level().getGameTime();
 
             // A short pause lets movement and world changes become observable before the next look.
             // After being spoken to, come back sooner: a conversation that stalls for seconds
@@ -1589,9 +3341,16 @@ public final class AgentBrain {
         this.turnCalls = calls;
         this.turnResults = new String[calls.size()];
         this.nextResultToFlush = 0;
+        this.turnAbandoned = false;
 
         int executed = 0;
         for (int i = 0; i < calls.size(); i++) {
+            if (this.turnAbandoned) {
+                // An earlier step in this same turn ended the turn - `interrupt` does exactly that.
+                // The steps after it were answered as cancelled by abandonPlan(); running them anyway
+                // would be work the model was told would not happen.
+                break;
+            }
             LlmClient.ToolCall call = calls.get(i);
 
             if (executed >= MAX_TOOL_CALLS_PER_TURN) {
@@ -1605,7 +3364,13 @@ public final class AgentBrain {
 
             boolean busy = !this.queue.isEmpty() || this.isLongActionRunning();
             if (!busy || isConcurrent(call.name())) {
-                String result = this.execute(call);
+                String result;
+                this.executingCallIndex = i;
+                try {
+                    result = this.execute(call);
+                } finally {
+                    this.executingCallIndex = -1;
+                }
                 if (LOG.isInfoEnabled()) {
                     LOG.info("Bot {} called {}({}) -> {}", this.bot.getName().getString(),
                             call.name(), summarise(call.arguments()), firstLine(result));
@@ -1631,6 +3396,7 @@ public final class AgentBrain {
             }
         }
 
+        this.turnAbandoned = false;
         this.flushResults();
     }
 
@@ -1660,12 +3426,16 @@ public final class AgentBrain {
             if (next.abortPlanOnFailure && isFailure(result)) {
                 int discarded = this.queue.size();
                 this.queue.clear();
+                this.authorisedTunnelClearance.clear();
                 this.actionReports.addLast("the plan stopped because " + next.call.name()
                         + " failed; discarded " + discarded
                         + " dependent step(s) and requested a fresh decision");
                 this.cooldownTicks = 0;
                 break;
             }
+        }
+        if (this.queue.isEmpty()) {
+            this.authorisedTunnelClearance.clear();
         }
     }
 
@@ -1688,9 +3458,13 @@ public final class AgentBrain {
         if (steps.size() > MAX_PLAN_STEPS) {
             return "failed: a plan may contain at most " + MAX_PLAN_STEPS + " steps";
         }
-        if (this.queue.size() + steps.size() > MAX_QUEUED_ACTIONS) {
+        boolean replaceCurrent = args.has("replace_current")
+                && args.get("replace_current").isJsonPrimitive()
+                && args.get("replace_current").getAsBoolean();
+        if (!replaceCurrent && this.queue.size() + steps.size() > MAX_QUEUED_ACTIONS) {
             return "failed: the action queue already has " + this.queue.size()
-                    + " step(s); wait for it to drain before adding " + steps.size() + " more";
+                    + " step(s); wait for it to drain or set replace_current=true before adding "
+                    + steps.size() + " more";
         }
 
         List<QueuedCall> parsed = new ArrayList<>(steps.size());
@@ -1718,6 +3492,21 @@ public final class AgentBrain {
             parsed.add(new QueuedCall(
                     new LlmClient.ToolCall("plan_step_" + (i + 1), tool, stepArgs),
                     -1, !continueOnFailure));
+        }
+
+        int replaced = 0;
+        String replacedAction = null;
+        if (replaceCurrent) {
+            replaced = this.queue.size();
+            if (this.isLongActionRunning()) {
+                replacedAction = this.describeCurrentAction();
+            }
+            this.abandonCurrentAction();
+            this.queue.clear();
+            this.authorisedTunnelClearance.clear();
+            this.abortQueueIfMovementFails = false;
+            this.pendingSleep = null;
+            this.cooldownTicks = 0;
         }
 
         int started = 0;
@@ -1748,6 +3537,11 @@ public final class AgentBrain {
         int queued = this.queue.size();
         String result = "accepted " + parsed.size() + " sequential step(s); "
                 + started + " ran immediately and " + queued + " total step(s) are waiting";
+        if (replaceCurrent) {
+            result += ". Replaced "
+                    + (replacedAction == null ? "the previous schedule" : replacedAction)
+                    + " and cancelled " + replaced + " older queued step(s)";
+        }
         if (!immediate.isEmpty()) {
             result += ". Started: " + String.join("; ", immediate);
         }
@@ -1757,7 +3551,7 @@ public final class AgentBrain {
     /** Policy gate for nested plan actions; execution checks the same policy again. */
     private boolean planToolAvailable(String tool) {
         return switch (tool) {
-            case "mine", "dig_tunnel", "escape_up" -> this.policy.canBreakBlocks();
+            case "mine", "mine_resource", "dig_tunnel", "escape_up" -> this.policy.canBreakBlocks();
             case "place", "use" -> this.policy.canPlaceBlocks();
             case "open_container", "withdraw", "deposit" -> this.policy.canUseContainers();
             case "attack" -> this.policy.canAttack();
@@ -1821,22 +3615,32 @@ public final class AgentBrain {
      * unanswered tool call would make every later request malformed.
      */
     private void abandonPlan(String reason) {
+        this.turnAbandoned = true;
         if (this.turnResults == null) {
             this.queue.clear();
+            this.authorisedTunnelClearance.clear();
             this.abortQueueIfMovementFails = false;
             return;
         }
+        // A call that cancels the turn from inside its own execution still owns its result slot:
+        // leaving it null here means runTurn() records the real answer instead of the generic
+        // "cancelled" placeholder. Every other pending step gets the honest cancellation.
+        int running = this.executingCallIndex;
         for (int i = this.nextResultToFlush; i < this.turnResults.length; i++) {
-            if (this.turnResults[i] == null) {
+            if (this.turnResults[i] == null && i != running) {
                 this.turnResults[i] = "cancelled: " + reason;
             }
         }
         this.queue.clear();
+        this.authorisedTunnelClearance.clear();
         this.abortQueueIfMovementFails = false;
-        this.flushResults();
-        this.turnCalls = null;
-        this.turnResults = null;
-        this.nextResultToFlush = 0;
+        if (running < 0) {
+            // Called from outside the dispatcher (death, pause, watchdog): close the turn here.
+            this.flushResults();
+            this.turnCalls = null;
+            this.turnResults = null;
+            this.nextResultToFlush = 0;
+        }
     }
 
     /**
@@ -2057,9 +3861,16 @@ public final class AgentBrain {
                 "Preferred for every task with two or more known actions. Submit one compact, "
                 + "strictly sequential plan instead of many sibling tool calls. Up to "
                 + MAX_PLAN_STEPS + " steps are buffered and keep running while the next LLM call "
-                + "is still in flight. A failed step cancels later dependent steps by default; set "
-                + "continue_on_failure only when that particular later work is independent. Do not "
-                + "pad a plan with observe/look_at/stop ceremonies or guess unknown coordinates.",
+                + "is still in flight. Put EVERY step you already know into this one plan: a plan "
+                + "that ends after one or two steps buys another full planning turn seconds later, "
+                + "which is the most expensive mistake you can make here. Chain the whole errand - "
+                + "walk, open, take, craft, place, mine the vein, return - and let the runtime stop "
+                + "it if the world disagrees. A failed step cancels later dependent steps by "
+                + "default; set continue_on_failure only when that particular later work is "
+                + "independent. Do not pad a plan with observe/look_at/stop ceremonies or guess "
+                + "unknown coordinates. Set replace_current=true when this plan intentionally "
+                + "supersedes the action and queue already in progress; do not put interrupt inside "
+                + "the steps.",
                 planSchema()));
 
         tools.add(new LlmClient.ToolSpec("observe",
@@ -2081,7 +3892,10 @@ public final class AgentBrain {
                         "z", "number: Z"), List.of("x", "y", "z"))));
 
         tools.add(new LlmClient.ToolSpec("say",
-                "Speak in chat. Other players will see this message.",
+                "Speak in chat. Other players will see this message. Speak only to answer a player, "
+                + "to report a task you have finished, or to report a blocker you cannot solve. Never "
+                + "narrate progress you are already making, and never announce that you will report "
+                + "something later - a promise to speak again is not information.",
                 LlmClient.schema(LlmClient.params("message", "string: what to say"), List.of("message"))));
 
         tools.add(new LlmClient.ToolSpec("eat",
@@ -2101,12 +3915,79 @@ public final class AgentBrain {
                 + "as routine travel.",
                 LlmClient.schema(LlmClient.params())));
 
-        if (this.policy.canBreakBlocks()) {
+        tools.add(new LlmClient.ToolSpec("find_resource",
+                "Search current light-x-ray perception for concrete blocks matching a resource "
+                + "name or registry id. Returns several exact candidates, their distance, and "
+                + "whether each is exposed or occluded. Use this instead of guessing coordinates.",
+                LlmClient.schema(LlmClient.params(
+                        "resource", "string: block/resource name, e.g. copper_ore, oak_log or chest",
+                        "radius", "number: optional search radius, 4-48; defaults to current perception radius"),
+                        List.of("resource"))));
+
+        if (com.melody.mcagent.rt.action.Backpacks.available()) {
+            tools.add(new LlmClient.ToolSpec("backpack",
+                    "Look inside your Sophisticated Backpack (worn in the Curios back slot): how full "
+                    + "it is, what is in it, and which upgrades are installed. Check it before putting "
+                    + "things away or taking them out.",
+                    LlmClient.schema(LlmClient.params())));
+            tools.add(new LlmClient.ToolSpec("backpack_sort",
+                    "Sort the backpack's contents with the backpack mod's own sorting.",
+                    LlmClient.schema(LlmClient.params())));
+            tools.add(new LlmClient.ToolSpec("backpack_wear",
+                    "Wear your Sophisticated Backpack in the Curios back slot. Use this after a player "
+                    + "gives you one or after you craft one; it takes no armour or offhand slot. Name "
+                    + "the item when you are carrying more than one backpack - a worn backpack is put "
+                    + "back in your inventory when it is replaced.",
+                    LlmClient.schema(LlmClient.params(
+                            "item", "string: which backpack to wear, e.g. "
+                                    + "sophisticatedbackpacks:diamond_backpack"))));
+            tools.add(new LlmClient.ToolSpec("backpack_put",
+                    "Put items from your own inventory into the backpack. Omit item to put away "
+                    + "everything that fits.",
+                    LlmClient.schema(LlmClient.params(
+                            "item", "string: optional item id or name to put away",
+                            "count", "number: optional how many"))));
+            tools.add(new LlmClient.ToolSpec("backpack_take",
+                    "Take items out of the backpack into your own inventory. Omit item to take out "
+                    + "whatever is in there.",
+                    LlmClient.schema(LlmClient.params(
+                            "item", "string: optional item id or name to take out",
+                            "count", "number: optional how many"))));
+            tools.add(new LlmClient.ToolSpec("backpack_upgrade",
+                    "Install an upgrade you are carrying - a stack upgrade you just crafted, or one a "
+                    + "player handed you - into the backpack's upgrade slots.",
+                    LlmClient.schema(LlmClient.params(
+                            "item", "string: optional upgrade item id or name"))));
+        }
+
+        if (this.policy.canBreakBlocks() && miningSkillEnabled()) {
+            tools.add(new LlmClient.ToolSpec("start_mining",
+                    "Start one persistent mining trip and return immediately. Use this for player "
+                    + "requests such as 'go mining' or 'bring back 32 iron': the runtime repeatedly "
+                    + "finds priority ores, creates/reuses the one safe tunnel, mines, watches "
+                    + "inventory/health/hunger, and returns home without another planning call. Do "
+                    + "not also submit per-block mine/dig_tunnel/escape plans for the same trip.",
+                    miningGoalSchema()));
+
+            tools.add(new LlmClient.ToolSpec("mine_resource",
+                    "Find and mine the nearest currently perceived block matching a resource name. "
+                    + "This avoids coordinate guessing and automatically creates a safe physical "
+                    + "access route for light-x-ray/occluded targets. vein_radius follows connected "
+                    + "blocks of the same exact type; use 0 for one block.",
+                    LlmClient.schema(LlmClient.params(
+                            "resource", "string: block/resource name or id, e.g. iron_ore or oak_log",
+                            "search_radius", "number: optional search radius, default current perception radius",
+                            "vein_radius", "number: optional connected-block radius, default 6",
+                            "item", "string: optional tool; automatic tool economy still applies"),
+                            List.of("resource"))));
+
             tools.add(new LlmClient.ToolSpec("mine",
                     "Break a block, taking the correct amount of time for your tool. Give a radius to "
                     + "fell a whole tree or clear a vein in one go: the job keeps breaking connected "
                     + "blocks of the SAME kind within that many blocks of the one you named, then "
-                    + "walks over and picks up the drops. Use radius 0 or omit it for a single block.",
+                    + "walks over and picks up the drops. Use radius 0 or omit it for a single block. "
+                    + "Player-built blocks are protected and the job refuses them: a building's "
+                    + "blocks, its furniture, storage and machines, and the ground under its floor.",
                     LlmClient.schema(LlmClient.params(
                             "x", "number: X", "y", "number: Y", "z", "number: Z",
                             "radius", "number: optional, how far the job may spread, e.g. 6 for a tree",
@@ -2118,18 +3999,20 @@ public final class AgentBrain {
                     "Preferred way to mine underground or descend. Locally digs and walks through "
                     + "a safe two-block-high tunnel without guessing per-block coordinates. mode=down "
                     + "makes a descending staircase; mode=level makes a branch/strip-mine tunnel. "
-                    + "The first call establishes one persistent entrance. Calls made after unloading "
+                    + "The first call establishes the one persistent entrance allowed near home. "
+                    + "That entrance cannot be replaced by a later tool call. Calls made after unloading "
                     + "at storage automatically return through that entrance to the saved working face, "
-                    + "instead of opening another hole. Set new_site=true only when a player explicitly "
-                    + "wants a different mine. One call handles up to 24 blocks with real tool timing "
+                    + "instead of opening another hole. Horizontal tunnelling is refused in the home "
+                    + "surface band; descend first, then branch underground. One call handles up to 24 "
+                    + "blocks with real tool timing "
                     + "and drops. It stops before fluids, falling blocks, gaps, block entities or "
-                    + "unbreakable terrain.",
+                    + "unbreakable terrain, and it refuses to start inside a player-built structure: "
+                    + "walk out of the base and dig in natural ground instead of putting a hole in it.",
                     LlmClient.schema(LlmClient.params(
                             "direction", "string: north, south, east or west",
                             "mode", "string: down or level",
                             "length", "number: tunnel length from 1 to 24",
-                            "item", "string: optional fallback tool; ordinary stone automatically uses stone_pickaxe",
-                            "new_site", "boolean: optional, default false; deliberately abandon the old mine route"),
+                            "item", "string: optional fallback tool; ordinary stone automatically uses stone_pickaxe"),
                             List.of("direction", "mode", "length"))));
 
             tools.add(new LlmClient.ToolSpec("escape_up",
@@ -2137,7 +4020,9 @@ public final class AgentBrain {
                     + "staircase with real jump clearance and normal mining time, then walking up each tread. "
                     + "One call climbs up to 8 blocks and avoids block entities, falling blocks, "
                     + "fluids and unbreakable terrain. Prefer this after goto says there is no route; "
-                    + "use return_to_spawn if it reports no safe staircase.",
+                    + "use return_to_spawn if it reports no safe staircase. Inside a player-built "
+                    + "structure it will not dig through the building: it walks you out through the "
+                    + "door or opening instead.",
                     LlmClient.schema(LlmClient.params(
                             "item", "string: optional tool from your pack, e.g. iron_pickaxe"))));
         }
@@ -2277,6 +4162,12 @@ public final class AgentBrain {
         root.addProperty("additionalProperties", false);
 
         JsonObject properties = new JsonObject();
+        JsonObject replaceCurrent = new JsonObject();
+        replaceCurrent.addProperty("type", "boolean");
+        replaceCurrent.addProperty("description",
+                "default false; true atomically stops the current walk/mine/fight and discards its "
+                + "queued tail before starting these replacement steps");
+        properties.add("replace_current", replaceCurrent);
         JsonObject steps = new JsonObject();
         steps.addProperty("type", "array");
         steps.addProperty("description", "2-24 actions to execute in strict order");
@@ -2324,6 +4215,54 @@ public final class AgentBrain {
     }
 
     /**
+     * The persistent-trip schema, written out rather than described to {@link LlmClient#schema}.
+     *
+     * <p>{@code schema()} reads a property's type from the text before the first colon, so a hint
+     * written as "array of strings: ..." is emitted as {@code "type": "array of strings"}. That is not
+     * a JSON Schema type, and the production provider rejected the whole request with
+     * {@code 11129 invalid function call parameters} — every planning call failed until it was
+     * corrected, and no dev-server test could see it because the scripted model ignores tool
+     * schemas. Arrays therefore have to be built by hand, with an {@code items} type.
+     */
+    private static JsonObject miningGoalSchema() {
+        JsonObject root = new JsonObject();
+        root.addProperty("type", "object");
+        root.addProperty("additionalProperties", false);
+
+        JsonObject properties = new JsonObject();
+
+        JsonObject primary = new JsonObject();
+        primary.addProperty("type", "string");
+        primary.addProperty("description",
+                "main resource, e.g. iron_ore; optional for a general trip");
+        properties.add("primary", primary);
+
+        JsonObject secondary = new JsonObject();
+        secondary.addProperty("type", "array");
+        secondary.addProperty("description", "other useful ores in priority order");
+        JsonObject secondaryItem = new JsonObject();
+        secondaryItem.addProperty("type", "string");
+        secondary.add("items", secondaryItem);
+        properties.add("secondary", secondary);
+
+        JsonObject amount = new JsonObject();
+        amount.addProperty("type", "number");
+        amount.addProperty("description",
+                "optional new primary-resource items to obtain; 0 means a normal trip");
+        properties.add("amount", amount);
+
+        JsonObject chunks = new JsonObject();
+        chunks.addProperty("type", "number");
+        chunks.addProperty("description",
+                "optional 8-block tunnel chunks before returning, default 12");
+        properties.add("max_tunnel_chunks", chunks);
+
+        root.add("properties", properties);
+        root.add("required", new JsonArray());
+        return root;
+    }
+
+    /**
      * Tools that may run <em>while</em> the bot is already busy walking or mining.
      *
      * <p>The distinction is what makes a multi-step plan possible. A model that asks for
@@ -2343,7 +4282,9 @@ public final class AgentBrain {
             // queued too" - it had diagnosed its own problem correctly and been ignored.
             case "plan", "say", "look_at", "eat", "remember", "forget", "recall",
                  "find_item", "find_uses", "craftable_now", "interrupt", "return_to_spawn",
-                 "escape_up" -> true;
+                 "escape_up", "start_mining",
+                 // Reading the backpack is a look, not a change: it must not wait behind a walk.
+                 "backpack" -> true;
             default -> false;
         };
     }
@@ -2477,53 +4418,174 @@ public final class AgentBrain {
 
         // Finish the break in progress.
         if (job.current != null) {
-            if (--job.ticksRemaining > 0) {
-                return true;
+            if (!job.finishSent) {
+                if (--job.ticksRemaining > 0) {
+                    return true;
+                }
+                Actions.finishBreak(this.bot, job.current, job.face);
+                job.finishSent = true;
+                job.verifyTicksRemaining = MINE_BREAK_VERIFY_TICKS;
             }
-            Actions.finishBreak(this.bot, job.current, job.face);
-            job.broken++;
-            // Take this block's drops with it, as it falls. Walking to each one is what used to make
-            // a "chop the tree" job take minutes; see Actions.collectBreakDrops.
-            job.collected += Actions.collectBreakDrops(this.bot, job.current);
-            this.expandMineFrontier(job, job.current);
-            job.current = null;
-            job.approachTicks = 0;
+            // Protection mods and server hooks may reject STOP_DESTROY_BLOCK without throwing. Do
+            // not count a block merely because the timer elapsed; verify that the original block
+            // actually changed. Vanilla may publish a delayed destroy on a following server tick,
+            // so give it a bounded grace period before calling the break rejected.
+            BlockState after = this.bot.level().getBlockState(job.current);
+            if (job.currentType != null && after.is(job.currentType)) {
+                if (job.verifyTicksRemaining-- > 0) {
+                    return true;
+                }
+                job.failed("BREAK_REJECTED");
+                job.unreachable++;
+                LOG.info("Bot {} could not break {}: the original block remained after the timed "
+                        + "break (protected or rejected)", this.bot.getName().getString(),
+                        job.current.toShortString());
+                job.current = null;
+                job.currentType = null;
+                job.approachTicks = 0;
+            } else {
+                job.broken++;
+                if (job.current.equals(job.origin)) {
+                    job.originCompleted = true;
+                }
+                if (job.clearanceTargets.remove(job.current)) {
+                    job.clearanceBroken++;
+                }
+                this.rememberSelfCleared(job.current);
+                // Take this block's drops with it, as it falls. Walking to each one is what used to
+                // make a "chop the tree" job take minutes; see Actions.collectBreakDrops.
+                job.collected += Actions.collectBreakDrops(this.bot, job.current);
+                this.expandMineFrontier(job, job.current);
+                job.current = null;
+                job.currentType = null;
+                job.approachTicks = 0;
+            }
+            job.finishSent = false;
+            job.verifyTicksRemaining = 0;
         }
 
         // Start the next one.
         while (job.current == null && !job.pending.isEmpty()) {
             BlockPos next = job.pending.pollFirst();
             if (this.bot.level().getBlockState(next).isAir()) {
+                if (next.equals(job.origin)) {
+                    job.originCompleted = true;
+                }
+                job.failed("TARGET_BECAME_AIR");
+                continue;
+            }
+            if (!job.allowHomeSurface && this.isProtectedHomeSurface(next)) {
+                job.failed("PROTECTED_HOME_SURFACE");
+                job.unreachable++;
+                LOG.info("Bot {} abandoned mining target {}: {}", this.bot.getName().getString(),
+                        next.toShortString(), this.homeSurfaceProtectionReason(next));
+                continue;
+            }
+            // Radius jobs spread to neighbours of the same block without passing through startMine
+            // again, so the structure rule is re-checked for every new target in the frontier.
+            String refusedTarget = PlayerStructure.protectionReason(
+                    this.bot.serverLevel(), this.bot.blockPosition(), next);
+            if (refusedTarget != null) {
+                job.failed("PROTECTED_STRUCTURE");
+                job.unreachable++;
+                LOG.info("Bot {} abandoned mining target {}: {}", this.bot.getName().getString(),
+                        next.toShortString(), refusedTarget);
+                continue;
+            }
+
+            // Light x-ray is perception, not reach. If another solid block is between the eyes and
+            // the target, remove that blocker first and then reconsider the original target from
+            // the changed world. This prevents the old behaviour of mining ore straight through a
+            // wall merely because Euclidean distance was under 4.5 blocks.
+            BlockPos blocker = Perception.firstBlockingBlock(this.bot, next);
+            if (blocker != null) {
+                if (!job.allowHomeSurface && this.isProtectedHomeSurface(blocker)) {
+                    job.failed("PROTECTED_HOME_SURFACE");
+                    job.unreachable++;
+                    LOG.info("Bot {} abandoned mining target {}: blocker {} would scar home terrain",
+                            this.bot.getName().getString(), next.toShortString(),
+                            blocker.toShortString());
+                    continue;
+                }
+                String refusedBlocker = PlayerStructure.protectionReason(
+                        this.bot.serverLevel(), this.bot.blockPosition(), blocker);
+                if (refusedBlocker != null) {
+                    job.failed("PROTECTED_STRUCTURE");
+                    job.unreachable++;
+                    LOG.info("Bot {} abandoned mining target {}: the block in the way {} is {}",
+                            this.bot.getName().getString(), next.toShortString(),
+                            blocker.toShortString(), refusedBlocker);
+                    continue;
+                }
+                BlockState blockerState = this.bot.level().getBlockState(blocker);
+                boolean unsafe = !blockerState.getFluidState().isEmpty()
+                        || blockerState.getBlock() instanceof FallingBlock
+                        || this.bot.level().getBlockEntity(blocker) != null
+                        || isEscapeHazard(blockerState)
+                        || Actions.ticksToBreak(this.bot, blocker) == Integer.MAX_VALUE;
+                if (unsafe || !job.clearanceTargets.add(blocker)) {
+                    job.failed(unsafe ? "OCCLUDED_UNSAFE" : "OCCLUSION_NOT_CLEARED");
+                    job.unreachable++;
+                    LOG.info("Bot {} abandoned mining target {}: blocker {} was {}",
+                            this.bot.getName().getString(), next.toShortString(),
+                            blocker.toShortString(), unsafe ? "unsafe/unbreakable" : "still present after an attempt");
+                    continue;
+                }
+                // Revisit the intended block after its nearest obstruction. The blocker is an
+                // ordinary timed mining target, so protection, tool speed and drops still apply.
+                job.pending.addFirst(next);
+                job.pending.addFirst(blocker);
                 continue;
             }
             if (!Actions.canReach(this.bot, next)) {
-                // Out of arm's reach - a tree's upper trunk, or a vein around a corner. Walk to it
-                // rather than skipping it, because skipping is how a "chop the tree" job leaves the
-                // top half of the tree standing.
-                if (!this.approachForMining(next)) {
-                    if (++job.approachTicks > MINE_APPROACH_TIMEOUT_TICKS) {
-                        job.approachTicks = 0;
-                        job.unreachable++;
-                        continue; // genuinely unreachable; leave it and move on
-                    }
-                    job.pending.addFirst(next);
-                    return true;
+                // Count time without reaching the interaction envelope even while MovementDriver
+                // still owns a target. The previous code counted only failed path *creation*, so a
+                // path which existed on paper but made no physical progress kept MineJob alive
+                // forever and relied on the minute-long decision watchdog to notice.
+                if (++job.approachTicks > MINE_APPROACH_TIMEOUT_TICKS) {
+                    this.stopMoving();
+                    job.approachTicks = 0;
+                    job.unreachable++;
+                    job.failed("APPROACH_NO_PROGRESS");
+                    continue;
+                }
+                MovementDriver.Plan approach = this.approachForMining(next);
+                if (approach == MovementDriver.Plan.BLOCKED) {
+                    job.approachTicks = 0;
+                    job.unreachable++;
+                    job.failed("NO_REACHABLE_STAND");
+                    continue;
+                }
+                if (approach == MovementDriver.Plan.TOO_FAR) {
+                    job.approachTicks = 0;
+                    job.unreachable++;
+                    job.failed("TARGET_OUTSIDE_ACCESS_RANGE");
+                    continue;
                 }
                 job.pending.addFirst(next);
                 return true;
             }
 
+            BlockState nextState = this.bot.level().getBlockState(next);
+            // Clearance blocks can require a different tool than the requested resource, and a
+            // radius job can reveal targets after the initial tool dispatch. Re-equip every block.
+            Actions.equipForMining(this.bot, nextState, "");
             int ticks = Actions.ticksToBreak(this.bot, next);
             if (ticks == Integer.MAX_VALUE) {
+                job.failed("UNBREAKABLE_WITH_HELD_TOOL");
                 continue; // not breakable with what we are holding
             }
             Actions.Result started = Actions.startBreak(this.bot, next, Actions.faceToward(this.bot, next));
             if (!started.success()) {
+                job.failed("BREAK_START_REJECTED");
                 continue;
             }
             job.current = next;
+            job.currentType = nextState.getBlock();
             job.face = Actions.faceToward(this.bot, next);
             job.ticksRemaining = Math.min(ticks, 20 * 60);
+            job.finishSent = false;
+            job.verifyTicksRemaining = 0;
             return true;
         }
 
@@ -2549,27 +4611,18 @@ public final class AgentBrain {
      *
      * @return true if a route was started
      */
-    private boolean approachForMining(BlockPos target) {
+    private MovementDriver.Plan approachForMining(BlockPos target) {
         var manager = com.melody.mcagent.rt.Agent.botManager();
         var handle = manager == null ? null : manager.get(this.bot.getName().getString());
         if (handle == null) {
-            return false;
+            return MovementDriver.Plan.BLOCKED;
         }
         if (handle.movement().hasTarget()) {
-            return true; // already on our way
+            return MovementDriver.Plan.FOUND; // already on our way
         }
-        if (!(this.bot.level() instanceof net.minecraft.server.level.ServerLevel level)) {
-            return false;
-        }
-        // Stand beside or below it: a trunk is chopped from the ground it grows out of.
-        BlockPos stand = com.melody.mcagent.rt.path.PathFinder.resolveGoal(
-                level, this.bot.blockPosition(), target.below());
-        if (stand == null) {
-            stand = com.melody.mcagent.rt.path.PathFinder.resolveGoal(
-                    level, this.bot.blockPosition(), target);
-        }
-        return stand != null && handle.movement().setPathTarget(stand, 24)
-                == com.melody.mcagent.rt.bot.MovementDriver.Plan.FOUND;
+        // Search all reachable interaction positions at once. Picking one arbitrary cell below the
+        // target repeatedly chose a sealed side even when the opposite side was open.
+        return handle.movement().setPathWithinReach(target, 24, Actions.REACH);
     }
 
     /** Add the neighbours of a freshly broken block to the job's frontier. */
@@ -2713,6 +4766,9 @@ public final class AgentBrain {
                         net.minecraft.world.entity.item.ItemEntity.class,
                         this.bot.getBoundingBox().inflate(3.0D));
         String report = "broke " + job.broken + " block(s)";
+        if (job.clearanceBroken > 0) {
+            report += " (including " + job.clearanceBroken + " access-clearance block(s))";
+        }
         if (job.collected > 0) {
             report += ", " + job.collected + " item(s) went into your pack as they dropped";
         }
@@ -2727,16 +4783,318 @@ public final class AgentBrain {
             }
             report += "; still on the ground nearby: " + items;
         }
+        if (!job.failures.isEmpty()) {
+            report += "; mining failures=" + job.failures;
+        }
+        boolean requestedTargetCleared = job.originCompleted
+                || (job.originType != null
+                        && !this.bot.level().getBlockState(job.origin).is(job.originType));
+        if (requestedTargetCleared) {
+            // The requested target itself is gone, so a later block at this coordinate is a new
+            // incident. Breaking only an access block must not reset the one-retry guard.
+            this.jevRetriedTargets.remove(job.origin);
+            this.mineFailureCounts.remove(job.origin);
+            this.clearJevSkippedTarget(job);
+        }
         this.actionReports.addLast(report);
-        if (job.broken == 0 && job.unreachable > 0 && !this.queue.isEmpty()) {
+        this.requestJevMiningRecovery(job, report);
+        if (job.originType != null && !requestedTargetCleared
+                && job.unreachable > 0 && !this.queue.isEmpty()) {
             int discarded = this.queue.size();
             this.queue.clear();
+            this.authorisedTunnelClearance.clear();
             this.abortQueueIfMovementFails = false;
             this.cooldownTicks = 0;
-            this.actionReports.addLast("mining could not get within reach of "
-                    + job.origin.toShortString() + "; discarded " + discarded
-                    + " dependent step(s) instead of waiting on more unreachable coordinates");
+            this.actionReports.addLast("the requested block at " + job.origin.toShortString()
+                    + " was not cleared; discarded " + discarded
+                    + " dependent step(s) instead of walking into the remaining obstruction");
         }
+    }
+
+    /** Ask Jev for one bounded recovery after a mining failure. */
+    private void requestJevMiningRecovery(MineJob job, String report) {
+        JevClient adviser = this.jevClient;
+        if (adviser == null || job.failures.isEmpty()) {
+            return;
+        }
+        // TARGET_BECAME_AIR is a race, not a failure: the block was already gone when the job reached
+        // it. It accounted for 232 of the 250 answered production calls and never once produced a
+        // physical choice worth acting on - while spending the same rate-limited quota the speech
+        // gate needs to answer a player. Only a real failure is worth a decision.
+        if (job.failures.keySet().stream().allMatch(code -> "TARGET_BECAME_AIR".equals(code))) {
+            return;
+        }
+        String botName = this.bot.getName().getString();
+        if (this.mineFailureCounts.size() > 256) {
+            var oldest = this.mineFailureCounts.keySet().iterator();
+            if (oldest.hasNext()) {
+                oldest.next();
+                oldest.remove();
+            }
+        }
+        int failuresForTarget = this.mineFailureCounts.merge(job.origin, 1, Integer::sum);
+        // Read the route once: it is world data on disk, and both the state and the candidate list
+        // need to know whether BACKTRACK is legal here.
+        MineRoute route = this.loadMineRoute();
+        boolean routeHere = route != null && route.dimension().equals(
+                this.bot.level().dimension().location().toString());
+        String state = this.miningRecoveryState(job, report, failuresForTarget, routeHere);
+        Map<String, String> candidates = new LinkedHashMap<>();
+        // A rejected break is not an access problem: the block itself refuses to change (protected by
+        // another mod, or unbreakable). The access planner cannot help, so retrying is not offered -
+        // measured: asked anyway, the model chose RETRY for a protected bookshelf.
+        boolean breakWasRejected = job.failures.containsKey("BREAK_REJECTED");
+        if (!this.jevRetriedTargets.contains(job.origin)
+                && !breakWasRejected
+                && !this.bot.level().getBlockState(job.origin).isAir()
+                && this.policy.canBreakBlocks()) {
+            candidates.put("RETRY_DIFFERENT_ACCESS",
+                    "Retry this target once from the changed world using the safe access planner");
+        }
+        candidates.put("SKIP_TARGET",
+                "Mark this exact target temporarily unreachable and continue with another candidate");
+        if (routeHere) {
+            candidates.put("BACKTRACK",
+                    "Return along known mine breadcrumbs toward the established entrance");
+        }
+        candidates.put("GATHER_PERCEPTION",
+                "Inspect local geometry and blockers before selecting another physical action");
+        candidates.put("ESCALATE_LLM",
+                "The finite recovery choices are insufficient; ask the planning LLM");
+
+        this.jevRecoveryRequestedAt = this.bot.level().getGameTime();
+        this.statsJevRequests++;
+        CompletableFuture.supplyAsync(() -> adviser.choose(
+                state, "mining_recovery",
+                com.melody.mcagent.rt.llm.JevPrompts.MINING_RECOVERY,
+                candidates), executor()).thenAccept(choice -> {
+                    this.jevRecoveryRequestedAt = -1L;
+                    if (choice.failed()) {
+                        LOG.info("JEV {} bot={} event=MINING_RECOVERY unavailable={}",
+                                adviser.settings().shadowMode() ? "SHADOW" : "ACTIVE",
+                                botName, choice.error());
+                    } else {
+                        LOG.info("JEV {} bot={} event=MINING_RECOVERY choice={} confidence={} "
+                                + "probabilities={} deterministic_outcome={} state={}",
+                                adviser.settings().shadowMode() ? "SHADOW" : "ACTIVE",
+                                botName, choice.choice(), String.format("%.3f", choice.confidence()),
+                                choice.probabilities(), firstLine(report),
+                                oneLineState(state));
+                        if (!adviser.settings().shadowMode()) {
+                            this.bot.server.execute(() -> this.applyJevMiningRecovery(
+                                    adviser, job, choice));
+                        }
+                    }
+                });
+    }
+
+    /**
+     * Test seam: ask Jev for a recovery as if this target had just failed, without making the mining
+     * loop fail for real.
+     *
+     * <p>Needed because the interesting failure codes cannot be produced in the dev world: there is no
+     * protection mod there, so {@code BREAK_REJECTED} is unreachable by injection, and the harness
+     * hook ticks after the brain, so a block cannot be kept alive across the break either. The
+     * decision path itself - whitelist, one-retry cap, confidence floor, staleness guard, fail-open -
+     * is what the harness has to drive, and this is the smallest door that allows it. The real loop
+     * still calls {@link #requestJevMiningRecovery} directly.
+     */
+    public void simulateMiningFailureForTest(BlockPos origin, int radius,
+                                             Map<String, Integer> failures, int broken,
+                                             int unreachable) {
+        MineJob job = new MineJob(origin, this.currentDimension(), radius, null, null,
+                this.bot.level().getGameTime(), false);
+        job.failures.putAll(failures);
+        job.broken = broken;
+        job.unreachable = unreachable;
+        this.requestJevMiningRecovery(job, "broke " + broken + " block(s); mining failures=" + failures);
+    }
+
+    /**
+     * Everything a recovery decision needs, and nothing it does not.
+     *
+     * <p>The first version of this state carried only the failure counts, and the model answered with
+     * a coin flip between two options that were both no-ops. What was missing is the evidence a
+     * player would use: what the target is, whether it is even still there, whether a retry has
+     * already been spent on it, how many times it has failed, what the bot is holding, what it is
+     * trying to achieve, what just happened, and what the local space looks like.
+     */
+    private String miningRecoveryState(MineJob job, String report, int failuresForTarget,
+                                       boolean routeHere) {
+        BlockState target = this.bot.level().getBlockState(job.origin);
+        StringBuilder recent = new StringBuilder();
+        int shown = 0;
+        for (String line : this.actionReports) {
+            if (shown++ >= 2) {
+                break;
+            }
+            if (recent.length() > 0) {
+                recent.append(" | ");
+            }
+            recent.append(line);
+        }
+        return "Minecraft mining event. bot=" + this.bot.getName().getString()
+                + "; dimension=" + this.bot.level().dimension().location()
+                + "; position=" + this.bot.blockPosition().toShortString()
+                + "; requested_origin=" + job.origin.toShortString()
+                + "; target_block=" + (target.isAir() ? "gone(air)" : describeTarget(target))
+                + "; radius=" + job.radius
+                + "; broken=" + job.broken
+                + "; clearance_broken=" + job.clearanceBroken
+                + "; unreachable=" + job.unreachable
+                + "; failures=" + job.failures
+                + "; failures_for_this_exact_target=" + failuresForTarget
+                + "; retry_already_used_for_this_target=" + this.jevRetriedTargets.contains(job.origin)
+                + "; saved_mine_route_in_this_dimension=" + routeHere
+                + "; holding=" + describeHeld()
+                + "; goal=" + (this.standingGoal == null || this.standingGoal.isBlank()
+                        ? "(none)" : this.standingGoal)
+                + "; just_happened=[" + recent + "]"
+                + "; result=" + report
+                + "; " + com.melody.mcagent.rt.perception.SemanticScene.describe(this.bot)
+                        .replace('\n', ' ').replace("  ", " ");
+    }
+
+    /** What the bot is holding in its main hand, for a recovery that may be a tool problem. */
+    private String describeHeld() {
+        var held = this.bot.getMainHandItem();
+        return held.isEmpty() ? "empty hand" : held.getHoverName().getString()
+                + " x" + held.getCount();
+    }
+
+    /** Apply only whitelisted, bounded Jev choices on the server thread. */
+    private void applyJevMiningRecovery(JevClient adviser, MineJob failedJob,
+                                        JevClient.Choice choice) {
+        // A config reload or a newer action makes the asynchronous advice stale. Never let an old
+        // response interrupt work selected by a player or the planning model in the meantime.
+        if (this.jevClient != adviser || this.paused || this.bot.isRemoved()
+                || this.bot.hasDisconnected()
+                || !failedJob.dimension.equals(this.currentDimension())) {
+            return;
+        }
+        if (this.mineJob != null || this.combatJob != null || this.isMoving()
+                || !this.queue.isEmpty() || this.thinking.get()) {
+            // Say *which* of these superseded the advice. "not_applied=newer_work" alone cannot
+            // distinguish "a player or the model already gave the bot work" from "the bot happens to
+            // be thinking about its next step", and those two want opposite fixes: the first is the
+            // guard working, the second would mean a recovery can never land.
+            LOG.info("JEV ACTIVE bot={} event=MINING_RECOVERY not_applied=newer_work "
+                    + "mineJob={} combat={} moving={} queue={} thinking={} state={}",
+                    this.bot.getName().getString(), this.mineJob != null, this.combatJob != null,
+                    this.isMoving(), this.queue.size(), this.thinking.get(),
+                    this.describeCurrentAction());
+            return;
+        }
+        if (choice.confidence() < MIN_ACTIVE_JEV_CONFIDENCE) {
+            this.actionReports.addLast("Jev recovery confidence was only "
+                    + String.format(java.util.Locale.ROOT, "%.2f", choice.confidence())
+                    + "; asking the planning model instead of taking a physical action");
+            this.cooldownTicks = 0;
+            return;
+        }
+
+        String applied = null;
+        switch (choice.choice()) {
+            case "RETRY_DIFFERENT_ACCESS" -> {
+                if (this.jevRetriedTargets.size() >= 128) {
+                    this.jevRetriedTargets.clear();
+                }
+                if (!this.jevRetriedTargets.add(failedJob.origin)) {
+                    this.actionReports.addLast("Jev declined a repeated automatic retry of "
+                            + failedJob.origin.toShortString() + "; asking the planning model");
+                    this.cooldownTicks = 0;
+                    return;
+                }
+                applied = this.startMine(failedJob.origin, failedJob.radius, "", false);
+                this.actionReports.addLast("Jev recovery RETRY_DIFFERENT_ACCESS -> " + applied);
+            }
+            case "BACKTRACK" -> {
+                applied = this.scheduleJevBacktrack();
+                this.actionReports.addLast("Jev recovery BACKTRACK -> " + applied);
+                if (applied.startsWith("failed:")) {
+                    this.cooldownTicks = 0;
+                }
+            }
+            case "SKIP_TARGET" -> {
+                this.markJevSkippedTarget(failedJob);
+                applied = "marked " + failedJob.origin.toShortString() + " temporarily unreachable";
+                this.actionReports.addLast("Jev marked " + failedJob.origin.toShortString()
+                        + " temporarily unreachable; choose another perceived resource candidate");
+                this.cooldownTicks = 0;
+            }
+            case "GATHER_PERCEPTION" -> {
+                applied = "asked for fresh perception before another physical action";
+                this.actionReports.addLast("Jev requested fresh local geometry before another "
+                        + "physical action");
+                this.cooldownTicks = 0;
+            }
+            case "ESCALATE_LLM" -> {
+                applied = "escalated to the planning model";
+                this.actionReports.addLast("Jev escalated this mining recovery to the planning model");
+                this.cooldownTicks = 0;
+            }
+            default -> {
+                applied = "unsupported choice; asking the planning model";
+                LOG.warn("JEV ACTIVE bot={} returned unknown mining recovery {}; escalating",
+                        this.bot.getName().getString(), choice.choice());
+                this.actionReports.addLast("Jev returned an unsupported recovery choice; asking the "
+                        + "planning model");
+                this.cooldownTicks = 0;
+            }
+        }
+        // Only these two choices can start movement/mining. SKIP_TARGET mutates a bounded selector
+        // marker and GATHER_PERCEPTION merely asks for another turn; logging either as a physical
+        // action made production telemetry overstate Jev's autonomy.
+        boolean physical = "RETRY_DIFFERENT_ACCESS".equals(choice.choice())
+                || ("BACKTRACK".equals(choice.choice())
+                        && applied != null && !applied.startsWith("failed:"));
+        LOG.info("JEV ACTIVE bot={} event=MINING_RECOVERY applied={} choice={} confidence={} "
+                + "result={}",
+                this.bot.getName().getString(), physical, choice.choice(),
+                String.format(java.util.Locale.ROOT, "%.2f", choice.confidence()),
+                firstLine(applied == null ? "" : applied));
+    }
+
+    /** Queue the saved mine breadcrumbs in reverse, ending at the entrance. */
+    private String scheduleJevBacktrack() {
+        MineRoute route = this.loadMineRoute();
+        String dimension = this.bot.level().dimension().location().toString();
+        if (route == null || !route.dimension().equals(dimension)) {
+            return "failed: no mine route is saved in this dimension";
+        }
+        List<BlockPos> breadcrumbs = route.waypoints();
+        BlockPos here = this.bot.blockPosition();
+        int nearest = -1;
+        double nearestDistance = Double.MAX_VALUE;
+        for (int i = 0; i < breadcrumbs.size(); i++) {
+            double distance = breadcrumbs.get(i).distSqr(here);
+            if (distance < nearestDistance) {
+                nearestDistance = distance;
+                nearest = i;
+            }
+        }
+        int queued = 0;
+        BlockPos last = here;
+        for (int i = nearest; i >= 0; i--) {
+            BlockPos point = breadcrumbs.get(i);
+            if (point.distSqr(last) < 4.0D) {
+                continue;
+            }
+            this.queue.addLast(new QueuedCall(new LlmClient.ToolCall(
+                    "jev_backtrack_" + (++queued), "goto", positionArgs(point)), -1, true));
+            last = point;
+        }
+        if (route.entrance().distSqr(last) >= 4.0D) {
+            this.queue.addLast(new QueuedCall(new LlmClient.ToolCall(
+                    "jev_backtrack_" + (++queued), "goto", positionArgs(route.entrance())),
+                    -1, true));
+        }
+        if (queued == 0) {
+            return "already at the established mine entrance";
+        }
+        this.cooldownTicks = PLAN_PREFETCH_DELAY_TICKS;
+        return "queued " + queued + " breadcrumb walk(s) toward "
+                + route.entrance().toShortString();
     }
 
     // --- tool execution -------------------------------------------------------------------------
@@ -2872,12 +5230,58 @@ public final class AgentBrain {
                 case "escape_up":
                     return this.escapeUp(string(args, "item", ""));
 
+                case "start_mining":
+                    if (!miningSkillEnabled()) {
+                        return "failed: the persistent mining skill is disabled on this server; "
+                                + "plan the trip step by step instead";
+                    }
+                    return this.startMiningGoal(args);
+
+                case "backpack":
+                case "backpack_wear":
+                case "backpack_sort":
+                case "backpack_put":
+                case "backpack_take":
+                case "backpack_upgrade":
+                    return this.backpackTool(name, args);
+
+                case "find_resource":
+                    return this.findResource(
+                            string(args, "resource", ""),
+                            (int) arg(args, "radius", this.observeRadius));
+
+                case "mine_resource": {
+                    if (!this.policy.canBreakBlocks()) {
+                        return "failed: you are not allowed to break blocks";
+                    }
+                    String resource = string(args, "resource", "");
+                    int searchRadius = (int) arg(args, "search_radius", this.observeRadius);
+                    List<Perception.SeenBlock> matches = this.resourceMatches(resource, searchRadius);
+                    if (matches.isEmpty()) {
+                        return "failed: NO_VISIBLE_RESOURCE - no perceived block matches '" + resource
+                                + "' within " + Math.max(4, Math.min(48, searchRadius))
+                                + " blocks; move/explore before trying again";
+                    }
+                    Perception.SeenBlock chosen = matches.get(0);
+                    String item = string(args, "item", "");
+                    Actions.Result equip = Actions.equipForMining(this.bot, chosen.state(), item);
+                    if (equip != null) {
+                        return "failed: " + equip.message();
+                    }
+                    int veinRadius = (int) Math.max(0,
+                            Math.min(MAX_MINE_RADIUS, arg(args, "vein_radius", 6)));
+                    String outcome = this.startMine(chosen.pos(), veinRadius, item, false);
+                    return "selected nearest " + describeTarget(chosen.state()) + " at "
+                            + chosen.pos().toShortString() + " from " + matches.size()
+                            + " perceived candidate(s): " + outcome;
+                }
+
                 case "dig_tunnel":
+                    // Gameplay model calls can never replace the durable entrance. Extra arguments
+                    // not present in the schema are ignored rather than becoming a terrain bypass.
                     return this.digTunnel(
                             string(args, "direction", ""), string(args, "mode", ""),
-                            (int) arg(args, "length", 8), string(args, "item", ""),
-                            args.has("new_site") && args.get("new_site").isJsonPrimitive()
-                                    && args.get("new_site").getAsBoolean());
+                            (int) arg(args, "length", 8), string(args, "item", ""), false);
 
                 case "mine_checkpoint": {
                     Direction direction = parseHorizontalDirection(string(args, "direction", ""));
@@ -2890,7 +5294,8 @@ public final class AgentBrain {
                                     (int) arg(args, "entrance_z", 0)),
                             new BlockPos((int) arg(args, "face_x", 0),
                                     (int) arg(args, "face_y", 0),
-                                    (int) arg(args, "face_z", 0)), direction);
+                                    (int) arg(args, "face_z", 0)), direction,
+                            decodeMineWaypoints(string(args, "waypoints", "")));
                     this.saveMineRoute(route);
                     return "updated established mine working face to " + route.face().toShortString();
                 }
@@ -2908,7 +5313,10 @@ public final class AgentBrain {
                     if (equip != null) {
                         return "failed: " + equip.message();
                     }
-                    return this.startMine(pos, radius);
+                    return this.startMine(pos, radius, string(args, "item", ""),
+                            args.has("_access_planned")
+                                    && args.get("_access_planned").isJsonPrimitive()
+                                    && args.get("_access_planned").getAsBoolean());
                 }
 
                 case "hold": {
@@ -2963,9 +5371,11 @@ public final class AgentBrain {
                 case "interrupt": {
                     String what = this.describeCurrentAction();
                     boolean wasBusy = this.isLongActionRunning();
+                    boolean stoppedGoal = this.miningGoal != null;
                     int cancelled = this.queue.size();
                     this.abandonCurrentAction();
                     this.abandonPlan("the bot stopped to do something else");
+                    this.miningGoal = null;
                     this.cooldownTicks = 0;
 
                     // Even with nothing running there is usually something to clear: a plan whose
@@ -2975,6 +5385,9 @@ public final class AgentBrain {
                     reply.append(wasBusy ? "stopped " + what : "nothing long-running was in progress");
                     if (cancelled > 0) {
                         reply.append("; cancelled ").append(cancelled).append(" queued step(s)");
+                    }
+                    if (stoppedGoal) {
+                        reply.append("; cancelled the persistent mining goal");
                     }
                     reply.append(". You are at ").append(this.bot.blockPosition().toShortString());
                     if (this.ticksMotionless > MOTIONLESS_TICKS_TO_REPORT) {
@@ -3150,11 +5563,11 @@ public final class AgentBrain {
         boolean addressed = this.directlyAddressed;
         long now = this.bot.level().getGameTime();
         long sinceSpoken = now - this.lastSpokenTick;
-        if (!addressed && looksLikeProgressNarration(line)) {
+        if (!addressed && NARRATION_GUARD_ENABLED && looksLikeProgressNarration(line)) {
             return "not sent: this is routine progress narration. Keep working silently; only report "
                     + "completion, a decision the player must make, or a blocker you cannot solve.";
         }
-        if (!addressed && sinceSpoken < UNPROMPTED_CHAT_COOLDOWN) {
+        if (!addressed && sinceSpoken < UNPROMPTED_CHAT_COOLDOWN && !reportsFinishedWork(line)) {
             return "not sent: you spoke " + (sinceSpoken / 20)
                     + "s ago and nobody has spoken to you since. Most turns should be silent - only "
                     + "speak when you have something worth saying.";
@@ -3201,6 +5614,28 @@ public final class AgentBrain {
     }
 
     /** Recognise the repetitive travel/mining status lines models tend to broadcast autonomously. */
+    /**
+     * Whether a line reports work that is actually finished.
+     *
+     * <p>The quiet period exists to stop narration, not to stop the one unprompted message a player
+     * is waiting for: "钻石挖到了，一组放你箱子里了" is the whole point of the task. The narration
+     * rule above is checked first, so a promise ("挖到就喊你") is still refused before this can
+     * exempt it. This only decides whether the quiet period applies.
+     */
+    private static boolean reportsFinishedWork(String line) {
+        String lower = line.toLowerCase(java.util.Locale.ROOT).replaceAll("\\s+", "");
+        for (String marker : new String[] {
+                "挖到了", "拿到了", "做好了", "放好了", "找到了", "完成了", "搞定了", "建好了",
+                "收好了", "送到了", "done", "finished", "gotthe", "foundthe", "isready",
+                "allset", "itisin"
+        }) {
+            if (lower.contains(marker)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private static boolean looksLikeProgressNarration(String line) {
         String lower = line.toLowerCase(java.util.Locale.ROOT).replaceAll("\\s+", "");
         for (String phrase : new String[] {
@@ -3210,6 +5645,30 @@ public final class AgentBrain {
                 "notfoundyet", "currentlywalking", "justgotstuck"
         }) {
             if (lower.contains(phrase)) {
+                return true;
+            }
+        }
+        // A promise to report later carries no information now. This is the shape production kept
+        // sending - six lines in two hours, every one of them "挖到钻石就喊你" in different words:
+        // "挖到就给你留着", "挖到钻石立刻喊你", "挖到钻石先给你留着". A phrase list alone missed them,
+        // so the rule is stated as the intent: announcing a future report is narration.
+        for (String promise : new String[] {
+                "就喊你", "立刻喊你", "马上喊你", "就告诉你", "就通知你", "先给你留着",
+                "就给你留着", "给你留着", "稍等", "等我消息", "回头告诉你",
+                "letyouknow", "letuknow", "tellyouwhen", "keepyouposted", "willreport",
+                "assoonasifind", "onceifind", "whenifind", "illshout"
+        }) {
+            if (lower.contains(promise)) {
+                return true;
+            }
+        }
+        // Still working on the same thing, no result yet: the other half of the same six lines.
+        for (String ongoing : new String[] {
+                "继续往下", "接着往下", "往下挖", "往下打", "还在挖", "重新找路", "重开一条",
+                "绕个方向", "接着挖", "stilldigging", "stillmining", "keepdigging",
+                "backtodigging", "workingonit"
+        }) {
+            if (lower.contains(ongoing)) {
                 return true;
             }
         }
@@ -3318,31 +5777,327 @@ public final class AgentBrain {
         this.refreshIdentity();
     }
 
+    /** Exact perceived candidates for a semantic resource query, nearest first. */
+    private List<Perception.SeenBlock> resourceMatches(String requested, int requestedRadius) {
+        int radius = Math.max(4, Math.min(48, requestedRadius));
+        return matchesIn(Perception.visibleBlocks(this.bot, radius), requested);
+    }
+
+    /**
+     * The same matching over an already-taken perception pass.
+     *
+     * <p>Exposed as a separate step because one scan can serve every priority: the persistent mining
+     * skill asks about up to eight resources per decision, and a fresh {@code visibleBlocks} walk for
+     * each of them re-raycasts the same world up to eight times in a single tick.
+     */
+    private List<Perception.SeenBlock> matchesIn(List<Perception.SeenBlock> visible, String requested) {
+        String query = requested == null ? "" : requested.trim().toLowerCase(java.util.Locale.ROOT);
+        if (query.startsWith("minecraft:")) {
+            query = query.substring("minecraft:".length());
+        }
+        if (query.isBlank()) {
+            return List.of();
+        }
+        List<Perception.SeenBlock> matches = new ArrayList<>();
+        for (Perception.SeenBlock seen : visible) {
+            if (this.isJevSkippedTarget(seen.pos())) {
+                continue;
+            }
+            String id = net.minecraft.core.registries.BuiltInRegistries.BLOCK
+                    .getKey(seen.state().getBlock()).toString().toLowerCase(java.util.Locale.ROOT);
+            String path = id.substring(id.indexOf(':') + 1);
+            String display = seen.state().getBlock().getName().getString()
+                    .toLowerCase(java.util.Locale.ROOT).replace(' ', '_');
+            if (id.equals(query) || path.equals(query) || id.contains(query)
+                    || path.contains(query) || display.contains(query)) {
+                matches.add(seen);
+            }
+        }
+        matches.sort(java.util.Comparator.comparingDouble(Perception.SeenBlock::distance));
+        return matches;
+    }
+
+    private String findResource(String requested, int requestedRadius) {
+        List<Perception.SeenBlock> matches = this.resourceMatches(requested, requestedRadius);
+        int radius = Math.max(4, Math.min(48, requestedRadius));
+        if (matches.isEmpty()) {
+            return "No perceived block matches '" + requested + "' within " + radius
+                    + " blocks. This is not proof that none exists; move or explore and search again.";
+        }
+        StringBuilder result = new StringBuilder("Perceived ").append(matches.size())
+                .append(" candidate(s) matching '").append(requested).append("':\n");
+        for (int i = 0; i < Math.min(8, matches.size()); i++) {
+            Perception.SeenBlock seen = matches.get(i);
+            int blockers = Perception.blockerCount(
+                    this.bot, seen.pos(), Perception.SEE_THROUGH_BLOCKS + 1);
+            result.append("  - ").append(describeTarget(seen.state())).append(" at ")
+                  .append(seen.pos().toShortString()).append(String.format(" (%.1f blocks, ",
+                          seen.distance()))
+                  .append(blockers == 0 ? "EXPOSED" : "OCCLUDED by " + blockers + " block(s)")
+                  .append(")\n");
+        }
+        result.append("Use mine_resource with the same resource name; it will choose the nearest "
+                + "candidate and solve physical access rather than guessing a goto coordinate.");
+        return result.toString();
+    }
+
     /**
      * Start breaking a block, or a connected region of the same kind of block.
      *
      * @param radius 0 for just that block, otherwise how far from it the job may spread
      */
-    private String startMine(BlockPos pos, int radius) {
+    /**
+     * Clearance cells of a mining access route that must not be dug: everything inside the
+     * player-built structure around the bot, plus any fixture. The bounded structure scan runs once
+     * here so that the access search stays O(1) per node.
+     */
+    private java.util.function.Predicate<BlockPos> forbiddenForAccess() {
+        net.minecraft.server.level.ServerLevel level = this.bot.serverLevel();
+        PlayerStructure.Region region = PlayerStructure.detectCached(level, this.bot.blockPosition());
+        return cell -> {
+            if (this.isProtectedHomeSurface(cell)) {
+                return true;
+            }
+            if (region != null && region.contains(cell)) {
+                return true;
+            }
+            return PlayerStructure.isFixture(level.getBlockState(cell));
+        };
+    }
+
+    /** The bot's durable notion of home: its bed/anchor, in the dimension where it was set. */
+    @Nullable
+    private BlockPos homePosition() {
+        BlockPos home = this.bot.getRespawnPosition();
+        if (home == null || !this.bot.getRespawnDimension().equals(this.bot.level().dimension())) {
+            return null;
+        }
+        return home;
+    }
+
+    /** Whether a position lies in the horizontal base neighbourhood protected from surface scars. */
+    private boolean isNearHome(BlockPos pos) {
+        BlockPos home = this.homePosition();
+        if (home == null) {
+            return false;
+        }
+        long dx = (long) pos.getX() - home.getX();
+        long dz = (long) pos.getZ() - home.getZ();
+        return dx * dx + dz * dz <= (long) HOME_TERRAIN_RADIUS * HOME_TERRAIN_RADIUS;
+    }
+
+    /**
+     * Protect visible ground and its supporting layers around home.
+     *
+     * <p>The height map follows already-damaged terrain too, so digging at the bottom of an old pit
+     * cannot evade the rule and deepen it. The only exemption is issued internally by dig_tunnel for
+     * cells in the one established entrance/corridor.
+     */
+    private boolean isProtectedHomeSurface(BlockPos pos) {
+        if (!this.isNearHome(pos)) {
+            return false;
+        }
+        int surface = this.bot.serverLevel().getHeight(
+                Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, pos.getX(), pos.getZ());
+        return pos.getY() >= surface - HOME_SURFACE_DEPTH;
+    }
+
+    private String homeSurfaceProtectionReason(BlockPos pos) {
+        BlockPos home = this.homePosition();
+        return "the surface at " + pos.toShortString() + " is within " + HOME_TERRAIN_RADIUS
+                + " blocks of home" + (home == null ? "" : " at " + home.toShortString())
+                + "; ordinary mine/mine_resource/escape excavation may not scar or deepen the "
+                + "ground here. Use the one established dig_tunnel entrance instead";
+    }
+
+    private String currentDimension() {
+        return this.bot.level().dimension().location().toString();
+    }
+
+    private static String miningTargetKey(String dimension, BlockPos pos) {
+        return dimension + "|" + pos.getX() + "|" + pos.getY() + "|" + pos.getZ();
+    }
+
+    /** True while an unchanged exact block is under a bounded Jev SKIP_TARGET marker. */
+    private boolean isJevSkippedTarget(BlockPos pos) {
+        String key = miningTargetKey(this.currentDimension(), pos);
+        SkippedMiningTarget skipped = this.jevSkippedTargets.get(key);
+        if (skipped == null) {
+            return false;
+        }
+        long now = this.bot.level().getGameTime();
+        if (now >= skipped.expiresAt()
+                || this.bot.level().getBlockState(pos).getBlock() != skipped.block()) {
+            this.jevSkippedTargets.remove(key);
+            return false;
+        }
+        return true;
+    }
+
+    /** Persist a SKIP_TARGET result so the next resource scan cannot immediately pick it again. */
+    private void markJevSkippedTarget(MineJob job) {
+        if (!job.dimension.equals(this.currentDimension())) {
+            return;
+        }
+        if (this.jevSkippedTargets.size() >= 256) {
+            var oldest = this.jevSkippedTargets.keySet().iterator();
+            if (oldest.hasNext()) {
+                this.jevSkippedTargets.remove(oldest.next());
+            }
+        }
+        this.jevSkippedTargets.put(miningTargetKey(job.dimension, job.origin),
+                new SkippedMiningTarget(this.bot.level().getBlockState(job.origin).getBlock(),
+                        this.bot.level().getGameTime() + JEV_SKIP_TARGET_TICKS));
+    }
+
+    private void clearJevSkippedTarget(MineJob job) {
+        this.jevSkippedTargets.remove(miningTargetKey(job.dimension, job.origin));
+    }
+
+    /** Record a block this bot removed, so a queued step naming it is a no-op instead of a failure. */
+    private void rememberSelfCleared(BlockPos pos) {
+        long now = this.bot.level().getGameTime();
+        this.selfCleared.put(pos.immutable(), now);
+        // Pruned on write, so the map cannot grow with the world; the window outlives a queued plan.
+        this.selfCleared.entrySet().removeIf(entry -> now - entry.getValue() > SELF_CLEARED_TICKS);
+    }
+
+    /** Whether this bot itself removed {@code pos} within {@link #SELF_CLEARED_TICKS}. */
+    private boolean wasSelfCleared(BlockPos pos) {
+        Long when = this.selfCleared.get(pos);
+        if (when == null) {
+            return false;
+        }
+        if (this.bot.level().getGameTime() - when > SELF_CLEARED_TICKS) {
+            this.selfCleared.remove(pos);
+            return false;
+        }
+        return true;
+    }
+
+    private String startMine(BlockPos pos, int radius, String requestedItem,
+                             boolean accessAlreadyPlanned) {
+        boolean tunnelClearance = this.authorisedTunnelClearance.remove(pos);
         var state = this.bot.level().getBlockState(pos);
         if (state.isAir()) {
+            if (SELF_CLEARED_ENABLED && this.wasSelfCleared(pos)) {
+                // Not a failure: the intended end state - this block gone - already holds. The tunnel
+                // macro and the mining access route both queue the cells they mean to clear, and a
+                // MineJob clears its own approach blocker while removing an occluded target, so the
+                // two name the same cell sooner or later. Returning "failed:" here aborted the whole
+                // plan (every macro step aborts on failure) and bought a planning turn to re-derive
+                // the same tunnel: production showed a 12-block tunnel dying after two blocks, every
+                // 40 seconds, descending 2.4 blocks a minute.
+                long age = this.bot.level().getGameTime() - this.selfCleared.getOrDefault(pos, 0L);
+                LOG.info("Bot {} treats {} as already done: this bot removed it {} tick(s) ago as "
+                                + "clearance for an earlier step of this plan",
+                        this.bot.getName().getString(), pos.toShortString(), age);
+                return "already clear: " + pos.toShortString() + " is gone - this bot removed it "
+                        + age + " tick(s) ago as clearance for an earlier step, so there is nothing "
+                        + "left to break here";
+            }
             return "failed: there is no block at " + pos.toShortString()
                     + " - it is open air. Your block list shows only what you can actually see; "
                     + "observe again and use a coordinate from it rather than guessing.";
+        }
+        if (!tunnelClearance && this.isProtectedHomeSurface(pos)) {
+            String refused = this.homeSurfaceProtectionReason(pos);
+            LOG.info("Bot {} refused surface excavation at {}: {}", this.bot.getName().getString(),
+                    pos.toShortString(), refused);
+            return "failed: " + refused;
+        }
+        if (!tunnelClearance && this.isJevSkippedTarget(pos)) {
+            return "failed: " + pos.toShortString() + " is temporarily marked unreachable by "
+                    + "mining recovery; choose another perceived resource candidate";
         }
         int ticks = Actions.ticksToBreak(this.bot, pos);
         if (ticks == Integer.MAX_VALUE) {
             return "failed: that block cannot be broken with what you are holding";
         }
 
+        // The hard rule. Every breaking path in this class funnels through here - the mine and
+        // mine_resource tools, tunnel steps, escape stairs and access clearance alike - so a
+        // player's building, its furniture and the ground under it are refused once, centrally.
+        String refused = PlayerStructure.protectionReason(
+                this.bot.serverLevel(), this.bot.blockPosition(), pos);
+        if (refused != null) {
+            LOG.info("Bot {} refused to break {}: {}", this.bot.getName().getString(),
+                    pos.toShortString(), refused);
+            return "failed: " + refused + ". Player-built structures are protected: no tunnels through "
+                    + "a building, no holes in its floor, no mining the ground underneath it. Walk out "
+                    + "through its own door or opening, and mine natural ground away from the base.";
+        }
+
         if (!Actions.canReach(this.bot, pos)) {
-            // Start the job anyway and let it walk into range; a model aiming at a tree from ten
-            // blocks away is behaving reasonably.
-            this.mineJob = new MineJob(pos, radius, radius > 0 ? state.getBlock() : null,
-                    this.bot.level().getGameTime());
-            this.approachForMining(pos);
-            return "walking into reach of " + pos.toShortString()
-                    + " before breaking it (" + describeTarget(state) + ")";
+            MovementDriver.Plan walking = this.approachForMining(pos);
+            if (walking == MovementDriver.Plan.FOUND) {
+                // Start the job and let the multi-goal path take it to whichever side is actually
+                // reachable. MineJob's own timeout verifies physical progress, not just a path on
+                // paper.
+                this.mineJob = new MineJob(pos, this.currentDimension(), radius,
+                        radius > 0 ? state.getBlock() : null, state.getBlock(),
+                        this.bot.level().getGameTime(), tunnelClearance);
+                return "walking to a reachable mining position for " + pos.toShortString()
+                        + " before breaking it (" + describeTarget(state) + ")";
+            }
+
+            if (accessAlreadyPlanned) {
+                return "failed: NO_ACCESS_ROUTE_AFTER_CLEARANCE - the prepared route still does not "
+                        + "put " + pos.toShortString() + " within reach; do not retry the same target";
+            }
+            MiningAccessPlanner.Route access = MiningAccessPlanner.find(
+                    this.bot, pos, MINE_ACCESS_RANGE, this.forbiddenForAccess());
+            if (access == null || access.steps().isEmpty()) {
+                return "failed: NO_SAFE_MINING_ACCESS - no short two-block-high route can reach "
+                        + pos.toShortString() + " without crossing fluids, falling blocks, block "
+                        + "entities, hazards, unbreakable terrain or a player-built structure";
+            }
+
+            List<QueuedCall> route = new ArrayList<>();
+            java.util.Set<BlockPos> scheduledClearance = new java.util.HashSet<>();
+            int sequence = 0;
+            for (MiningAccessPlanner.Step step : access.steps()) {
+                for (BlockPos clear : step.clear()) {
+                    if (!scheduledClearance.add(clear)) {
+                        continue;
+                    }
+                    JsonObject mine = positionArgs(clear);
+                    mine.addProperty("_access_planned", true);
+                    route.add(new QueuedCall(new LlmClient.ToolCall(
+                            "mine_access_clear_" + (++sequence), "mine", mine), -1, true));
+                }
+                JsonObject walk = positionArgs(step.feet());
+                route.add(new QueuedCall(new LlmClient.ToolCall(
+                        "mine_access_walk_" + (++sequence), "goto", walk), -1, true));
+            }
+            JsonObject target = positionArgs(pos);
+            target.addProperty("radius", radius);
+            target.addProperty("_access_planned", true);
+            if (requestedItem != null && !requestedItem.isBlank()) {
+                target.addProperty("item", requestedItem);
+            }
+            route.add(new QueuedCall(new LlmClient.ToolCall(
+                    "mine_access_target_" + (++sequence), "mine", target), -1, true));
+            this.prependOrAppendMacro(route);
+            LOG.info("Bot {} planned mining access to {}: {} movement step(s), {} clearance "
+                    + "block(s), {} search node(s)", this.bot.getName().getString(),
+                    pos.toShortString(), access.steps().size(), access.blocksToClear(),
+                    access.expandedNodes());
+            return "creating a real access route to occluded/unreachable target "
+                    + pos.toShortString() + ": " + access.steps().size() + " movement step(s), "
+                    + access.blocksToClear() + " clearance block(s), then the requested mining job";
+        }
+
+        BlockPos blocker = Perception.firstBlockingBlock(this.bot, pos);
+        if (blocker != null) {
+            // In range is not the same as exposed. Let MineJob remove the nearest blocker with
+            // normal timing, re-raycast, and repeat until the intended block is genuinely open.
+            this.mineJob = new MineJob(pos, this.currentDimension(), radius,
+                    radius > 0 ? state.getBlock() : null, state.getBlock(),
+                    this.bot.level().getGameTime(), tunnelClearance);
+            return "target " + pos.toShortString() + " was perceived through solid terrain; "
+                    + "clearing the real approach starting with " + blocker.toShortString()
+                    + " before mining " + describeTarget(state);
         }
 
         Actions.Result started = Actions.startBreak(this.bot, pos, Actions.faceToward(this.bot, pos));
@@ -3350,9 +6105,15 @@ public final class AgentBrain {
             return "failed: " + started.message();
         }
         // Completion is driven from tick() so the break takes real mining time.
-        this.mineJob = new MineJob(pos, radius, radius > 0 ? state.getBlock() : null,
-                this.bot.level().getGameTime());
+        this.mineJob = new MineJob(pos, this.currentDimension(), radius,
+                radius > 0 ? state.getBlock() : null, state.getBlock(),
+                this.bot.level().getGameTime(), tunnelClearance);
+        // This target is already the active break. Leaving the constructor's copy in pending made
+        // every successful direct mine rediscover its now-air origin and report a fake
+        // TARGET_BECAME_AIR failure.
+        this.mineJob.pending.remove(pos);
         this.mineJob.current = pos;
+        this.mineJob.currentType = state.getBlock();
         this.mineJob.face = Actions.faceToward(this.bot, pos);
         this.mineJob.ticksRemaining = Math.min(ticks, 20 * 60);
 
@@ -3385,7 +6146,8 @@ public final class AgentBrain {
         // vanilla does the actual pickup as soon as the bot is near enough. -1 for the start tick:
         // this job exists precisely to fetch items that were already there, so it must not apply the
         // "only what this job produced" filter the mining jobs use.
-        this.mineJob = new MineJob(this.bot.blockPosition(), Math.max(4, radius), null, -1L);
+        this.mineJob = new MineJob(this.bot.blockPosition(), this.currentDimension(),
+                Math.max(4, radius), null, null, -1L, false);
         this.mineJob.collecting = true;
         return "going to pick up " + drops.size() + " drop(s) within " + radius
                 + " blocks: " + items;
@@ -3429,6 +6191,15 @@ public final class AgentBrain {
             Vec3 target = handle == null ? null : handle.movement().getTarget();
             return target == null ? "walking"
                     : String.format("walking to (%.0f, %.0f, %.0f)", target.x, target.y, target.z);
+        }
+        MiningGoal goal = this.miningGoal;
+        if (goal != null) {
+            int gained = this.matchingResourceCount(goal.primary) - goal.startingAmount;
+            return (goal.returning ? "returning from" : "running")
+                    + " persistent mining goal (priorities=" + goal.priorities
+                    + ", primary_progress=" + gained + "/"
+                    + (goal.requestedAmount > 0 ? goal.requestedAmount : "trip")
+                    + ", tunnel_chunks=" + goal.tunnelChunks + "/" + goal.maxTunnelChunks + ")";
         }
         return "idle";
     }
@@ -3535,6 +6306,21 @@ public final class AgentBrain {
     }
 
     /** The first line of a tool result, for concise logging. */
+    /**
+     * A state string flattened onto one line and capped generously.
+     *
+     * <p>{@link #firstLine} caps at 160 characters, which is right for an error message and wrong for a
+     * calibration sample: it cuts the goal, the queued steps and the recent reports off the end, and
+     * {@code tools/jev-replay} would then re-score a state the model never saw.
+     */
+    private static String oneLineState(String text) {
+        if (text == null) {
+            return "";
+        }
+        String flat = text.replace('\n', ' ').replace("  ", " ").strip();
+        return flat.length() > 700 ? flat.substring(0, 700) + "..." : flat;
+    }
+
     private static String firstLine(String text) {
         if (text == null) {
             return "";
@@ -3609,29 +6395,78 @@ public final class AgentBrain {
     }
 
     /**
+     * How long an interrupted model call is given to unwind before its class loader is closed.
+     *
+     * <p>Measured, not guessed: an interrupt aborts a blocking {@code HttpClient.send} in about
+     * 8 ms. This is that with two orders of magnitude of headroom, and it is a bound rather than a
+     * wait - the common case returns as soon as the last call unwinds.
+     */
+    private static final long DRAIN_GRACE_MILLIS = 1000L;
+
+    /**
      * Shut the shared executor down, on server stop or on reload.
      *
      * <p>An in-flight model call holds this class loader on its stack, and on a reload that loader
      * is about to be closed: a request allowed to run to its own timeout would finish against
      * classes that no longer exist. Interrupt it instead of waiting the request out.
+     *
+     * <p>"Instead of waiting" is meant literally, and this method is called on the server thread by
+     * the reload. It used to shut down gracefully and wait two seconds <em>before</em> interrupting,
+     * and that wait could never succeed: a model call is a blocking HTTP request whose own timeout
+     * is tens of seconds, so a call in flight when the reload began was certain to still be in
+     * flight two seconds later. The reload therefore parked the server thread for exactly 2.0 s
+     * every time a bot was mid-thought - production logged 18 of 51 reloads at 2005 +/- 5 ms, each
+     * one followed by "Can't keep up! ... 50 ticks behind" - and then interrupted the request
+     * anyway. Interrupting first removes the wait without changing what happens to the request.
+     *
+     * <p>Positive control: {@code MCAGENT_RELOAD_INTERRUPT=off} restores the old wait-then-interrupt
+     * order, which is how {@code MCAGENT_RELOAD_TEST} proves it can see the stall at all.
      */
     public static synchronized void shutdown() {
         ExecutorService current = executor;
         if (current == null) {
             return;
         }
-        current.shutdown();
-        try {
-            if (!current.awaitTermination(2, TimeUnit.SECONDS)) {
+        long start = System.nanoTime();
+        if (interruptFirst()) {
+            // shutdownNow() also drops calls that were still queued. Starting one only to interrupt
+            // it two seconds later is the wait this exists to remove, and its answer would have been
+            // handed to bots that no longer exist.
+            int dropped = current.shutdownNow().size();
+            if (dropped > 0) {
+                LOG.info("Dropped {} queued model call(s) that had not started", dropped);
+            }
+        } else {
+            // The positive control: exactly what this method did before, wait included.
+            current.shutdown();
+            try {
+                if (!current.awaitTermination(2, TimeUnit.SECONDS)) {
+                    current.shutdownNow();
+                }
+            } catch (InterruptedException e) {
                 current.shutdownNow();
-                current.awaitTermination(2, TimeUnit.SECONDS);
+                Thread.currentThread().interrupt();
+            }
+        }
+        try {
+            if (!current.awaitTermination(DRAIN_GRACE_MILLIS, TimeUnit.MILLISECONDS)) {
+                // The loader is closed the moment this returns, so a call still running here is
+                // about to lose its classes. Say so: the wait this replaced gave up silently after
+                // 4 s and the only symptom was a NoClassDefFoundError much later.
+                LOG.warn("A model call was still running {} ms after being interrupted; the runtime "
+                        + "class loader is being closed under it", DRAIN_GRACE_MILLIS);
             }
         } catch (InterruptedException e) {
-            current.shutdownNow();
             Thread.currentThread().interrupt();
         }
+        LOG.info("Model executor stopped in {} ms", (System.nanoTime() - start) / 1_000_000L);
         // Clear the field so a later server start rebuilds it (see executor()).
         executor = null;
+    }
+
+    /** Whether to interrupt in-flight model calls before waiting on them. See {@link #shutdown()}. */
+    private static boolean interruptFirst() {
+        return !"off".equalsIgnoreCase(System.getenv("MCAGENT_RELOAD_INTERRUPT"));
     }
 
     /** Exposed for diagnostics: a summary of the conversation so far. */
@@ -3642,6 +6477,15 @@ public final class AgentBrain {
         out.put("historyMessages", this.history.size());
         out.put("cooldownTicks", this.cooldownTicks);
         out.put("mining", this.mineJob != null);
+        // What the routing guard actually reads, plus the job's own progress counter, so a test (or
+        // an operator) can tell "carrying on with work" from "standing still" without guessing.
+        out.put("queueSize", this.queue.size());
+        out.put("longActionRunning", this.isLongActionRunning());
+        out.put("mineBroken", this.mineJob == null ? -1 : this.mineJob.broken);
+        out.put("jevSkippedMiningTargets", this.jevSkippedTargets.size());
+        out.put("miningGoal", this.miningGoal == null ? "(none)" : this.describeCurrentAction());
+        out.put("lastMiningGoalOutcome",
+                this.lastMiningGoalOutcome == null ? "(none)" : this.lastMiningGoalOutcome);
         out.put("busy", this.describeCurrentAction());
         out.put("contextTokens", this.estimatedTokens());
         out.put("reportedPromptTokens", this.lastPromptTokens);
@@ -3655,6 +6499,17 @@ public final class AgentBrain {
         out.put("tokenBudget", this.tokenBudget);
         out.put("standingGoal", this.standingGoal == null ? "(none)" : this.standingGoal);
         out.put("paused", this.paused);
+        // What the cheap layer is doing: which trigger the next decision will be labelled with, and
+        // per-trigger asked/continued/escalated/failed tallies. Read by /mcagent status and by the
+        // gated routing test, which asserts on the counters rather than on log text.
+        out.put("pendingTrigger", this.pendingTrigger.name());
+        out.put("jevRouting", this.routingCounters());
+        out.put("routeLeaseActive", this.routeLeaseKey != null
+                && this.bot.level().getGameTime() < this.routeLeaseExpiresAt);
+        out.put("statsPlannerRequests", this.statsPlannerRequests);
+        out.put("statsJevRequests", this.statsJevRequests);
+        out.put("statsLeaseContinuations", this.statsLeaseContinuations);
+        out.put("statsBackoffAvoided", this.statsBackoffAvoided);
         return out;
     }
 }

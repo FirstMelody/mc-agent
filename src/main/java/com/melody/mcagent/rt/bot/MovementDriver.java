@@ -203,6 +203,35 @@ public final class MovementDriver {
         return Plan.FOUND;
     }
 
+    /**
+     * Walk to whichever reachable standing cell puts an occupied target block within interaction
+     * range. Unlike {@link #setPathTarget}, this is a multi-goal search and therefore does not get
+     * stuck repeatedly choosing the same sealed side of a tree, vein or machine.
+     */
+    public Plan setPathWithinReach(BlockPos targetBlock, int maxRange, double reach) {
+        if (!(this.bot.level() instanceof ServerLevel level)) {
+            return Plan.BLOCKED;
+        }
+        BlockPos start = this.bot.blockPosition();
+        if (start.distSqr(targetBlock) > (double) (maxRange + Math.ceil(reach))
+                * (maxRange + Math.ceil(reach))) {
+            return Plan.TOO_FAR;
+        }
+        PathFinder.Path path = PathFinder.findPathWithinReach(
+                level, start, targetBlock, maxRange, reach);
+        if (path == null) {
+            this.clear();
+            return Plan.BLOCKED;
+        }
+        if (path.isEmpty()) {
+            this.clear();
+            return Plan.FOUND;
+        }
+        this.waypoints = new ArrayDeque<>(PathFinder.toVec3(path.waypoints()));
+        this.setTarget(this.waypoints.poll());
+        return Plan.FOUND;
+    }
+
     /** Advance to the next waypoint on the current path, if any. */
     private void advanceWaypoint() {
         if (this.waypoints != null && !this.waypoints.isEmpty()) {
@@ -344,10 +373,17 @@ public final class MovementDriver {
         } else if (++this.noProgressTicks > NO_PROGRESS_TICKS) {
             if (LOG.isInfoEnabled()) {
                 LOG.info("Bot gave up walking to {} after {} ticks without getting closer "
-                        + "(best {}+ blocks away); it is {}+ blocks out",
+                        + "(best {}+ blocks away); it is {}+ blocks out from pos=({}, {}, {}), "
+                        + "dy={}, onGround={}, supportCollision={}, verticalSpeed={}, "
+                        + "pathWaypoints={}",
                         String.format("%.1f, %.1f", this.target.x, this.target.z),
                         NO_PROGRESS_TICKS, String.format("%.1f", this.bestDistanceToTarget),
-                        String.format("%.1f", remaining));
+                        String.format("%.1f", remaining),
+                        String.format("%.2f", bot.getX()), String.format("%.2f", bot.getY()),
+                        String.format("%.2f", bot.getZ()), String.format("%.2f", dy),
+                        bot.onGround(), bot.verticalCollisionBelow,
+                        String.format("%.3f", bot.getDeltaMovement().y),
+                        this.waypoints == null ? 0 : this.waypoints.size() + 1);
             }
             this.arrived = false;
             this.target = null;
@@ -374,7 +410,20 @@ public final class MovementDriver {
         // resetting stuckTicks, so a bot could climb the first tread and push against the second
         // forever. This is the same input a player supplies while walking up rough stairs.
         boolean climbingToHigherWaypoint = dy > 0.45D && horizontal < 1.75D;
-        if (climbingToHigherWaypoint && bot.onGround()) {
+        // A restored fake player can spend several ticks with onGround=false even while its feet
+        // are supported by a partial/modded collision shape. Production exposed the exact symptom:
+        // it stopped 0.8 blocks from the centre of a one-block-higher stair (player radius 0.3 +
+        // half a block 0.5), never jumped, and timed out. verticalCollisionBelow is the engine's
+        // stronger support signal. The final fallback is bounded to a close, higher ledge after
+        // several no-progress ticks and requires virtually zero vertical speed, so it cannot turn
+        // ordinary airborne travel into flight.
+        boolean stalledAtHigherLedge = climbingToHigherWaypoint
+                && horizontal <= 1.05D
+                && this.noProgressTicks >= STUCK_TICKS_BEFORE_JUMP
+                && Math.abs(bot.getDeltaMovement().y) < 0.02D;
+        boolean supportedForJump = bot.onGround() || bot.verticalCollisionBelow
+                || stalledAtHigherLedge;
+        if (climbingToHigherWaypoint && supportedForJump) {
             // A real client communicates the jump impulse; merely leaving the boolean input high
             // proved unreliable for a headless ServerPlayer on consecutive one-block treads.
             // Applying vanilla's own jumpFromGround is the server-side equivalent and still lets

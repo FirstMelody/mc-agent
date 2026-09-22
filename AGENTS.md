@@ -73,11 +73,33 @@ MCAGENT_INVENTORY_TEST=true ... runServer --offline   # opens and edits a bot pa
 MCAGENT_MINEDROP_TEST=true  ... runServer --offline   # radius mining + drops into the pack
 MCAGENT_CHAT_TEST=true      ... runServer --offline   # chat throttle (uses a stub LLM server)
 MCAGENT_CHAT_INVOKE_TEST=true ... runServer --offline # any chat -> immediate full-state optional-silence turn
+MCAGENT_CHAT_INVOKE_TEST=true MCAGENT_CHAT_KEEP=off ... runServer --offline
+                                                      # its second-phase control: a watchdog-forced
+                                                      # turn is allowed to consume the message
+MCAGENT_CHAT_INVOKE_TEST=true MCAGENT_CHAT_FAR=off ... runServer --offline
+                                                      # its third-phase control: a message from
+                                                      # outside earshot is not treated as addressed
 MCAGENT_PERSIST_TEST=write|verify ... runServer --offline   # persistence across a real restart
 MCAGENT_BRAIN_TEST=true ... runServer --offline       # full LLM loop — needs a live endpoint
 MCAGENT_SABLE_TEST=true ... runServer --offline
 MCAGENT_TUNNEL_TEST=true ... runServer --offline      # local descending tunnel macro
+MCAGENT_ESCAPE_TEST=true ... runServer --offline      # staircase escape + economical tool fallback
+MCAGENT_SELFCLEAR_TEST=true ... runServer --offline   # a queued step naming a block the bot just cleared
+                                                      # must not abort the plan (the tunnel-death bug)
+MCAGENT_SELFCLEAR_TEST=true MCAGENT_SELFCLEARED=off ... runServer --offline   # its positive control
+MCAGENT_MINING_GOAL_TEST=true ... runServer --offline  # the persistent mining skill finishes a whole
+                                                       # trip on one planning call; interrupt cancels it
+MCAGENT_MINING_GOAL_TEST=true MCAGENT_MINING_GOAL=off ... runServer --offline  # its positive control
 MCAGENT_PERF=true       ... runServer --offline       # visibility-scan timing
+MCAGENT_STRUCTURE_TEST=true ... runServer --offline   # player-built structure guard (mine/tunnel/escape)
+MCAGENT_STRUCTURE_TEST=true MCAGENT_STRUCTURE_GUARD=off ... runServer --offline   # its positive control
+MCAGENT_JEV_MINE_TEST=true ... runServer --offline    # Jev mining recovery, confidence and race guards
+MCAGENT_SPEECH_TEST=true    ... runServer --offline   # Jev speech gate, low-confidence silence,
+                                                      # narration guard + repetition guard (stub System One)
+MCAGENT_SPEECH_TEST=true MCAGENT_NARRATION_GUARD=off ... runServer --offline  # its positive control
+MCAGENT_CMD_UX_TEST=true    ... runServer --offline   # spawn resumes at the logout position; tab completion
+MCAGENT_RELOAD_TEST=true    ... runServer --offline   # a reload must not wait on an in-flight model call
+MCAGENT_RELOAD_TEST=true MCAGENT_RELOAD_INTERRUPT=off ... runServer --offline  # its positive control
 ```
 
 Decompiled Minecraft/NeoForge sources for API reference: `/ymtc/Repos/.mcai-scratch/mcsrc/`
@@ -103,6 +125,45 @@ cp build/libs/mcagent-runtime.jar <server>/mcagent-runtime/mcagent-runtime.jar
 
 - **Never run `gradle clean`.** It deletes `build/smoke-server`, the dev game directory. It has been
   destroyed once this way.
+- **Never `cp` over the live runtime jar - rename onto it.** `deploy-hot.sh` writes a `.new` file and
+  `mv`s it. The running generation still holds that jar open, and overwriting the same inode leaves
+  its class loader reading a file whose central directory has moved: every class it has not loaded
+  yet then dies with `ZipException: ZipFile invalid LOC header` and `NoClassDefFoundError`, mid-tick.
+  A rename leaves the old inode alone and gives the new generation a complete file.
+- **`/mcagent reload` deleting itself is a real failure mode.** The core registers `runtime`/`reload`
+  and *then* delegates to the runtime, so a runtime that replaces the whole `/mcagent` node removes
+  the command used to load it. `BotCommands.refreshSubcommands` therefore deletes only the children
+  the runtime itself is about to register. If it ever happens again: `tools/restore-core-commands.sh`
+  re-registers the core's commands on the live dispatcher (no restart). It renames its agent class on
+  every run, because HotSpot memoises the class loader of the **first** attached agent jar - same
+  class name, stale bytes, silently.
+- **Brigadier merges command trees; it never replaces a node.** Same-named children keep the old
+  node's argument type and suggestion provider, and only the executor and grandchildren are merged
+  in. Adding `.suggests()` to a command therefore does nothing on a server that already registered
+  it: production kept 9月20日's argument nodes for two days. `/mcagent commands` reads the **live**
+  dispatcher and reports which bot-name arguments actually complete; the dev-server test cannot catch
+  this because its dispatcher is always fresh.
+- **A tool-schema type that is not a JSON Schema type kills every request, not one tool.**
+  `LlmClient.schema` splits `"type: description"` on the first colon, so `"array of strings: ..."`
+  became `"type": "array of strings"` and the provider answered every planning call with
+  `11129 invalid function call parameters`. Arrays have to be hand-built with an `items` type;
+  `LlmClient` now degrades an unknown type to `string` and warns, and `MINEGOALTEST` asserts the types
+  in the real outgoing request. No dev test can see this through the scripted model, which ignores
+  tool schemas - check the request, not the model's behaviour.
+- **Chat is recorded for every bot in the dimension; distance only decides who is addressed.**
+  `ChatLog` used to *record* only within 64 blocks, so a message aimed at the bot could vanish with
+  no trace: production had a player answer the bot's own question from just outside earshot and the
+  bot looked like it was ignoring them - no chat turn, no gate decision, nothing in the log. Now
+  every message is recorded and `directed` is what uses range. A **language request** additionally
+  bypasses the silence gate: it is a message about how to talk, and a gate looking for "does this
+  need an action" reads it as chatter. Ordinary task instructions still go through the gate, because
+  that is where the calibrated silence and repetition rules live.
+- **The cheap layer's saving is only visible in `JEV STATS`.** A call that did not happen leaves no
+  log line, so the absolute call rate says nothing about whether routing works; one line per 5
+  minutes reports calls, intercepted, idle_continuation, idle_skipped and avoided_percent. Read that
+  before claiming a reduction. The measured shape: routing intercepts about half of the decisions it
+  is asked about, and the other half of the calls are idle re-plans (a one-to-three step plan drains,
+  the bot is idle, and it buys a 12k-token planning turn).
 - The runtime jar must **not** sit in `mods/` — NeoForge would try to load it as a mod. `RuntimeHost`
   resolves `mcagent-runtime/mcagent-runtime.jar` relative to the server's working directory.
 - `/mcagent reload` re-registers the runtime's commands on the live dispatcher. Brigadier merges and
@@ -180,3 +241,21 @@ The most expensive mistakes in this project's history were **confident claims th
   contents are recorded automatically; everything else is the model's choice.
 - `maxTokens` must clear the model's *thinking* budget, not just its answer — too low and a reasoning
   model spends the whole turn thinking and emits no tool call at all.
+- **Player-built structures are protected** (`rt/perception/PlayerStructure.java`): fixtures (beds,
+  storage, workstations, anything with a block entity) are never breakable, and a cluster of building
+  blocks around a fixture protects its whole box plus 6 blocks of foundation. Every breaking path
+  funnels through `AgentBrain.startMine`, which is where the refusal is enforced; the planners refuse
+  earlier so the bot gets an honest message instead of a cascade of failed steps. `escape_up` inside a
+  building walks out through the door instead of digging. Classify blocks by id *tokens*, never
+  `Set.of(path.split("_"))` — mods ship ids like `chipped:bricks_bricks` and `Set.of` throws on
+  duplicates, which escapes the classifier entirely.
+- `/mcagent spawn <name>` with no coordinates resumes at the position recorded in the bot's own
+  playerdata (`BotManager.savedLogout`), in the dimension it logged out in: vanilla restores a
+  returning player's dimension from that file but never their coordinates, because those normally
+  come from the client. Every bot-name argument completes to the online bots; `spawn` completes to
+  the names that still have saved data, read from the server's `usercache.json` (vanilla's
+  `GameProfileCache` keeps its entry type package-private, so its `load()` is unusable here).
+- The dev server loads the runtime from **`build/smoke-server/mcagent-runtime/mcagent-runtime.jar`**,
+  not from `build/classes`. Run `deploySmokeServer` before `runServer`, or you will be testing the
+  previous build and conclude your change did nothing. Also note the env vars must be visible to the
+  forked server JVM: a long-lived Gradle daemon started without them will not pass them on.

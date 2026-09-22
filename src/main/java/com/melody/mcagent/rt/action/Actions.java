@@ -623,24 +623,42 @@ public final class Actions {
     }
 
     /**
-     * Equip an economical pickaxe for this block, falling back to the requested tool.
-     * Ordinary tunnel material uses stone; ores use iron; ancient debris and obsidian use diamond.
+     * Equip the cheapest carried tool suited to this block, falling back to the requested tool.
+     *
+     * <p>The model may omit {@code item}; the server still must not leave an unrelated held item
+     * selected while a suitable tool is in the pack. The ordering also preserves expensive tools
+     * when a cheaper one is capable.
      */
     @Nullable
     public static Result equipForMining(ServerPlayer bot, BlockState state, String requestedItem) {
-        if (!state.is(net.minecraft.tags.BlockTags.MINEABLE_WITH_PICKAXE)) {
+        String[] preferred;
+        if (state.is(net.minecraft.tags.BlockTags.MINEABLE_WITH_PICKAXE)) {
+            if (state.is(net.minecraft.tags.BlockTags.NEEDS_DIAMOND_TOOL)) {
+                preferred = new String[] { "diamond_pickaxe", "netherite_pickaxe" };
+            } else if (state.is(net.minecraft.tags.BlockTags.NEEDS_IRON_TOOL)) {
+                preferred = new String[] {
+                        "iron_pickaxe", "diamond_pickaxe", "netherite_pickaxe"
+                };
+            } else {
+                preferred = new String[] {
+                        "stone_pickaxe", "iron_pickaxe", "diamond_pickaxe", "netherite_pickaxe"
+                };
+            }
+        } else if (state.is(net.minecraft.tags.BlockTags.MINEABLE_WITH_AXE)) {
+            preferred = new String[] {
+                    "stone_axe", "iron_axe", "diamond_axe", "netherite_axe"
+            };
+        } else if (state.is(net.minecraft.tags.BlockTags.MINEABLE_WITH_SHOVEL)) {
+            preferred = new String[] {
+                    "stone_shovel", "iron_shovel", "diamond_shovel", "netherite_shovel"
+            };
+        } else if (state.is(net.minecraft.tags.BlockTags.MINEABLE_WITH_HOE)) {
+            preferred = new String[] {
+                    "stone_hoe", "iron_hoe", "diamond_hoe", "netherite_hoe"
+            };
+        } else {
             return equipIfRequested(bot, requestedItem);
         }
-        String path = net.minecraft.core.registries.BuiltInRegistries.BLOCK
-                .getKey(state.getBlock()).getPath().toLowerCase(Locale.ROOT);
-        boolean diamondTier = path.equals("ancient_debris") || path.contains("obsidian");
-        boolean ore = path.endsWith("_ore") || path.contains("ore_")
-                || path.equals("ancient_debris");
-        String[] preferred = diamondTier
-                ? new String[] { "diamond_pickaxe", "netherite_pickaxe" }
-                : ore
-                        ? new String[] { "iron_pickaxe", "diamond_pickaxe", "netherite_pickaxe" }
-                        : new String[] { "stone_pickaxe" };
         for (String item : preferred) {
             Result equipped = holdItem(bot, item);
             if (equipped.success()) {
@@ -723,6 +741,9 @@ public final class Actions {
 
     // --- chat -----------------------------------------------------------------------------------
 
+    /** How long a bot is held to "you already said that", in ticks. */
+    private static final long REPEAT_WINDOW_TICKS = 3600L;
+
     /**
      * Speak as the bot, so real players see it as an ordinary chat line.
      *
@@ -737,6 +758,17 @@ public final class Actions {
         if (text.length() > 256) {
             text = text.substring(0, 256);
         }
+
+        // Repetition is the most visible way a bot looks broken, and it is cheap to catch: a bot does
+        // not hear its own chat, so before this it could acknowledge one instruction three times in a
+        // row and never notice. "The same" means identical after punctuation and spacing are
+        // ignored, or an earlier line contained in this one, within the last few minutes.
+        if (com.melody.mcagent.rt.perception.ChatLog.saidRecently(bot, text, REPEAT_WINDOW_TICKS)) {
+            return Result.fail("you already said this within the last " + (REPEAT_WINDOW_TICKS / 20)
+                    + " seconds; do not repeat yourself. Either say something with new information "
+                    + "in it, or stay silent and keep working");
+        }
+
         var message = net.minecraft.network.chat.PlayerChatMessage.unsigned(bot.getUUID(), text);
         var bound = net.minecraft.network.chat.ChatType.bind(net.minecraft.network.chat.ChatType.CHAT, bot);
         bot.server.getPlayerList().broadcastChatMessage(message, bot, bound);
@@ -754,6 +786,8 @@ public final class Actions {
             com.melody.mcagent.rt.perception.ChatLog.record(
                     bot, text, bot.level().getGameTime(), listeners);
         }
+        // And remember it as its own line, so both the repetition check and the prompt know it.
+        com.melody.mcagent.rt.perception.ChatLog.recordOwn(bot, text, bot.level().getGameTime());
 
         return Result.ok("said: " + text);
     }

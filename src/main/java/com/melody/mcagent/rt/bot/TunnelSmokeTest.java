@@ -80,20 +80,38 @@ public final class TunnelSmokeTest implements TestHook {
                     : Agent.brainManager().get(handle.player().getUUID());
             handle.player().teleportTo(Vec3.atBottomCenterOf(this.origin).x,
                     this.origin.getY(), Vec3.atBottomCenterOf(this.origin).z);
+            // Make this artificial hillside "home" only after the initial route is complete. The
+            // first entrance must remain legal; every later attempt to replace it must be refused.
+            handle.player().setRespawnPosition(handle.player().level().dimension(), this.origin,
+                    0.0F, true, false);
             String resume = brain == null ? "no brain"
                     : brain.digTunnel("east", "level", 2, "diamond_pickaxe");
             boolean reused = resume.contains("established mine entrance")
                     && resume.contains("no new surface hole");
+            String secondEntrance = brain == null ? "no brain"
+                    : brain.digTunnel("south", "down", 2, "diamond_pickaxe", true);
+            boolean oneEntrance = secondEntrance.contains("second entrance is forbidden");
+            BlockPos protectedSurface = this.origin.offset(0, 3, 2);
+            String surfaceMine = brain == null ? "no brain"
+                    : brain.mineAsTool(protectedSurface, 0);
+            boolean surfaceIntact = surfaceMine.contains("surface")
+                    && level(handle).getBlockState(protectedSurface).is(Blocks.STONE);
             boolean economical = !stonePick.isEmpty() && stonePick.getDamageValue() > 0
                     && !diamondPick.isEmpty() && diamondPick.getDamageValue() == 0;
-            this.finish(drops >= 36 && schema && reused && economical,
+            this.finish(drops >= 36 && schema && reused && oneEntrance && surfaceIntact && economical,
                     "moved from " + this.origin.toShortString() + " to " + at.toShortString()
                     + ", cobblestone=" + drops + ", schema=" + schema
-                    + ", reused=" + reused + ", economicalTools=" + economical
-                    + ", resume='" + resume + "'");
+                    + ", reused=" + reused + ", oneEntrance=" + oneEntrance
+                    + ", surfaceIntact=" + surfaceIntact + ", economicalTools=" + economical
+                    + ", resume='" + resume + "', second='" + secondEntrance
+                    + "', surfaceMine='" + surfaceMine + "'");
         } else if (this.ticks > 1600) {
             this.finish(false, "still at " + at.toShortString() + " after 1600 ticks");
         }
+    }
+
+    private static ServerLevel level(BotManager.BotHandle handle) {
+        return handle.player().serverLevel();
     }
 
     private void begin() {
@@ -147,7 +165,15 @@ public final class TunnelSmokeTest implements TestHook {
         handle.player().getInventory().add(new ItemStack(Items.STONE_PICKAXE));
         if (!Agent.attachBrain(handle.player())) {
             this.finish(false, "could not attach scripted brain");
+            return;
         }
+        AgentBrain brain = Agent.brainManager() == null ? null
+                : Agent.brainManager().get(handle.player().getUUID());
+        if (brain == null) {
+            this.finish(false, "attached brain was not registered");
+            return;
+        }
+        brain.clearMineRouteForTest();
     }
 
     private static ItemStack find(net.minecraft.server.level.ServerPlayer player, Item item) {

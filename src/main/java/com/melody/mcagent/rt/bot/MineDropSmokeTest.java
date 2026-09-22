@@ -24,13 +24,15 @@ import org.slf4j.LoggerFactory;
 /**
  * Proves that a mining job's drops end up in the pack as the blocks fall, instead of being walked to.
  *
- * <p>Enabled with {@code MCAGENT_MINEDROP_TEST=true}. Three checks, each of which fails differently:
+ * <p>Enabled with {@code MCAGENT_MINEDROP_TEST=true}. Five checks, each of which fails differently:
  * <ol>
  *   <li>a radius job on a stack of logs fells the whole trunk, the logs are in the inventory, nothing
  *       is left on the ground, and the end-of-job collection phase finds nothing to walk to;</li>
  *   <li>with a full pack, what does not fit stays on the ground instead of being destroyed;</li>
  *   <li>valuable ore displaces one redundant low-tier tool in a completely full pack;</li>
  *   <li>an item that was already lying there before the break is not swept up with it.</li>
+ *   <li>a lightly x-rayed ore sealed inside terrain gets a real two-block-high access tunnel rather
+ *       than being mined through the wall or hanging forever on an unreachable coordinate.</li>
  * </ol>
  *
  * <p>The model is a scripted stub that never asks for anything, so the job runs deterministically and
@@ -68,8 +70,11 @@ public final class MineDropSmokeTest implements TestHook {
     private ServerLevel level;
     private BlockPos base;
     private BlockPos treeBase;
-    private BlockPos bookshelf;
+    private BlockPos clayBlock;
     private BlockPos diamondLog;
+    /** Where the foreign item rests: near the work, but out of automatic pickup range. */
+    private BlockPos diamondSupport;
+    private BlockPos occludedOre;
     private ItemEntity foreignItem;
 
     private int ticks;
@@ -137,11 +142,11 @@ public final class MineDropSmokeTest implements TestHook {
                 // The sweep happens inside the tick that breaks the block, and vanilla's own pickup
                 // cannot have run yet when this hook sees it, so counting the leftovers here is the
                 // moment before anything could have moved them.
-                if (this.level.getBlockState(this.bookshelf).isAir()) {
+                if (this.level.getBlockState(this.clayBlock).isAir()) {
                     this.checkLeftoversImmediately();
                     this.step = 4;
                     this.phaseStartTick = this.ticks;
-                } else if (this.timedOut(600, "the bookshelf was never broken")) {
+                } else if (this.timedOut(600, "the clay block was never broken")) {
                     // handled by timedOut
                 }
             }
@@ -186,8 +191,20 @@ public final class MineDropSmokeTest implements TestHook {
                 // bot has finished.
                 if (!this.isMining()) {
                     this.checkForeignItemNotSwept();
-                    this.report();
+                    this.startOccludedAccessJob();
                 } else if (this.timedOut(400, "the age-filter job never finished")) {
+                    // handled by timedOut
+                }
+            }
+            case 8 -> {
+                var brain = this.brain();
+                boolean targetGone = this.level.getBlockState(this.occludedOre).isAir();
+                boolean idle = brain != null && "idle".equals(brain.currentAction());
+                if (targetGone && idle) {
+                    this.checkOccludedAccessJob();
+                    this.report();
+                } else if (this.timedOut(1600,
+                        "the occluded ore access route never completed")) {
                     // handled by timedOut
                 }
             }
@@ -224,10 +241,10 @@ public final class MineDropSmokeTest implements TestHook {
         for (int i = 0; i < TREE_LOGS; i++) {
             this.level.setBlockAndUpdate(this.treeBase.above(i), Blocks.OAK_LOG.defaultBlockState());
         }
-        this.bookshelf = this.base.offset(2, 0, 2);
-        this.level.setBlockAndUpdate(this.bookshelf, Blocks.BOOKSHELF.defaultBlockState());
-        LOG.info("MINEDROPTEST: tree of {} logs based at {}, bookshelf at {}", TREE_LOGS,
-                this.treeBase, this.bookshelf);
+        this.clayBlock = this.base.offset(2, 0, 2);
+        this.level.setBlockAndUpdate(this.clayBlock, Blocks.CLAY.defaultBlockState());
+        LOG.info("MINEDROPTEST: tree of {} logs based at {}, clay block at {}", TREE_LOGS,
+                this.treeBase, this.clayBlock);
 
         var handle = Agent.botManager().spawn(BOT, this.level,
                 new Vec3(this.base.getX() + 1.5, this.base.getY(), this.base.getZ() + 0.5), true);
@@ -320,7 +337,7 @@ public final class MineDropSmokeTest implements TestHook {
         bot.teleportTo(this.treeBase.getX() + 1.5, this.treeBase.getY(), this.treeBase.getZ() + 0.5);
         String outcome = brain.mineAsTool(this.treeBase, 6);
         LOG.info("MINEDROPTEST radius job: {}", outcome);
-        this.check("the radius job started", outcome.startsWith("started mining"));
+        this.check("the radius job started", !outcome.startsWith("failed:") && brain.isMining());
         this.step = 2;
         this.phaseStartTick = this.ticks;
     }
@@ -352,9 +369,13 @@ public final class MineDropSmokeTest implements TestHook {
     // --- check 2: partial fit --------------------------------------------------------------------
 
     /**
-     * Break a bookshelf with a pack that has room for one of the three books it drops.
+     * Break a clay block with a pack that has room for one of the four clay balls it drops.
      *
      * <p>A full pack is exactly the case where an over-eager sweep would delete the remainder.
+     *
+     * <p>Clay rather than a bookshelf: a bookshelf is player-placed furniture, and the structure
+     * guard now refuses to break one - correctly, but it is not what this check is about. Clay is
+     * natural terrain and drops a fixed four items.
      */
     private void startPartialFitJob() {
         ServerPlayer bot = bot();
@@ -370,13 +391,13 @@ public final class MineDropSmokeTest implements TestHook {
         for (int slot = 0; slot < inventory.getContainerSize(); slot++) {
             inventory.setItem(slot, new ItemStack(Items.STONE, 64));
         }
-        // Room for exactly one book, and the bookshelf drops three.
-        inventory.setItem(0, new ItemStack(Items.BOOK, 63));
+        // Room for exactly one clay ball, and the block drops four.
+        inventory.setItem(0, new ItemStack(Items.CLAY_BALL, 63));
         giveAxe();
 
-        bot.teleportTo(this.bookshelf.getX() + 1.5, this.bookshelf.getY(),
-                this.bookshelf.getZ() + 0.5);
-        String outcome = brain.mineAsTool(this.bookshelf, 0);
+        bot.teleportTo(this.clayBlock.getX() + 1.5, this.clayBlock.getY(),
+                this.clayBlock.getZ() + 0.5);
+        String outcome = brain.mineAsTool(this.clayBlock, 0);
         LOG.info("MINEDROPTEST partial-fit job: {}", outcome);
         this.check("the partial-fit job started", outcome.startsWith("started mining"));
         this.step = 3;
@@ -384,35 +405,35 @@ public final class MineDropSmokeTest implements TestHook {
     }
 
     private void checkLeftoversImmediately() {
-        int books = 0;
-        for (ItemEntity drop : itemsNear(this.bookshelf, 3.0D)) {
-            if (drop.getItem().is(Items.BOOK)) {
-                books += drop.getItem().getCount();
+        int dropped = 0;
+        for (ItemEntity drop : itemsNear(this.clayBlock, 3.0D)) {
+            if (drop.getItem().is(Items.CLAY_BALL)) {
+                dropped += drop.getItem().getCount();
             }
         }
         ServerPlayer bot = bot();
-        int held = bot == null ? -1 : countOf(bot, Items.BOOK);
+        int held = bot == null ? -1 : countOf(bot, Items.CLAY_BALL);
 
         LOG.info("MINEDROPTEST ================ CHECK 2: partial fit ================");
-        LOG.info("MINEDROPTEST bookshelf broke with room for 1 of its 3 books");
-        LOG.info("MINEDROPTEST books in the pack    : {}", held);
-        LOG.info("MINEDROPTEST books on the ground  : {}", books);
-        this.check("what fitted went into the pack (64 books)", held == 64);
-        this.check("what did not fit stayed on the ground instead of being deleted (" + books
-                + " of the 2 left over)", books == 2);
+        LOG.info("MINEDROPTEST clay block broke with room for 1 of its 4 clay balls");
+        LOG.info("MINEDROPTEST clay balls in the pack  : {}", held);
+        LOG.info("MINEDROPTEST clay balls on the ground: {}", dropped);
+        this.check("what fitted went into the pack (64 clay balls)", held == 64);
+        this.check("what did not fit stayed on the ground instead of being deleted (" + dropped
+                + " of the 3 left over)", dropped == 3);
     }
 
     private void checkLeftoversAfterJob() {
-        int books = 0;
-        for (ItemEntity drop : itemsNear(this.bookshelf, 6.0D)) {
-            if (drop.getItem().is(Items.BOOK)) {
-                books += drop.getItem().getCount();
+        int dropped = 0;
+        for (ItemEntity drop : itemsNear(this.clayBlock, 6.0D)) {
+            if (drop.getItem().is(Items.CLAY_BALL)) {
+                dropped += drop.getItem().getCount();
             }
         }
-        LOG.info("MINEDROPTEST after the fallback collection phase: {} book(s) still on the ground, "
-                + "{} tick(s) spent trying to collect them", books, this.collectingTicks);
-        this.check("the leftovers are still on the ground after the fallback phase (" + books + ")",
-                books == 2);
+        LOG.info("MINEDROPTEST after the fallback collection phase: {} clay ball(s) still on the "
+                + "ground, {} tick(s) spent trying to collect them", dropped, this.collectingTicks);
+        this.check("the leftovers are still on the ground after the fallback phase (" + dropped + ")",
+                dropped == 3);
         this.check("the fallback gave up instead of standing there forever (" + this.collectingTicks
                 + " ticks)", this.collectingTicks < 400);
         this.collectingTicks = 0;
@@ -464,23 +485,27 @@ public final class MineDropSmokeTest implements TestHook {
         this.diamondLog = this.base.offset(2, 0, -2);
         this.level.setBlockAndUpdate(this.diamondLog, Blocks.OAK_LOG.defaultBlockState());
 
-        // A real dropped item, resting on top of the log that is about to be broken - squarely inside
-        // the area the sweep looks at, so only its age can keep it out of the pack. Not a block drop
-        // and not instantly pickable: like anything a player throws down, it starts with the usual
-        // pickup delay.
+        // A real dropped item, resting on its own support block two tiles beyond the log that is about
+        // to be broken. It used to sit on that very log, which made this check flaky: the bot has to
+        // walk onto the broken log's tile to collect its own drop, and vanilla pickup then takes
+        // anything within ~1.3 blocks - so the outcome depended on where the drop happened to land,
+        // not on the age filter this test exists to check. Two tiles out is still inside the sweep's
+        // radius, but outside automatic pickup range.
+        this.diamondSupport = this.base.offset(4, 0, -2);
+        this.level.setBlockAndUpdate(this.diamondSupport, Blocks.STONE.defaultBlockState());
         this.foreignItem = new ItemEntity(this.level,
-                this.diamondLog.getX() + 0.5D, this.diamondLog.getY() + 1.05D,
-                this.diamondLog.getZ() + 0.5D, new ItemStack(Items.DIAMOND, 1));
+                this.diamondSupport.getX() + 0.5D, this.diamondSupport.getY() + 1.05D,
+                this.diamondSupport.getZ() + 0.5D, new ItemStack(Items.DIAMOND, 1));
         this.foreignItem.setDefaultPickUpDelay();
         this.level.addFreshEntity(this.foreignItem);
         LOG.info("MINEDROPTEST dropped a diamond on top of the log at {}; nothing in this break "
-                + "produced it", this.diamondLog.toShortString());
+                + "produced it", this.diamondSupport.toShortString());
 
         // Stand well back while it ages. A player collects items from about 1.3 blocks away (the
         // bounding box used for pickup is inflated by 1.0 x 0.5 x 1.0), so a bot standing next to it
         // would simply pick it up and the test would prove nothing.
-        bot.teleportTo(this.diamondLog.getX() + 6.5, this.diamondLog.getY(),
-                this.diamondLog.getZ() + 0.5);
+        bot.teleportTo(this.diamondSupport.getX() + 6.5, this.diamondSupport.getY(),
+                this.diamondSupport.getZ() + 0.5);
         this.stopBot();
         this.step = 5;
         this.phaseStartTick = this.ticks;
@@ -494,11 +519,13 @@ public final class MineDropSmokeTest implements TestHook {
             this.finish();
             return;
         }
-        // Close enough to reach the block, far enough that vanilla's own pickup cannot grab the
-        // diamond out from under the test. A player collects items from a box inflated by
-        // (1.0, 0.5, 1.0) around their own, so 2.5 blocks of separation leaves a margin - but only
-        // for as long as the bot stands still, which is why the driver is stopped first.
-        bot.teleportTo(this.diamondLog.getX() + 2.5, this.diamondLog.getY(),
+        // Close enough to reach the log, far enough that vanilla's own pickup cannot grab the diamond
+        // out from under the test. A player collects items from a box inflated by (1.0, 0.5, 1.0)
+        // around their own, so the bot stands on the far side of the log from the item - 2.5 blocks
+        // from the log it must break and 6.5 from the diamond. (Standing on the near side put it 0.5
+        // blocks from the item, which is how this test first failed: it was picked up instantly and
+        // the age filter was never exercised.)
+        bot.teleportTo(this.diamondLog.getX() - 2.5, this.diamondLog.getY(),
                 this.diamondLog.getZ() + 0.5);
         this.stopBot();
         this.collectingTicks = 0;
@@ -536,7 +563,7 @@ public final class MineDropSmokeTest implements TestHook {
         int diamondsHeld = bot == null ? 0 : countOf(bot, Items.DIAMOND);
         int diamondsOnGround = 0;
         int age = this.foreignItem.isRemoved() ? -1 : this.foreignItem.getAge();
-        for (ItemEntity drop : itemsNear(this.diamondLog, 4.0D)) {
+        for (ItemEntity drop : itemsNear(this.diamondSupport, 4.0D)) {
             if (drop.getItem().is(Items.DIAMOND)) {
                 diamondsOnGround += drop.getItem().getCount();
             }
@@ -568,7 +595,7 @@ public final class MineDropSmokeTest implements TestHook {
         ServerPlayer bot = bot();
         int diamondsHeld = bot == null ? -1 : countOf(bot, Items.DIAMOND);
         int diamondsOnGround = 0;
-        for (ItemEntity drop : itemsNear(this.diamondLog, 6.0D)) {
+        for (ItemEntity drop : itemsNear(this.diamondSupport, 6.0D)) {
             if (drop.getItem().is(Items.DIAMOND)) {
                 diamondsOnGround += drop.getItem().getCount();
             }
@@ -589,6 +616,78 @@ public final class MineDropSmokeTest implements TestHook {
         this.check("the collection phase had nothing of its own to fetch (" + this.collectingTicks
                 + " tick(s))", this.collectingTicks <= 2);
         this.collectingTicks = 0;
+    }
+
+    // --- check 5: perceived-through-terrain access ----------------------------------------------
+
+    private void startOccludedAccessJob() {
+        ServerPlayer bot = bot();
+        var brain = brain();
+        if (bot == null || brain == null) {
+            this.check("a bot with a brain exists for the occluded-access job", false);
+            this.report();
+            return;
+        }
+
+        // A large sealed stone mass: ordinary walking cannot reach any point within arm's reach of
+        // the ore, while a short player-sized excavation from the front can. The mass is wide and
+        // tall enough that going around or over it is not accidentally a valid test solution.
+        for (int dx = -2; dx <= 14; dx++) {
+            for (int dz = -9; dz <= 9; dz++) {
+                for (int dy = 0; dy <= 7; dy++) {
+                    this.level.setBlockAndUpdate(this.base.offset(dx, dy, dz),
+                            Blocks.AIR.defaultBlockState());
+                }
+                this.level.setBlockAndUpdate(this.base.offset(dx, -1, dz),
+                        Blocks.STONE.defaultBlockState());
+            }
+        }
+        for (int dx = 3; dx <= 12; dx++) {
+            for (int dz = -8; dz <= 8; dz++) {
+                for (int dy = 0; dy <= 6; dy++) {
+                    this.level.setBlockAndUpdate(this.base.offset(dx, dy, dz),
+                            Blocks.STONE.defaultBlockState());
+                }
+            }
+        }
+        this.occludedOre = this.base.offset(8, 0, 0);
+        this.level.setBlockAndUpdate(this.occludedOre, Blocks.DIAMOND_ORE.defaultBlockState());
+
+        bot.getInventory().clearContent();
+        bot.getInventory().setItem(0, new ItemStack(Items.IRON_PICKAXE));
+        bot.getInventory().selected = 0;
+        bot.teleportTo(this.base.getX() + 0.5D, this.base.getY(), this.base.getZ() + 0.5D);
+        this.stopBot();
+
+        String outcome = brain.mineAsTool(this.occludedOre, 0);
+        LOG.info("MINEDROPTEST occluded-access job: target={}, bot={}, {}",
+                this.occludedOre.toShortString(), bot.blockPosition().toShortString(), outcome);
+        this.check("the sealed target produced an explicit access route",
+                outcome.contains("access route"));
+        this.step = 8;
+        this.phaseStartTick = this.ticks;
+    }
+
+    private void checkOccludedAccessJob() {
+        ServerPlayer bot = bot();
+        int openFeet = 0;
+        int openHead = 0;
+        for (int dx = 3; dx <= 7; dx++) {
+            if (this.level.getBlockState(this.base.offset(dx, 0, 0)).isAir()) {
+                openFeet++;
+            }
+            if (this.level.getBlockState(this.base.offset(dx, 1, 0)).isAir()) {
+                openHead++;
+            }
+        }
+        LOG.info("MINEDROPTEST ================ CHECK 5: occluded access ===============");
+        LOG.info("MINEDROPTEST target ore removed  : {}", this.level.getBlockState(this.occludedOre).isAir());
+        LOG.info("MINEDROPTEST corridor feet/head  : {}/{} open cells", openFeet, openHead);
+        LOG.info("MINEDROPTEST bot final position  : {}", bot == null ? "?" : bot.blockPosition());
+        this.check("the occluded ore was eventually mined",
+                this.level.getBlockState(this.occludedOre).isAir());
+        this.check("a real player-sized corridor was excavated (feet=" + openFeet
+                + ", head=" + openHead + ")", openFeet >= 4 && openHead >= 2);
     }
 
     // --- helpers ---------------------------------------------------------------------------------

@@ -56,6 +56,12 @@ public final class ObservationBuilder {
         if (banner != null) {
             sb.append(banner).append("\n\n");
         }
+        // Right below the message it applies to: what the bot has already said about it. Three
+        // near-identical acknowledgements of one instruction is the failure this prevents.
+        String said = ChatLog.repetitionWarning(bot);
+        if (said != null) {
+            sb.append(said).append("\n\n");
+        }
 
         sb.append("=== YOUR STATE ===\n");
         sb.append(describeSelf(bot)).append('\n');
@@ -154,6 +160,11 @@ public final class ObservationBuilder {
     public static String describeSurroundings(ServerPlayer bot, int radius) {
         StringBuilder sb = new StringBuilder();
 
+        // Geometry comes before the long object list. It is deterministic and compact: the model
+        // should know it is in a closed tunnel with one frontier without reverse-engineering that
+        // fact from grouped stone coordinates.
+        sb.append(SemanticScene.describe(bot));
+
         List<Perception.SeenEntity> entities = Perception.visibleEntities(bot);
         if (entities.isEmpty()) {
             sb.append("Entities: none visible.\n");
@@ -233,14 +244,26 @@ public final class ObservationBuilder {
         ordered.addAll(ordinary);
 
         sb.append("Blocks you can see within ").append(radius).append(" blocks (")
-                .append(blocks.size()).append(" total, grouped; nearest instance of each):\n");
+                .append(blocks.size()).append(" total, grouped; nearest instance of each). ")
+                .append("A target marked OCCLUDED was noticed through the intentional light ")
+                .append("see-through allowance; it is an interest target, not a directly walkable ")
+                .append("coordinate. The mining tools will create a real access route first:\n");
         for (int i = 0; i < Math.min(ordered.size(), MAX_NAMED_BLOCKS); i++) {
             Map.Entry<String, TypeSummary> entry = ordered.get(i);
             TypeSummary summary = entry.getValue();
+            int blockers = Perception.blockerCount(
+                    bot, summary.nearest, Perception.SEE_THROUGH_BLOCKS + 1);
             sb.append("  - ").append(entry.getKey()).append(" x").append(summary.count)
               .append(" - nearest at ").append(summary.nearest.toShortString())
               .append(String.format(" (%.0f blocks %s)", summary.nearestDistance,
-                      compass(bot, summary.nearest)))
+                      compass(bot, summary.nearest)));
+            if (blockers > 0) {
+                sb.append(" [OCCLUDED by ").append(blockers).append(" block")
+                  .append(blockers == 1 ? "" : "s").append(']');
+            } else {
+                sb.append(" [EXPOSED]");
+            }
+            sb
               .append('\n');
         }
         if (ordered.size() > MAX_NAMED_BLOCKS) {
@@ -479,12 +502,20 @@ public final class ObservationBuilder {
                 player expects an answer from you, reply with the say tool in their language; if not,
                 stay silent. Keep any reply short, like a person chatting in a game.
 
+                Your own language is 简体中文: speak Chinese by default, including when you start a
+                conversation yourself, and answer in the language a player used only when that is not
+                Chinese. If a player asks you to switch language - "转中文", "说中文", "speak
+                Chinese" - obey it immediately, in that language, and remember it for the rest of the
+                session. Never answer a Chinese message in English.
+
                 Act by calling the tools provided. LLM calls are slow, so never spend one call on one
                 tiny action when you already know the next actions. For any task with two or more
                 known steps, PREFER the plan tool: put 4-12 useful actions in one strictly sequential
                 plan when the observation gives you enough information, up to 24 when the work is
                 repetitive. "Walk to the tree, chop it, return, deposit the logs" is one plan, not four
                 decisions. The server executes that plan while your next LLM call is still running.
+                A plan that drains leaves you idle, and an idle bot is asked to plan again - so a
+                one-step plan costs one full call per action. Batch the whole errand.
                 A plan stops at the first failed step by default, so stale dependent steps do not make
                 things worse; use continue_on_failure only for a genuinely independent step.
 
@@ -513,11 +544,11 @@ public final class ObservationBuilder {
 
                 Mining underground must leave you a way back out. ALWAYS use dig_tunnel for repeated
                 underground excavation: mode=down makes a descending staircase and mode=level makes a
-                branch tunnel. It remembers one established entrance and working face; after unloading
-                at storage, call it normally and it returns through that entrance before continuing.
-                Never start another hole unless a player explicitly asks for a new mine, in which case
-                set new_site=true. Never construct a staircase by guessing a long list of individual mine
-                coordinates; after the first blocks change those guesses become air or unreachable.
+                branch tunnel. It remembers the one established entrance allowed near home and its
+                working face; after unloading at storage, call it normally and it returns through that
+                entrance before continuing. You cannot replace that entrance or open another surface
+                hole. Never construct a staircase by guessing individual mine coordinates: those calls
+                are refused near the home surface because they produce pits and trenches.
                 Repeat dig_tunnel in chunks of up to 24 blocks. If you end up below ground with
                 no walking route, use escape_up once: the server will dig and climb a real staircase
                 with ordinary mining time. If it cannot find a safe staircase, use return_to_spawn;
@@ -525,20 +556,23 @@ public final class ObservationBuilder {
                 your inventory. Do not keep retrying goto, /home, /spawn or guessed place calls while
                 your coordinates remain unchanged.
 
-                To fell a tree or clear a vein, call mine once with a radius instead of picking blocks
-                off one at a time: mine(x, y, z, radius=6). The job keeps breaking connected blocks of
-                the same kind. What each block drops goes straight into your pack as it falls, so you
-                never have to walk over anything you have mined yourself.
+                To fell a tree or clear a vein, prefer mine_resource(resource, vein_radius=6): it
+                searches perceived blocks instead of making you copy or guess a coordinate, and it
+                creates a real access tunnel when light-x-ray perception noticed the target through
+                terrain. Use mine(x, y, z, radius=6) when an exact target coordinate is already known.
+                Both jobs keep breaking connected blocks of the same kind. What each block drops goes
+                straight into your pack as it falls, so you never have to walk over anything you mined.
 
                 Conserve iron tools: ordinary stone, cobblestone, deepslate and tunnel clearance use
                 a stone pickaxe whenever one is carried. Iron pickaxes are reserved for diamond and
                 other ores. The server selects this automatically even if you name a wasteful tool.
 
                 You may be asked what to do while a long action is still running. Your observation then
-                says WHAT YOU ARE DOING RIGHT NOW. If you are part-way through something and want to
-                change plan, call interrupt first, then say what to do instead - otherwise your new
-                action simply waits in line behind the old one. If the action is still what you want,
-                just do not interrupt it.
+                says WHAT YOU ARE DOING RIGHT NOW. If you are part-way through something and already
+                know the replacement steps, submit one plan with replace_current=true; it atomically
+                stops the old action, discards its stale queue, and starts the replacement. Use a
+                direct interrupt only when you must stop now but do not yet know the replacement.
+                If the action is still what you want, do not interrupt or replace it.
 
                 Anything else left on the ground - what you drop, what someone gives you - is reported
                 to you; use pickup, or walk over it.

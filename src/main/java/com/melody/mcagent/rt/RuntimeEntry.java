@@ -13,11 +13,19 @@ import com.melody.mcagent.rt.bot.BrainSmokeTest;
 import com.melody.mcagent.rt.bot.ChatThrottleSmokeTest;
 import com.melody.mcagent.rt.bot.ChatInvokeSmokeTest;
 import com.melody.mcagent.rt.bot.CombatSmokeTest;
+import com.melody.mcagent.rt.command.CommandUxSmokeTest;
 import com.melody.mcagent.rt.bot.EscapeSmokeTest;
+import com.melody.mcagent.rt.bot.JevSpeechGateSmokeTest;
+import com.melody.mcagent.rt.bot.JevMiningRecoverySmokeTest;
+import com.melody.mcagent.rt.bot.JevRoutingSmokeTest;
 import com.melody.mcagent.rt.bot.PlanSmokeTest;
 import com.melody.mcagent.rt.bot.MineDropSmokeTest;
+import com.melody.mcagent.rt.bot.MiningGoalSmokeTest;
 import com.melody.mcagent.rt.bot.PersistenceSmokeTest;
+import com.melody.mcagent.rt.bot.ReloadLatencySmokeTest;
 import com.melody.mcagent.rt.bot.SableCompatTest;
+import com.melody.mcagent.rt.bot.SelfClearedStepSmokeTest;
+import com.melody.mcagent.rt.bot.StructureGuardSmokeTest;
 import com.melody.mcagent.rt.bot.TunnelSmokeTest;
 import com.melody.mcagent.rt.command.BotCommands;
 import com.melody.mcagent.rt.command.CommandSmokeTest;
@@ -138,8 +146,14 @@ public final class RuntimeEntry implements AgentRuntime {
         for (BotManager.BotHandle handle : bots.handles()) {
             players.add(handle.player());
         }
+        // Every online name, so a message that names another player is not read as being for a bot
+        // that merely happens to be the only one in earshot.
+        List<String> names = new ArrayList<>();
+        for (ServerPlayer online : event.getPlayer().server.getPlayerList().getPlayers()) {
+            names.add(online.getName().getString());
+        }
         ChatLog.record(event.getPlayer(), event.getRawText(),
-                event.getPlayer().level().getGameTime(), players);
+                event.getPlayer().level().getGameTime(), players, names);
     }
 
     @Override
@@ -160,6 +174,7 @@ public final class RuntimeEntry implements AgentRuntime {
                 + " | bots=" + (bots == null ? 0 : bots.handles().size())
                 + " | brains=" + (brains == null ? 0 : brains.all().size())
                 + " | llm=" + (brains != null && brains.isConfigured() ? "ready" : "not configured")
+                + " | jev=" + (brains == null ? "disabled" : brains.jevMode())
                 + (this.live ? "" : " | not started");
     }
 
@@ -226,13 +241,21 @@ public final class RuntimeEntry implements AgentRuntime {
         add(InventoryCommandSmokeTest.arm(server));
         add(SableCompatTest.arm(server));
         add(PersistenceSmokeTest.arm(server));
+        add(ReloadLatencySmokeTest.arm(server));
         add(MineDropSmokeTest.arm(server));
+        add(MiningGoalSmokeTest.arm(server));
         add(ChatThrottleSmokeTest.arm(server));
         add(ChatInvokeSmokeTest.arm(server));
         add(CombatSmokeTest.arm(server));
         add(PlanSmokeTest.arm(server));
         add(EscapeSmokeTest.arm(server));
         add(TunnelSmokeTest.arm(server));
+        add(SelfClearedStepSmokeTest.arm(server));
+        add(StructureGuardSmokeTest.arm(server));
+        add(JevSpeechGateSmokeTest.arm(server));
+        add(JevRoutingSmokeTest.arm(server));
+        add(JevMiningRecoverySmokeTest.arm(server));
+        add(CommandUxSmokeTest.arm(server));
     }
 
     private void add(@Nullable TestHook test) {

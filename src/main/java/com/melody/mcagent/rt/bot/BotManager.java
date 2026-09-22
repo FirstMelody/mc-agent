@@ -131,6 +131,11 @@ public final class BotManager {
      */
     @Nullable
     public BotHandle spawn(String name, ServerLevel level, Vec3 position, boolean persistData) {
+        return this.spawn(name, level, position, 0.0F, 0.0F, persistData);
+    }
+
+    public BotHandle spawn(String name, ServerLevel level, Vec3 position, float yaw, float pitch,
+                           boolean persistData) {
         PlayerList playerList = this.server.getPlayerList();
 
         if (this.get(name) != null || playerList.getPlayerByName(name) != null) {
@@ -173,7 +178,7 @@ public final class BotManager {
             listener.setAfterPhysicsHook(movement::tick);
 
             // Put the bot where the caller asked (placeNewPlayer respawns it at world spawn).
-            listener.teleport(position.x, position.y, position.z, 0.0F, 0.0F);
+            listener.teleport(position.x, position.y, position.z, yaw, pitch);
 
             BotHandle handle = new BotHandle(bot, connection, movement, persistData, name);
             this.bots.put(bot.getUUID(), handle);
@@ -323,6 +328,91 @@ public final class BotManager {
                     LOG.warn("Could not delete {} file for bot {}", dir, uuid, t);
                 }
             }
+        }
+    }
+
+    /**
+     * Where a bot last logged out: its saved position, rotation and dimension.
+     *
+     * <p>Vanilla restores a returning player's <em>dimension</em> from playerdata but not their
+     * coordinates - the position normally arrives from the client - so a bot spawned without
+     * coordinates used to land wherever the operator happened to be standing, which is how a bot
+     * that had been mining 200 blocks away came back at the base. Resuming at the logout spot is
+     * what makes {@code /mcagent spawn <name>} a "come back" rather than a "start over here".
+     */
+    public record SavedLogout(ServerLevel level, Vec3 position, float yaw, float pitch) {
+    }
+
+    /**
+     * The position this bot logged out at, read from its own playerdata, or {@code null} when it has
+     * no save file (a brand new bot) or the file cannot be trusted.
+     */
+    @Nullable
+    public SavedLogout savedLogout(String name) {
+        java.nio.file.Path file = playerDataFile(name);
+        if (file == null || !java.nio.file.Files.isRegularFile(file)) {
+            return null;
+        }
+        try {
+            net.minecraft.nbt.CompoundTag tag = net.minecraft.nbt.NbtIo.readCompressed(
+                    file, net.minecraft.nbt.NbtAccounter.unlimitedHeap());
+            net.minecraft.nbt.ListTag pos = tag.getList("Pos", net.minecraft.nbt.Tag.TAG_DOUBLE);
+            if (pos.size() < 3) {
+                return null;
+            }
+            double x = pos.getDouble(0);
+            double y = pos.getDouble(1);
+            double z = pos.getDouble(2);
+            float yaw = 0.0F;
+            float pitch = 0.0F;
+            net.minecraft.nbt.ListTag rotation =
+                    tag.getList("Rotation", net.minecraft.nbt.Tag.TAG_FLOAT);
+            if (rotation.size() >= 2) {
+                yaw = rotation.getFloat(0);
+                pitch = rotation.getFloat(1);
+            }
+            ServerLevel level = this.server.overworld();
+            String dimension = tag.getString("Dimension");
+            if (!dimension.isBlank()) {
+                ServerLevel saved = this.server.getLevel(net.minecraft.resources.ResourceKey.create(
+                        net.minecraft.core.registries.Registries.DIMENSION,
+                        net.minecraft.resources.ResourceLocation.parse(dimension)));
+                if (saved != null) {
+                    level = saved;
+                } else {
+                    LOG.warn("Bot '{}' logged out in unknown dimension {}; using the overworld",
+                            name, dimension);
+                }
+            }
+            if (level.isOutsideBuildHeight(net.minecraft.util.Mth.floor(y))) {
+                LOG.warn("Saved position of bot '{}' is outside the world ({}); ignoring it", name, y);
+                return null;
+            }
+            return new SavedLogout(level, new Vec3(x, y, z), yaw, pitch);
+        } catch (Throwable t) {
+            LOG.warn("Could not read the saved position of bot '{}': {}", name, t.toString());
+            return null;
+        }
+    }
+
+    /** Whether this bot name has saved state on disk, i.e. a spawn would resume it rather than
+     * start a new bot. */
+    public boolean hasSavedData(String name) {
+        java.nio.file.Path file = playerDataFile(name);
+        return file != null && java.nio.file.Files.isRegularFile(file);
+    }
+
+    /** The playerdata file a bot's name owns, or {@code null} when the world path is unavailable. */
+    @Nullable
+    private java.nio.file.Path playerDataFile(String name) {
+        try {
+            UUID uuid = UUIDUtil.createOfflineProfile(name).getId();
+            return this.server.getWorldPath(
+                    net.minecraft.world.level.storage.LevelResource.ROOT)
+                    .resolve("playerdata").resolve(uuid + ".dat");
+        } catch (Throwable t) {
+            LOG.warn("Could not resolve the playerdata path for bot '{}': {}", name, t.toString());
+            return null;
         }
     }
 
