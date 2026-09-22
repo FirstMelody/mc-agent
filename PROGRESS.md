@@ -2699,3 +2699,39 @@ FARMTEST VERDICT: PASS
 3. 还有一个已知交互：`PlayerStructure` 里 **torch 同时是 CONSTRUCTED 和 FIXTURE**，
    所以一块插了很多火把的田可能触发结构保护（阈值是 16 块建造方块 + 至少 1 个 fixture），
    建造时要显式豁免作物/耕地，否则收割会被自己的火把挡住。
+
+### 14.5 种田第二步：选址 + 整套工具化建造（已完成并实测）
+
+`build_farm` 工具 + `FarmBuildJob`（`AgentBrain`）+ `rt/perception/FarmSite.java`。
+
+**选址**（"不能随便乱开"）：`FarmSite.reject` 逐条检查并给出**理由**——地面平整且锄头能翻（草/土/土径）、
+每格上方 3 格空气、范围内没有水或岩浆、**不在玩家建筑里**（直接问结构保护本身，两者不可能各说各话）、
+四角外扩一格也没有建筑。没给坐标时 `FarmSite.find` 从 bot 往外螺旋找最近的一块合格地面。
+实测里它**拒绝了 bot 脚下那块地**（7 格外有个木板房+箱子），自己走到 8 格外建田 —— 这正是要的行为。
+
+**建造顺序本身就是设计**：外围一圈火把 → 站到田中央 → 挖中间的水坑 → 倒水 → 翻地 → 播种，
+**之后不再在田里走**。因为**被踩过的耕地会变回泥土**，走在自己的半成品田上就是毁田。
+
+```
+FARMBUILDTEST field: farmland=24/24 crops=24/24 bounds=[62, -37, -78, 66, -74] water-in-middle=true
+                     ring-torches=4/4 built-in-house=false
+FARMBUILDTEST model requests: 1 in the whole session, 0 of them while the build was running
+FARMBUILDTEST VERDICT: PASS
+```
+
+**这一轮真正挖出来的三个 bug**（都不是"代码看起来不对"，是实跑才暴露的）：
+
+1. **桶根本放不出来。** `Actions.useOnBlock` 走的是 `ItemStack.useOn(UseOnContext)`，而桶没实现它 ——
+   原版是在 `BucketItem.use(Level, Player, InteractionHand)` 里放水的，只有"使用物品"这条路径才到得了。
+   所以拿水桶右键方块**什么都不发生、也不报错**。新增 `Farming.placeFluid()` 走 `gameMode.useItem`，
+   并且先看向"水应该落在哪一格下面的方块"，因为这条路径是从玩家眼睛射线投射的。
+   （连带的坑：挖水坑不能用 `startMine`，它的收集阶段会把 bot 带去捡掉落物，bot 一走开，
+   对着坑倒水的射线就打偏了 —— 所以水坑改成 job 内联 break，bot 原地掉进坑里。）
+2. **"busy" 不等于不花 LLM。** 前瞻逻辑会在长动作期间每 2 秒买一次决策；所以一个只是"占着 tick"的
+   运行时技能照样烧 token —— 一块 5x5 的田建完花了 **5 次**规划轮，全是问"接下来干嘛"。
+   现在 `tick()` 对 `farmBuildJob` 直接 return（和 `miningGoal` 一样）。
+3. **田不能建得比"站在中央够得着"更大。** 站在中间时 5x5 全在 4.5 格内，7x7 的四个角在 4.97 格外 ——
+   第一版为了够到角就满田走，把三分之一的田踩成了泥土。所以半径上限锁 2（5x5）。
+
+另外记一笔：`PlayerStructure` 里 **torch 同时算建造方块和 fixture**，所以一块插满火把的田可能触发结构保护；
+现在 `protectionReason` 对**作物和耕地**直接放行（收割作物不是拆建筑），火把本身仍然受保护。

@@ -106,6 +106,8 @@ MCAGENT_ANVIL_TEST=true     ... runServer --offline   # anvil repair + enchantin
 MCAGENT_FARM_TEST=true      ... runServer --offline   # ripe crops harvested and replanted with zero
                                                       # planning turns; unripe crops left alone
 MCAGENT_ARMOR_TEST=true     ... runServer --offline   # hold() puts armour on the body, not in the hand
+MCAGENT_FARMBUILD_TEST=true ... runServer --offline   # chooses its own ground, then tills, waters,
+                                                      # lights and sows a field with no planning turns
 ```
 
 Decompiled Minecraft/NeoForge sources for API reference: `/ymtc/Repos/.mcai-scratch/mcsrc/`
@@ -271,6 +273,25 @@ The most expensive mistakes in this project's history were **confident claims th
   from the mining goal in one way: it only claims a tick when something is ripe, so a growing field
   never swallows the bot. Crop maturity is type-driven (`CropBlock.isMaxAge`, nether wart age), and
   the replant item comes from `Block.getCloneItemStack`, so modded crops work unmodified.
+- **Building a field has an order, and the order is the feature** (`build_farm`, `FarmBuildJob`,
+  `rt/perception/FarmSite.java`). Site first, and never on a whim: level ground a hoe will turn, air
+  above every cell, no fluid through it, and not inside anything a player built - the guard is asked,
+  so the two can never disagree, and every rejection carries its reason. Then the build itself:
+  torches on the ring *outside* the field, then the water hole, then till, then sow - **without
+  walking over the field again**. Farmland that has been fallen on is dirt again, so a bot that walks
+  across its own half-finished field destroys it; that is why the bot works from the middle and why
+  the field is capped at 5x5, which is what it can reach from there. It also digs the water hole
+  under its own feet *before* tilling, so the one fall it takes lands on grass.
+- **A bucket cannot be placed with `use`.** `Actions.useOnBlock` goes through
+  `ItemStack.useOn(UseOnContext)` and a bucket does not implement it: vanilla places a bucket in
+  `BucketItem.use(Level, Player, InteractionHand)`, which only the *item* path reaches. So
+  right-clicking a block with a water bucket did nothing and said nothing. `Farming.placeFluid` uses
+  `gameMode.useItem` instead, after looking at the block the fluid should land on, because that path
+  raycasts from the player's own eyes.
+- **Being "busy" still buys planning turns.** The lookahead path deliberately requests a new decision
+  every couple of seconds while a long action runs, so a runtime-owned skill that merely keeps the bot
+  busy costs turns - a single 5x5 field cost five of them before `tick()` returned early for
+  `farmBuildJob`, the way it already did for `miningGoal`.
 - **Armour is worn, not held.** `hold` used to fill the main hand for everything, so a bot that
   crafted a full iron set fought zombies holding iron boots - 27 Zombie deaths, and a self-written
   note that armour "cannot be equipped with my tools". `Actions.holdItem` now asks vanilla

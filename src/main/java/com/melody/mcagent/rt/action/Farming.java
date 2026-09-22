@@ -14,6 +14,7 @@ import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.Vec3;
+import org.jetbrains.annotations.Nullable;
 
 /**
  * The farming primitives: plant a seed, till soil, and the small helpers that decide what to plant.
@@ -123,6 +124,42 @@ public final class Farming {
         return Actions.Result.ok("tilled " + soilPos.toShortString() + " into farmland");
     }
 
+    /**
+     * Pour a bucket into a cell - the water source of a field.
+     *
+     * <p>Deliberately not {@link Actions#useOnBlock}: that goes through
+     * {@code ItemStack.useOn(UseOnContext)}, and a bucket does not implement it. Vanilla places a
+     * bucket in {@code BucketItem.use(Level, Player, InteractionHand)}, which is only reached by
+     * using the item itself, so right-clicking a block with a water bucket did nothing at all and
+     * said nothing about it. (Found by a field that reported "watered" with no water in it.)
+     *
+     * <p>That path raycasts from the player's own eyes, so the bot has to be looking at the block
+     * the fluid should land on - hence the look first, at the floor under the target cell.
+     *
+     * @param cell      the cell the fluid should end up in
+     * @param itemQuery the filled bucket, by id or name
+     */
+    public static Actions.Result placeFluid(ServerPlayer bot, BlockPos cell, String itemQuery) {
+        BlockPos floor = cell.below();
+        if (!Actions.canReach(bot, floor)) {
+            return Actions.Result.fail("the block under " + cell.toShortString() + " is out of reach");
+        }
+        Actions.lookAt(bot, Vec3.atCenterOf(floor));
+        Actions.Result held = Actions.holdItem(bot, itemQuery);
+        if (!held.success()) {
+            return held;
+        }
+        bot.gameMode.useItem(bot, bot.level(), bot.getMainHandItem(), InteractionHand.MAIN_HAND);
+        bot.swing(InteractionHand.MAIN_HAND, true);
+        if (bot.level().getBlockState(cell).getFluidState().isEmpty()) {
+            return Actions.Result.fail("the bucket was used but nothing was placed in "
+                    + cell.toShortString() + " - the bot has to be looking at the block below it");
+        }
+        return Actions.Result.ok("placed " + bot.level().getBlockState(cell)
+                .getFluidState().getType().getFluidType().getDescription().getString()
+                + " at " + cell.toShortString());
+    }
+
     /** Hold the cheapest hoe the bot is carrying. */
     public static Actions.Result equipHoe(ServerPlayer bot) {
         for (String hoe : HOES) {
@@ -132,6 +169,58 @@ public final class Farming {
             }
         }
         return Actions.Result.fail("you are not carrying a hoe");
+    }
+
+    /**
+     * The id of a hoe the bot is carrying, or null.
+     *
+     * <p>Asked before a field is built rather than discovered halfway through: "you need a hoe" is a
+     * job the model can do something about, and a field half-tilled because the hoe ran out is not.
+     */
+    @Nullable
+    public static String findHoe(ServerPlayer bot) {
+        var inventory = bot.getInventory();
+        for (int slot = 0; slot < inventory.getContainerSize(); slot++) {
+            ItemStack stack = inventory.getItem(slot);
+            if (isHoe(stack)) {
+                return idOf(stack);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * The id of the first seed the bot is carrying, or empty.
+     *
+     * <p>Any item that places a crop counts, so wheat, carrots, potatoes, beetroot and nether wart
+     * all work, as does anything a mod adds that is a crop block.
+     */
+    public static String firstSeed(ServerPlayer bot) {
+        var inventory = bot.getInventory();
+        for (int slot = 0; slot < inventory.getContainerSize(); slot++) {
+            ItemStack stack = inventory.getItem(slot);
+            if (stack.isEmpty() || !(stack.getItem() instanceof net.minecraft.world.item.BlockItem block)) {
+                continue;
+            }
+            if (block.getBlock() instanceof net.minecraft.world.level.block.CropBlock
+                    || block.getBlock() instanceof net.minecraft.world.level.block.NetherWartBlock) {
+                return idOf(stack);
+            }
+        }
+        return "";
+    }
+
+    /** How many of an item the bot is carrying, by id. */
+    public static int countOf(ServerPlayer bot, String itemId) {
+        var inventory = bot.getInventory();
+        int total = 0;
+        for (int slot = 0; slot < inventory.getContainerSize(); slot++) {
+            ItemStack stack = inventory.getItem(slot);
+            if (!stack.isEmpty() && idOf(stack).equals(itemId)) {
+                total += stack.getCount();
+            }
+        }
+        return total;
     }
 
     /** Is this stack a hoe? Used when a farm is planned and the tool list is being checked. */

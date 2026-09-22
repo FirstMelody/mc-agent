@@ -405,6 +405,14 @@ public final class PlayerStructure {
         if (state.isAir()) {
             return null;
         }
+        // Crops and farmland are not a structure. A field is renewable produce - taking the wheat is
+        // what a field is for - and without this the bot can be locked out of its own farm by its own
+        // lighting: a torch counts as both building material and a fixture, so a field near any build
+        // (or one with enough torches in it) would otherwise have every ripe crop refused as part of
+        // "a player's structure". Everything else in the region stays protected, torches included.
+        if (Crops.isCrop(state) || Crops.isFarmland(state)) {
+            return null;
+        }
         if ((classify(state) & FIXTURE) != 0) {
             return name(state) + " at " + target.toShortString()
                     + " is something a player placed (furniture, storage or a machine)";

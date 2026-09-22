@@ -25,6 +25,7 @@ import com.melody.mcagent.rt.llm.LlmClient;
 import com.melody.mcagent.rt.llm.JevClient;
 import com.melody.mcagent.rt.path.MiningAccessPlanner;
 import com.melody.mcagent.rt.perception.Crops;
+import com.melody.mcagent.rt.perception.FarmSite;
 import com.melody.mcagent.rt.perception.ObservationBuilder;
 import com.melody.mcagent.rt.perception.Perception;
 import com.melody.mcagent.rt.perception.PlayerStructure;
@@ -134,7 +135,7 @@ public final class AgentBrain {
             "sleep", "wake", "place", "use", "open_container", "withdraw", "deposit",
             "craft", "craftable_now", "attack", "chat_command", "find_item", "find_uses",
             "remember", "recall", "forget", "find_resource", "mine_resource", "dig_tunnel",
-            "escape_up", "return_to_spawn", "repair", "enchant", "farm");
+            "escape_up", "return_to_spawn", "repair", "enchant", "farm", "build_farm");
     /** One escape call stays small enough to fit beside other queued work. */
     private static final int MAX_ESCAPE_STEPS = 8;
     /** One local tunnel macro covers useful ground while remaining bounded and interruptible. */
@@ -639,6 +640,48 @@ public final class AgentBrain {
         }
     }
 
+    /**
+     * A field being built, one step per tick.
+     *
+     * <p>Laid out before the first block is touched, so the whole job is a list that shrinks rather
+     * than a plan that is re-derived: the layout is what the operator asked for, and a build that
+     * re-decides as it goes is a build that can end up as a different field.
+     */
+    private static final class FarmBuildJob {
+        final FarmSite.Site site;
+        /** Cells still to till. The water cell and the torch corners are not in here. */
+        final List<BlockPos> toTill = new ArrayList<>();
+        /**
+         * Cells that were tilled and still need sowing.
+         *
+         * <p>A separate list because tilling consumes the first one: an earlier version reused a
+         * single list for both passes, so by the time the sowing ran there was nothing left in it and
+         * the bot reported a finished field with nothing planted in it.
+         */
+        final List<BlockPos> toPlant = new ArrayList<>();
+        final List<BlockPos> torches = new ArrayList<>();
+        int tilled;
+        int planted;
+        int torchesPlaced;
+        int ticks;
+        boolean walking;
+        /** Whether the bot has taken up position in the middle of the field yet. */
+        boolean inPosition;
+        /** Ticks left in the water hole's break, which is done inline to keep the bot in place. */
+        int holeTicks;
+        boolean waterBroken;
+        boolean waterPlaced;
+        boolean waterSkipped;
+        boolean torchesSkipped;
+
+        FarmBuildJob(FarmSite.Site site) {
+            this.site = site;
+        }
+    }
+
+    /** A field build is a few hundred block operations; a minute is generous and still bounded. */
+    private static final int FARM_BUILD_TIMEOUT_TICKS = 2400;
+
     private static final String MINE_ROUTE_STATE = "mine_route_v1";
     /** The operator's standing objective, remembered across reloads and restarts. */
     private static final String STANDING_GOAL_STATE = "standing_goal_v1";
@@ -647,6 +690,9 @@ public final class AgentBrain {
     /** The field this bot keeps, if any. See {@link FarmGoal}. */
     @Nullable
     private FarmGoal farmGoal;
+    /** The field being built right now, if any. See {@link FarmBuildJob}. */
+    @Nullable
+    private FarmBuildJob farmBuildJob;
     /**
      * How the last persistent mining trip ended, kept after the goal is gone.
      *
@@ -1036,6 +1082,368 @@ public final class AgentBrain {
                 + "): " + ripe + " crop(s) are ripe. The runtime now harvests every ripe crop and "
                 + "replants it with the seeds you carry, without asking you each time. Use interrupt "
                 + "to stop, or call farm again to move the field.";
+    }
+
+    /**
+     * Lay out and build a field: till it, put water in the middle, light it, plant it.
+     *
+     * <p>Two decisions are made here and nowhere else. <b>Where</b>: with no coordinates the bot
+     * chooses the nearest level, open, unbuilt ground that a hoe can actually work (see
+     * {@link FarmSite}) - "do not just dig anywhere" is the point, because a field sited inside
+     * somebody's build fails one cell at a time and in public. <b>What the bot is missing</b>: the
+     * kit is checked up front and named, so a bot without a hoe is told to get a hoe rather than
+     * half-tilling a lawn.
+     */
+    private String startFarmBuild(JsonObject args) {
+        if (!this.policy.canBreakBlocks() || !this.policy.canPlaceBlocks()) {
+            return "failed: you are not allowed to change the world";
+        }
+        // Capped at 2 (a 5x5 field) on purpose: the bot works the field from its middle and must not
+        // walk across it once the soil is turned, because walking over farmland tramples it back into
+        // dirt. From the middle every cell of a 5x5 is inside reach; a 7x7 is not, and the first
+        // version of this job duly wrecked a third of its own field trying to reach the corners.
+        int radius = (int) Math.max(1, Math.min(2, arg(args, "radius", 2)));
+        FarmSite.Site site;
+        if (args.has("x") || args.has("z")) {
+            BlockPos centre = blockPos(args);
+            String why = FarmSite.reject(this.bot, centre, radius);
+            if (why != null) {
+                return "failed: " + why;
+            }
+            site = new FarmSite.Site(centre, radius, centre.getY(), List.of());
+        } else {
+            site = FarmSite.find(this.bot, radius, 24);
+            if (site == null) {
+                return "failed: no level, open, unbuilt ground within 24 blocks can hold a "
+                        + (radius * 2 + 1) + "x" + (radius * 2 + 1) + " field. Walk somewhere flatter "
+                        + "and further from buildings, or name the coordinates yourself.";
+            }
+        }
+
+        String hoe = Farming.findHoe(this.bot);
+        String seed = Farming.firstSeed(this.bot);
+        List<String> missing = new ArrayList<>();
+        if (hoe == null) {
+            missing.add("a hoe");
+        }
+        if (seed.isEmpty()) {
+            missing.add("seeds (wheat seeds, carrots, potatoes, beetroot or nether wart)");
+        }
+        if (!missing.isEmpty()) {
+            return "failed: a field needs " + String.join(" and ", missing) + ", and you have "
+                    + (hoe == null ? "no hoe" : "no seeds") + ". Craft or fetch that first.";
+        }
+
+        FarmBuildJob job = new FarmBuildJob(site);
+        // The middle becomes the water source and the four corners carry the torches, so neither is
+        // farmland: a torch on a farm is light, not a crop, and the water has to sit in a hole.
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dz = -radius; dz <= radius; dz++) {
+                if (dx == 0 && dz == 0) {
+                    continue;
+                }
+                job.toTill.add(site.cell(dx, dz));
+            }
+        }
+        // Light goes on the ring just outside the field, not on its corners: a torch in the field
+        // costs a crop, and the corners are the cells a bot standing in the middle cannot reach
+        // anyway.
+        int ring = radius + 1;
+        job.torches.add(site.cell(-ring, -ring));
+        job.torches.add(site.cell(-ring, ring));
+        job.torches.add(site.cell(ring, -ring));
+        job.torches.add(site.cell(ring, ring));
+        this.farmBuildJob = job;
+        this.cooldownTicks = 0;
+        int torches = Farming.countOf(this.bot, "minecraft:torch");
+        boolean bucket = Farming.countOf(this.bot, "minecraft:water_bucket") > 0;
+        LOG.info("Bot {} is building {} - {} cell(s) to till and plant, water in the middle ({}), "
+                + "{} corner torch(es) ({} carried)", this.bot.getName().getString(),
+                site.describe(), job.toTill.size(), bucket ? "bucket ready" : "NO WATER BUCKET",
+                job.torches.size(), torches);
+        return "building " + site.describe() + ": " + job.toTill.size() + " cell(s) to till and "
+                + "plant, a water source in the middle, and " + job.torches.size() + " torch(es) on "
+                + "the corners. This runs by itself; use interrupt to stop."
+                + (bucket ? "" : " No water bucket: the field will be dry until you bring one.")
+                + (torches >= job.torches.size() ? "" : " Only " + torches + " torch(es) carried.");
+    }
+
+    /**
+     * One tick of building. Returns true while the job owns the bot.
+     *
+     * <p>Order matters and is the order a player works in: stand in the field, till it, open the
+     * water hole, light it, then sow it. Planting before the water is in would just mean a second
+     * pass over every cell.
+     */
+    private boolean tickFarmBuildJob() {
+        FarmBuildJob job = this.farmBuildJob;
+        if (job == null) {
+            return false;
+        }
+        if (this.bot.isRemoved() || this.bot.isDeadOrDying()) {
+            this.farmBuildJob = null;
+            return false;
+        }
+        if (job.ticks % 200 == 0) {
+            // Progress line: a field build that stalls must say where it is and what it is waiting
+            // for, or the only symptom is a timeout with no explanation.
+            LOG.info("Bot {} farm build progress: tick={} bot={} till-left={} plant-left={} tilled={} "
+                    + "planted={} torches={} water(broken={} placed={} holeTicks={}) inField={} walking={}",
+                    this.bot.getName().getString(), job.ticks, this.bot.blockPosition().toShortString(),
+                    job.toTill.size(), job.toPlant.size(), job.tilled, job.planted, job.torchesPlaced,
+                    job.waterBroken, job.waterPlaced, job.holeTicks, this.inTheField(job), job.walking);
+        }
+        if (++job.ticks > FARM_BUILD_TIMEOUT_TICKS) {
+            this.finishFarmBuild("gave up after "
+                    + (FARM_BUILD_TIMEOUT_TICKS / 20) + "s with " + job.tilled + " tilled and "
+                    + job.planted + " planted");
+            return false;
+        }
+        // A dig or a walk already in progress owns the bot.
+        if (this.mineJob != null || this.isMoving()) {
+            return true;
+        }
+
+        // 1. Light first, while the field is still grass: the torches sit on the ring just outside
+        // it, so this means walking the perimeter - and walking the perimeter later, over freshly
+        // tilled soil, is how a bot tramples its own field back into dirt.
+        while (!job.torches.isEmpty()) {
+            BlockPos corner = job.torches.get(0);
+            if (!Actions.canReach(this.bot, corner)) {
+                if (this.walkTo(job, corner)) {
+                    return true;
+                }
+                job.torches.remove(0);
+                continue;
+            }
+            if (!this.bot.level().getBlockState(corner.above()).isAir()) {
+                job.torches.remove(0);
+                continue;
+            }
+            if (Farming.countOf(this.bot, "minecraft:torch") <= 0) {
+                job.torchesSkipped = true;
+                break;
+            }
+            Actions.Result held = Actions.holdItem(this.bot, "minecraft:torch");
+            if (held.success()) {
+                Actions.useOnBlock(this.bot, corner, net.minecraft.core.Direction.UP);
+                if (this.bot.level().getBlockState(corner.above())
+                        .is(net.minecraft.world.level.block.Blocks.TORCH)) {
+                    job.torchesPlaced++;
+                }
+            } else {
+                this.reportFarmBuild(job, held.message());
+                job.torchesSkipped = true;
+                break;
+            }
+            job.torches.remove(0);
+            return true;
+        }
+        if (job.torchesSkipped) {
+            job.torches.clear();
+            job.torchesSkipped = false;
+            this.reportFarmBuild(job, "out of torches, so the rest of the field is unlit");
+            return true;
+        }
+
+        // 2. Stand in the middle of the field. Not a reach test: a bot four blocks away can "reach"
+        // the middle and will happily dig and pour from there, and then find that most of the field is
+        // out of reach and that a bucket aimed at a hole four blocks away puts the water somewhere
+        // else. This is the position every later step is done from.
+        if (!job.inPosition || !this.inTheField(job)) {
+            if (this.inTheField(job)) {
+                job.inPosition = true;
+                return true;
+            }
+            if (!job.walking) {
+                job.walking = true;
+                if (!this.walkTo(job, job.site.centre())) {
+                    // Cannot get there: carry on from where it stands and let the per-cell reach
+                    // checks report what that costs.
+                    job.inPosition = true;
+                }
+            }
+            return true;
+        }
+
+        // 3. The water source, before a single cell is tilled. The bot digs the block it is standing
+        // on and drops into the hole, which is harmless while the ground is still grass - and it then
+        // stays in that hole for the rest of the build, so it never has to walk across its own field.
+        if (!job.waterBroken) {
+            BlockPos centre = job.site.centre();
+            if (this.bot.level().getBlockState(centre).isAir()) {
+                job.waterBroken = true;
+                job.waterPlaced = true;
+                return true;
+            }
+            // Broken inline rather than through startMine: a mine job walks the bot to its drop when
+            // the break finishes, and a bot that has wandered three blocks away cannot pour a bucket
+            // into the hole it is no longer standing in. That is exactly how this failed first.
+            Actions.Result started = Actions.startBreak(this.bot, centre,
+                    net.minecraft.core.Direction.UP);
+            if (!started.success()) {
+                this.reportFarmBuild(job, "could not open the water hole - " + started.message());
+                job.waterBroken = true;
+                job.waterPlaced = true;
+                job.waterSkipped = true;
+                return true;
+            }
+            job.waterBroken = true;
+            job.holeTicks = Actions.ticksToBreak(this.bot, centre);
+            return true;
+        }
+        if (job.holeTicks > 0) {
+            job.holeTicks--;
+            if (job.holeTicks == 0) {
+                Actions.finishBreak(this.bot, job.site.centre(), net.minecraft.core.Direction.UP);
+                this.bot.resetAttackStrengthTicker();
+            }
+            return true;
+        }
+        if (!job.waterPlaced) {
+            var hole = this.bot.level().getBlockState(job.site.centre());
+            if (!hole.isAir()) {
+                this.reportFarmBuild(job, "the water hole at " + job.site.centre().toShortString()
+                        + " is still " + hole.getBlock().getName().getString()
+                        + ", so there is nowhere to put the water");
+                job.waterPlaced = true;
+                job.waterSkipped = true;
+                return true;
+            }
+            if (Farming.countOf(this.bot, "minecraft:water_bucket") <= 0) {
+                this.reportFarmBuild(job, "no water bucket, so the field is dry - farmland needs "
+                        + "water within four blocks or the crops will not grow");
+                job.waterPlaced = true;
+                job.waterSkipped = true;
+                return true;
+            }
+            Actions.Result held = Actions.holdItem(this.bot, "water_bucket");
+            if (!held.success()) {
+                this.reportFarmBuild(job, held.message());
+                job.waterPlaced = true;
+                job.waterSkipped = true;
+                return true;
+            }
+            Actions.Result poured = Farming.placeFluid(this.bot, job.site.centre(), "water_bucket");
+            job.waterPlaced = true;
+            job.waterSkipped = !poured.success();
+            this.reportFarmBuild(job, poured.success()
+                    ? poured.message()
+                    : "no water in the field: " + poured.message());
+            return true;
+        }
+
+        // 4. Till everything that will be farmland, from the water hole the bot is standing in.
+        while (!job.toTill.isEmpty()) {
+            BlockPos soil = job.toTill.get(0);
+            job.toTill.remove(0);
+            if (!Actions.canReach(this.bot, soil)) {
+                this.reportFarmBuild(job, soil.toShortString()
+                        + " is out of reach and was left untilled");
+                continue;
+            }
+            Actions.Result result = Farming.till(this.bot, soil, "");
+            if (result.success()) {
+                job.tilled++;
+                job.toPlant.add(soil);
+            } else {
+                this.reportFarmBuild(job, result.message());
+            }
+            return true;
+        }
+
+        // 5. Sow it, in the same pass order and without moving.
+        while (!job.toPlant.isEmpty()) {
+            BlockPos soil = job.toPlant.get(0);
+            job.toPlant.remove(0);
+            if (!Actions.canReach(this.bot, soil)) {
+                this.reportFarmBuild(job, soil.toShortString()
+                        + " is out of reach and was left bare");
+                continue;
+            }
+            BlockPos crop = soil.above();
+            if (!this.bot.level().getBlockState(crop).isAir()) {
+                continue;
+            }
+            String seed = Farming.firstSeed(this.bot);
+            if (seed.isEmpty()) {
+                this.reportFarmBuild(job, "out of seeds after " + job.planted
+                        + " planted; the rest of the field is bare");
+                break;
+            }
+            Actions.Result planted = Farming.plant(this.bot, crop, seed);
+            if (planted.success()) {
+                job.planted++;
+            } else {
+                this.reportFarmBuild(job, planted.message());
+            }
+            return true;
+        }
+
+        this.finishFarmBuild("built " + job.tilled + " farmland cell(s), planted " + job.planted
+                + ", " + job.torchesPlaced + " torch(es)"
+                + (job.waterSkipped ? ", no water" : ", watered"));
+        // Adopt it: building a field and then walking away from it would be a strange thing to do.
+        this.farmGoal = new FarmGoal(job.site.centre(), job.site.radius() + 1, 0,
+                this.bot.level().getGameTime());
+        return false;
+    }
+
+    /** Is the bot standing in the middle of the field, or in the water hole at its centre? */
+    private boolean inTheField(FarmBuildJob job) {
+        BlockPos here = this.bot.blockPosition();
+        return here.distSqr(job.site.centre()) <= 2.25D
+                || here.distSqr(job.site.centre().above()) <= 2.25D;
+    }
+
+    /**
+     * Walk to a cell this step cannot reach from where the bot stands.
+     *
+     * <p>Only ever used before the soil is turned: a bot that walks over its own finished field is a
+     * bot that tramples it, and farmland that has been jumped on is dirt again.
+     *
+     * @return true when a walk was started, so the caller should wait
+     */
+    private boolean walkTo(FarmBuildJob job, BlockPos target) {
+        var handle = com.melody.mcagent.rt.Agent.botManager() == null ? null
+                : com.melody.mcagent.rt.Agent.botManager().get(this.bot.getName().getString());
+        if (handle == null) {
+            this.reportFarmBuild(job, "cannot walk to " + target.toShortString()
+                    + ": this bot is not registered");
+            return false;
+        }
+        var plan = handle.movement().setPathTarget(target.above(), GOTO_PLAN_RANGE);
+        if (plan != MovementDriver.Plan.FOUND) {
+            this.reportFarmBuild(job, target.toShortString() + " cannot be walked to (" + plan + ")");
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Say what went wrong, in the log as well as to the model.
+     *
+     * <p>The model only sees these lines in its next prompt, which is no use at all to whoever is
+     * reading the server log to find out why a field came out wrong - which is exactly how the
+     * first version of this job was debugged.
+     */
+    private void reportFarmBuild(FarmBuildJob job, String message) {
+        this.actionReports.addLast("farm build: " + message);
+        LOG.info("Bot {} farm build: {}", this.bot.getName().getString(), message);
+    }
+
+    /** Close a field build and make the outcome visible, in the log and to the model. */
+    private void finishFarmBuild(String outcome) {
+        FarmBuildJob job = this.farmBuildJob;
+        this.farmBuildJob = null;
+        this.stopMoving();
+        this.actionReports.addLast("farm build: " + outcome);
+        LOG.info("Bot {} farm build finished: {}", this.bot.getName().getString(), outcome);
+        if (job != null) {
+            LOG.info("Bot {} farm build detail: site={} tilled={} planted={} torches={}",
+                    this.bot.getName().getString(), job.site.describe(), job.tilled, job.planted,
+                    job.torchesPlaced);
+        }
     }
 
     /**
@@ -2301,6 +2709,7 @@ public final class AgentBrain {
         // Advance whatever long-running thing owns the bot, and notice when a journey ends.
         boolean busy = this.tickCombatJob();
         busy = this.tickMineJob() || busy;
+        busy = this.tickFarmBuildJob() || busy;
         this.noticeMovementFinished();
         this.tickPendingSleep();
         busy = busy || this.isMoving();
@@ -2378,6 +2787,16 @@ public final class AgentBrain {
             busy = this.isLongActionRunning();
         }
         if (!addressed && this.miningGoal != null) {
+            return;
+        }
+
+        // A field being built owns the bot outright, the way the mining goal does. Merely being busy
+        // is not enough: the lookahead below deliberately buys a planning turn every couple of
+        // seconds while something long is running, which is right for a walk or a dig the model asked
+        // for and pure waste for a build it already described. Measured before this line existed: a
+        // single 5x5 field cost five planning turns to build, all of them asking "what next?" about a
+        // job that was already in progress.
+        if (!addressed && this.farmBuildJob != null) {
             return;
         }
 
@@ -3739,7 +4158,7 @@ public final class AgentBrain {
                     this.policy.canUseContainers();
             // Harvesting is breaking a block and replanting is placing one, so the farm needs both
             // permissions to mean anything; break is the one that gates it.
-            case "farm" -> this.policy.canBreakBlocks();
+            case "farm", "build_farm" -> this.policy.canBreakBlocks();
             case "attack" -> this.policy.canAttack();
             default -> true;
         };
@@ -4179,6 +4598,19 @@ public final class AgentBrain {
                             "radius", "number: optional field radius in blocks, default 8"),
                             List.of())));
 
+            tools.add(new LlmClient.ToolSpec("build_farm",
+                    "Lay out and build a field: choose the ground, till it, put a water source in "
+                    + "the middle, light the corners with torches and sow it. Needs a hoe and seeds "
+                    + "(and a water bucket and torches for the water and the light). With no "
+                    + "coordinates it picks the nearest level, open, unbuilt ground itself. It runs "
+                    + "by itself once started; use interrupt to stop.",
+                    LlmClient.schema(LlmClient.params(
+                            "x", "number: optional X of the field centre",
+                            "y", "number: optional Y of the field centre (the soil level)",
+                            "z", "number: optional Z of the field centre",
+                            "radius", "number: optional half-width in blocks, 2-4, default 3"),
+                            List.of())));
+
             tools.add(new LlmClient.ToolSpec("mine",
                     "Break a block, taking the correct amount of time for your tool. Give a radius to "
                     + "fell a whole tree or clear a vein in one go: the job keeps breaking connected "
@@ -4514,7 +4946,8 @@ public final class AgentBrain {
 
     /** True while something long-running owns the bot and the next queued step must wait. */
     private boolean isLongActionRunning() {
-        return this.mineJob != null || this.combatJob != null || this.isMoving();
+        return this.mineJob != null || this.combatJob != null || this.farmBuildJob != null
+                || this.isMoving();
     }
 
     /** Begin a real combat exchange rather than performing one isolated swing. */
@@ -5476,6 +5909,9 @@ public final class AgentBrain {
                 case "farm":
                     return this.startFarmGoal(args);
 
+                case "build_farm":
+                    return this.startFarmBuild(args);
+
                 case "mine_resource": {
                     if (!this.policy.canBreakBlocks()) {
                         return "failed: you are not allowed to break blocks";
@@ -5598,12 +6034,15 @@ public final class AgentBrain {
                     String what = this.describeCurrentAction();
                     boolean wasBusy = this.isLongActionRunning();
                     boolean stoppedGoal = this.miningGoal != null;
-                    boolean stoppedFarm = this.farmGoal != null;
+                    boolean stoppedFarm = this.farmGoal != null || this.farmBuildJob != null;
                     int cancelled = this.queue.size();
                     this.abandonCurrentAction();
                     this.abandonPlan("the bot stopped to do something else");
                     this.miningGoal = null;
                     this.farmGoal = null;
+                    if (this.farmBuildJob != null) {
+                        this.finishFarmBuild("stopped on request");
+                    }
                     this.cooldownTicks = 0;
 
                     // Even with nothing running there is usually something to clear: a plan whose
@@ -6731,6 +7170,10 @@ public final class AgentBrain {
         out.put("mineBroken", this.mineJob == null ? -1 : this.mineJob.broken);
         out.put("jevSkippedMiningTargets", this.jevSkippedTargets.size());
         out.put("miningGoal", this.miningGoal == null ? "(none)" : this.describeCurrentAction());
+        out.put("farmBuild", this.farmBuildJob == null ? "(none)"
+                : this.farmBuildJob.site.centre().toShortString()
+                        + " tilled=" + this.farmBuildJob.tilled
+                        + " planted=" + this.farmBuildJob.planted);
         out.put("farm", this.farmGoal == null ? "(none)"
                 : this.farmGoal.centre.toShortString() + " r=" + this.farmGoal.radius
                         + " harvested=" + this.farmGoal.harvested
