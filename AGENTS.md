@@ -103,6 +103,9 @@ MCAGENT_RELOAD_TEST=true MCAGENT_RELOAD_INTERRUPT=off ... runServer --offline  #
 MCAGENT_ANVIL_TEST=true     ... runServer --offline   # anvil repair + enchanting table through the
                                                       # real tool loop, and the refusals that must be
                                                       # honest (no durability / nothing to repair with)
+MCAGENT_FARM_TEST=true      ... runServer --offline   # ripe crops harvested and replanted with zero
+                                                      # planning turns; unripe crops left alone
+MCAGENT_ARMOR_TEST=true     ... runServer --offline   # hold() puts armour on the body, not in the hand
 ```
 
 Decompiled Minecraft/NeoForge sources for API reference: `/ymtc/Repos/.mcai-scratch/mcsrc/`
@@ -260,6 +263,19 @@ The most expensive mistakes in this project's history were **confident claims th
   loader being closed, so each generation builds its own). Until the worker publishes, the item and
   recipe tools answer "the item/recipe index is not ready yet; try again shortly" - about 200 ms in
   production. `KnowledgeManager.clear()` interrupts and joins that worker before the loader closes.
+- **Farming is a runtime-owned skill** (`FarmGoal` in `AgentBrain`, `rt/action/Farming.java`,
+  `rt/perception/Crops.java`). Ripe crops are listed in the observation with coordinates, and the
+  `farm` tool adopts a field (centre + radius). From then on the skill harvests every ripe crop and
+  replants it with the seeds the bot carries, with **no planning turn at all** - the whole point, and
+  what `MCAGENT_FARM_TEST` asserts by counting model requests (one for the whole field). It differs
+  from the mining goal in one way: it only claims a tick when something is ripe, so a growing field
+  never swallows the bot. Crop maturity is type-driven (`CropBlock.isMaxAge`, nether wart age), and
+  the replant item comes from `Block.getCloneItemStack`, so modded crops work unmodified.
+- **Armour is worn, not held.** `hold` used to fill the main hand for everything, so a bot that
+  crafted a full iron set fought zombies holding iron boots - 27 Zombie deaths, and a self-written
+  note that armour "cannot be equipped with my tools". `Actions.holdItem` now asks vanilla
+  (`Equipable.getEquipmentSlot`) where a piece belongs and wears it, shields go to the offhand, and
+  `MCAGENT_ARMOR_TEST` scripts exactly the calls production made.
 - **Player-built structures are protected** (`rt/perception/PlayerStructure.java`): fixtures (beds,
   storage, workstations, anything with a block entity) are never breakable, and a cluster of building
   blocks around a fixture protects its whole box plus 6 blocks of foundation. Every breaking path

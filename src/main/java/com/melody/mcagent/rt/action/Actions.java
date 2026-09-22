@@ -584,6 +584,17 @@ public final class Actions {
             return Result.fail("unknown item '" + itemQuery + "'");
         }
 
+        // Armour, elytra and shields are worn, not held: "hold the iron helmet" means "put it on".
+        // Production is the reason this branch exists - the bot crafted a full iron set and a diamond
+        // helmet, called hold() for the pieces 43 times, and was killed by a zombie while holding
+        // iron boots (0 attack damage). It even wrote itself a note that armour "cannot be equipped
+        // with my tools", which was true: nothing could. Which slot a piece belongs in is vanilla's
+        // answer (Equipable.getEquipmentSlot), so modded armour lands correctly too.
+        net.minecraft.world.entity.EquipmentSlot bodySlot = bodySlotFor(itemId);
+        if (bodySlot != null) {
+            return equipInto(bot, itemQuery, itemId, bodySlot);
+        }
+
         var inventory = bot.getInventory();
         String wanted = itemId.toLowerCase(java.util.Locale.ROOT);
 
@@ -613,6 +624,67 @@ public final class Actions {
                     + " out of your pack and are now holding it");
         }
         return Result.fail("you are not carrying any '" + itemQuery + "'");
+    }
+
+    /**
+     * The body slot this item belongs in, or {@code null} when it is not worn equipment.
+     *
+     * <p>Anything that is not equipment, and anything whose slot is the main hand, returns null so
+     * the caller falls back to ordinary holding.
+     */
+    @Nullable
+    private static net.minecraft.world.entity.EquipmentSlot bodySlotFor(String itemId) {
+        try {
+            net.minecraft.resources.ResourceLocation id =
+                    net.minecraft.resources.ResourceLocation.tryParse(itemId);
+            if (id == null
+                    || !net.minecraft.core.registries.BuiltInRegistries.ITEM.containsKey(id)) {
+                return null;
+            }
+            var item = net.minecraft.core.registries.BuiltInRegistries.ITEM.get(id);
+            if (item instanceof net.minecraft.world.item.Equipable equipable) {
+                net.minecraft.world.entity.EquipmentSlot slot = equipable.getEquipmentSlot();
+                return slot == net.minecraft.world.entity.EquipmentSlot.MAINHAND ? null : slot;
+            }
+        } catch (Throwable t) {
+            // A modded item that cannot answer is simply held, which is what used to happen to
+            // everything.
+            return null;
+        }
+        return null;
+    }
+
+    /**
+     * Move one of this item from the pack onto the body, and put what was worn back in the pack.
+     *
+     * <p>Deliberately one item: wearing a stack of three helmets would destroy two of them.
+     */
+    private static Result equipInto(ServerPlayer bot, String rawQuery, String itemId,
+                                    net.minecraft.world.entity.EquipmentSlot target) {
+        var inventory = bot.getInventory();
+        String wanted = itemId.toLowerCase(java.util.Locale.ROOT);
+        for (int slot = 0; slot < inventory.getContainerSize(); slot++) {
+            ItemStack stack = inventory.getItem(slot);
+            if (!matchesItem(stack, wanted, rawQuery)) {
+                continue;
+            }
+            ItemStack toWear = stack.copyWithCount(1);
+            stack.shrink(1);
+            if (stack.isEmpty()) {
+                inventory.setItem(slot, ItemStack.EMPTY);
+            }
+            ItemStack previous = bot.getItemBySlot(target).copy();
+            bot.setItemSlot(target, toWear);
+            if (!previous.isEmpty() && !inventory.add(previous)) {
+                bot.drop(previous, false);
+            }
+            String where = target == net.minecraft.world.entity.EquipmentSlot.OFFHAND
+                    ? "in your offhand" : "worn (" + target.getName() + ")";
+            return Result.ok(toWear.getHoverName().getString() + " is now " + where
+                    + (previous.isEmpty() ? ""
+                            : "; your " + previous.getHoverName().getString() + " went back in the pack"));
+        }
+        return Result.fail("you are not carrying any '" + rawQuery + "'");
     }
 
     /** Does this stack answer to the requested id or name? Shared with {@link Stations}. */

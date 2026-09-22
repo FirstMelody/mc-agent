@@ -320,6 +320,52 @@ public final class ObservationBuilder {
             }
         }
 
+        sb.append(describeCrops(bot, blocks));
+
+        return sb.toString();
+    }
+
+    /**
+     * What is growing nearby, and what is ready to take.
+     *
+     * <p>Ripe crops come first and with coordinates, because that is the actionable half: "wheat at
+     * 12, 64, -3" is a job, "wheat x14" is scenery. The same scan feeds the farm skill, which
+     * harvests without asking the model anything - this section exists so the model can also see
+     * what is growing and decide whether any of it is worth walking over.
+     */
+    private static String describeCrops(ServerPlayer bot, List<Perception.SeenBlock> blocks) {
+        List<Perception.SeenBlock> ripe = new ArrayList<>();
+        Map<String, Integer> growing = new LinkedHashMap<>();
+        for (Perception.SeenBlock seen : blocks) {
+            if (!Crops.isCrop(seen.state())) {
+                continue;
+            }
+            if (Crops.isMature(seen.state())) {
+                ripe.add(seen);
+            } else {
+                growing.merge(seen.state().getBlock().getName().getString(), 1, Integer::sum);
+            }
+        }
+        if (ripe.isEmpty() && growing.isEmpty()) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder();
+        if (!ripe.isEmpty()) {
+            sb.append("Crops ready to harvest:\n");
+            for (Perception.SeenBlock seen : ripe.stream()
+                    .sorted(java.util.Comparator.comparingDouble(Perception.SeenBlock::distance))
+                    .limit(MAX_NAMED_BLOCKS).toList()) {
+                sb.append("  - ").append(seen.state().getBlock().getName().getString())
+                  .append(" at ").append(seen.pos().toShortString())
+                  .append(String.format(" (%.0f blocks %s)", seen.distance(), compass(bot, seen.pos())))
+                  .append('\n');
+            }
+        }
+        if (!growing.isEmpty()) {
+            sb.append("Still growing: ").append(growing.entrySet().stream()
+                    .map(entry -> entry.getKey() + " x" + entry.getValue())
+                    .collect(java.util.stream.Collectors.joining(", "))).append('\n');
+        }
         return sb.toString();
     }
 

@@ -18,11 +18,13 @@ import com.melody.mcagent.rt.action.ActionPolicy;
 import com.melody.mcagent.rt.action.Actions;
 import com.melody.mcagent.rt.action.Containers;
 import com.melody.mcagent.rt.action.Crafting;
+import com.melody.mcagent.rt.action.Farming;
 import com.melody.mcagent.rt.action.Stations;
 import com.melody.mcagent.rt.bot.MovementDriver;
 import com.melody.mcagent.rt.llm.LlmClient;
 import com.melody.mcagent.rt.llm.JevClient;
 import com.melody.mcagent.rt.path.MiningAccessPlanner;
+import com.melody.mcagent.rt.perception.Crops;
 import com.melody.mcagent.rt.perception.ObservationBuilder;
 import com.melody.mcagent.rt.perception.Perception;
 import com.melody.mcagent.rt.perception.PlayerStructure;
@@ -132,7 +134,7 @@ public final class AgentBrain {
             "sleep", "wake", "place", "use", "open_container", "withdraw", "deposit",
             "craft", "craftable_now", "attack", "chat_command", "find_item", "find_uses",
             "remember", "recall", "forget", "find_resource", "mine_resource", "dig_tunnel",
-            "escape_up", "return_to_spawn", "repair", "enchant");
+            "escape_up", "return_to_spawn", "repair", "enchant", "farm");
     /** One escape call stays small enough to fit beside other queued work. */
     private static final int MAX_ESCAPE_STEPS = 8;
     /** One local tunnel macro covers useful ground while remaining bounded and interruptible. */
@@ -599,11 +601,52 @@ public final class AgentBrain {
         }
     }
 
+    /**
+     * A field the bot keeps.
+     *
+     * <p>The opposite of {@link MiningGoal} in one respect: a mining trip is finished when the ore
+     * is in the pack, and a farm never is. Crops ripen on their own schedule, so this skill stays
+     * alive until it is interrupted and only claims a tick when something is actually ripe. Between
+     * harvests the bot is free - ordinary decisions, other jobs, the model's own plan - which is the
+     * point: the harvest itself must never cost a planning turn, but a field must not swallow the
+     * bot either.
+     */
+    private static final class FarmGoal {
+        final BlockPos centre;
+        final int radius;
+        final long startedAt;
+        int harvested;
+        int replanted;
+        int ripeWhenStarted;
+        /** Ticks since the last harvest, for the "still nothing ripe" report. */
+        int idleTicks;
+        /** The crop being put back after a harvest, and what to put there. */
+        @Nullable BlockPos pendingReplant;
+        String pendingSeed = "";
+        boolean idleReported;
+
+        FarmGoal(BlockPos centre, int radius, int ripeWhenStarted, long startedAt) {
+            this.centre = centre.immutable();
+            this.radius = radius;
+            this.ripeWhenStarted = ripeWhenStarted;
+            this.startedAt = startedAt;
+        }
+
+        boolean contains(BlockPos pos) {
+            return Math.abs(pos.getX() - this.centre.getX()) <= this.radius
+                    && Math.abs(pos.getZ() - this.centre.getZ()) <= this.radius
+                    && Math.abs(pos.getY() - this.centre.getY()) <= 4;
+        }
+    }
+
     private static final String MINE_ROUTE_STATE = "mine_route_v1";
     /** The operator's standing objective, remembered across reloads and restarts. */
     private static final String STANDING_GOAL_STATE = "standing_goal_v1";
     @Nullable
     private MiningGoal miningGoal;
+    /** The field this bot keeps, if any. See {@link FarmGoal}. */
+    @Nullable
+    private FarmGoal farmGoal;
     /**
      * How the last persistent mining trip ended, kept after the goal is gone.
      *
@@ -968,6 +1011,129 @@ public final class AgentBrain {
                 + ", return after inventory pressure, danger, or " + maxChunks
                 + " tunnel chunk(s). The runtime now owns navigation, resource selection, mining "
                 + "and return; do not submit per-block mining plans.";
+    }
+
+    /**
+     * Adopt a field: harvest what is ripe from now on, and replant it.
+     *
+     * <p>The field is described by a centre and a radius rather than by the blocks themselves, so it
+     * survives the crops being broken and replanted - which is what happens to it constantly.
+     */
+    private String startFarmGoal(JsonObject args) {
+        if (!this.policy.canBreakBlocks()) {
+            return "failed: you are not allowed to break blocks";
+        }
+        BlockPos centre = args.has("x") || args.has("z")
+                ? blockPos(args)
+                : this.bot.blockPosition();
+        int radius = (int) Math.max(3, Math.min(24, arg(args, "radius", 8)));
+        int ripe = this.ripeCropsIn(new FarmGoal(centre, radius, 0, 0)).size();
+        this.farmGoal = new FarmGoal(centre, radius, ripe, this.bot.level().getGameTime());
+        this.cooldownTicks = 0;
+        LOG.info("Bot {} is now keeping the field at {} (radius {}): {} ripe crop(s) right now",
+                this.bot.getName().getString(), centre.toShortString(), radius, ripe);
+        return "keeping the field centred on " + centre.toShortString() + " (radius " + radius
+                + "): " + ripe + " crop(s) are ripe. The runtime now harvests every ripe crop and "
+                + "replants it with the seeds you carry, without asking you each time. Use interrupt "
+                + "to stop, or call farm again to move the field.";
+    }
+
+    /**
+     * Every ripe crop inside the field that the bot can currently see.
+     *
+     * <p>One perception scan serves the whole question, sorted by distance so the bot takes the
+     * nearest first and does not walk the field in an arbitrary order.
+     */
+    private List<Perception.SeenBlock> ripeCropsIn(FarmGoal field) {
+        List<Perception.SeenBlock> out = new ArrayList<>();
+        for (Perception.SeenBlock seen : Perception.visibleBlocks(this.bot, field.radius + 4)) {
+            if (Crops.isMature(seen.state()) && field.contains(seen.pos())) {
+                out.add(seen);
+            }
+        }
+        out.sort(java.util.Comparator.comparingDouble(Perception.SeenBlock::distance));
+        return out;
+    }
+
+    /**
+     * One tick of farm work: replant what was just taken, or start on the nearest ripe crop.
+     *
+     * @return true when the skill did something and the tick belongs to it
+     */
+    private boolean advanceFarmGoal() {
+        FarmGoal field = this.farmGoal;
+        if (field == null) {
+            return false;
+        }
+        if (this.bot.isRemoved() || this.bot.isDeadOrDying()) {
+            this.farmGoal = null;
+            return false;
+        }
+        // Same safety valve as the mining skill: a bot that is nearly dead has no business farming.
+        if (this.bot.getHealth() <= 6.0F) {
+            this.actionReports.addLast("farm: stopping, health is "
+                    + String.format(java.util.Locale.ROOT, "%.1f", this.bot.getHealth()));
+            this.farmGoal = null;
+            return false;
+        }
+        if (this.mineJob != null || this.isMoving()) {
+            return true;
+        }
+
+        // Put back what was just harvested. This is a separate tick from the harvest because the
+        // block only becomes plantable once the crop is actually gone.
+        if (field.pendingReplant != null) {
+            BlockPos target = field.pendingReplant;
+            String seed = field.pendingSeed;
+            field.pendingReplant = null;
+            field.pendingSeed = "";
+            Actions.Result planted = Farming.plant(this.bot, target, seed);
+            if (planted.success()) {
+                field.replanted++;
+                this.actionReports.addLast("farm: " + planted.message());
+            } else {
+                // Out of seed, or the block is no longer plantable. Worth saying once per field:
+                // a field that is harvested and never replanted is a field that is being eaten.
+                this.actionReports.addLast("farm: could not replant " + target.toShortString()
+                        + " - " + planted.message());
+            }
+            return true;
+        }
+
+        List<Perception.SeenBlock> ripe = this.ripeCropsIn(field);
+        if (ripe.isEmpty()) {
+            field.idleTicks++;
+            // Say so once every 30 s rather than every tick: the point is that an operator watching
+            // the log can tell "the farm is alive and waiting" from "the farm is broken".
+            if (field.idleTicks > 600 && !field.idleReported) {
+                field.idleReported = true;
+                this.actionReports.addLast("farm: nothing ripe in the field right now ("
+                        + field.harvested + " harvested, " + field.replanted + " replanted so far)");
+            }
+            return false;
+        }
+
+        Perception.SeenBlock target = ripe.get(0);
+        // Read the seed before the crop is broken: after that there is nothing to ask.
+        net.minecraft.world.item.ItemStack seed =
+                Crops.replantItem(this.bot.serverLevel(), target.pos());
+        field.pendingReplant = target.pos();
+        field.pendingSeed = Farming.idOf(seed);
+        field.idleTicks = 0;
+        field.idleReported = false;
+        String started = this.startMine(target.pos(), 0, "", false);
+        if (started.startsWith("failed")) {
+            field.pendingReplant = null;
+            field.pendingSeed = "";
+            this.actionReports.addLast("farm: " + started);
+            return false;
+        }
+        field.harvested++;
+        LOG.info("Bot {} farm: harvesting {} at {} ({} harvested, {} replanted so far)",
+                this.bot.getName().getString(),
+                target.state().getBlock().getName().getString(), target.pos().toShortString(),
+                field.harvested, field.replanted);
+        return true;
     }
 
     /** Inventory count used for an amount goal; tools/armour are deliberately not ore progress. */
@@ -2212,6 +2378,18 @@ public final class AgentBrain {
             busy = this.isLongActionRunning();
         }
         if (!addressed && this.miningGoal != null) {
+            return;
+        }
+
+        // A FarmGoal works the same way with one difference: it only claims the tick when there is
+        // something to do. Between harvests the bot is free to plan and do other work, and a field
+        // that is merely growing never costs a planning turn - but a field must not swallow the bot
+        // either, which is why this does not return unconditionally the way the mining goal does.
+        if (!addressed && !busy && this.queue.isEmpty() && this.farmGoal != null
+                && !this.thinking.get() && this.advanceFarmGoal()) {
+            if (!this.queue.isEmpty()) {
+                this.runQueued();
+            }
             return;
         }
 
@@ -3559,6 +3737,9 @@ public final class AgentBrain {
             // core's config spec, which costs a server restart to deploy.
             case "open_container", "withdraw", "deposit", "repair", "enchant" ->
                     this.policy.canUseContainers();
+            // Harvesting is breaking a block and replanting is placing one, so the farm needs both
+            // permissions to mean anything; break is the one that gates it.
+            case "farm" -> this.policy.canBreakBlocks();
             case "attack" -> this.policy.canAttack();
             default -> true;
         };
@@ -3985,6 +4166,18 @@ public final class AgentBrain {
                             "vein_radius", "number: optional connected-block radius, default 6",
                             "item", "string: optional tool; automatic tool economy still applies"),
                             List.of("resource"))));
+
+            tools.add(new LlmClient.ToolSpec("farm",
+                    "Keep a field: harvest every ripe crop in it and replant with the seeds you are "
+                    + "carrying, from now on, without asking you each time. Stand in the field (or "
+                    + "give its centre) and call this once. Crops you can see are listed under "
+                    + "'Crops ready to harvest'. Use interrupt to stop.",
+                    LlmClient.schema(LlmClient.params(
+                            "x", "number: optional X of the field centre",
+                            "y", "number: optional Y of the field centre",
+                            "z", "number: optional Z of the field centre",
+                            "radius", "number: optional field radius in blocks, default 8"),
+                            List.of())));
 
             tools.add(new LlmClient.ToolSpec("mine",
                     "Break a block, taking the correct amount of time for your tool. Give a radius to "
@@ -5280,6 +5473,9 @@ public final class AgentBrain {
                             string(args, "resource", ""),
                             (int) arg(args, "radius", this.observeRadius));
 
+                case "farm":
+                    return this.startFarmGoal(args);
+
                 case "mine_resource": {
                     if (!this.policy.canBreakBlocks()) {
                         return "failed: you are not allowed to break blocks";
@@ -5402,10 +5598,12 @@ public final class AgentBrain {
                     String what = this.describeCurrentAction();
                     boolean wasBusy = this.isLongActionRunning();
                     boolean stoppedGoal = this.miningGoal != null;
+                    boolean stoppedFarm = this.farmGoal != null;
                     int cancelled = this.queue.size();
                     this.abandonCurrentAction();
                     this.abandonPlan("the bot stopped to do something else");
                     this.miningGoal = null;
+                    this.farmGoal = null;
                     this.cooldownTicks = 0;
 
                     // Even with nothing running there is usually something to clear: a plan whose
@@ -5415,6 +5613,9 @@ public final class AgentBrain {
                     reply.append(wasBusy ? "stopped " + what : "nothing long-running was in progress");
                     if (cancelled > 0) {
                         reply.append("; cancelled ").append(cancelled).append(" queued step(s)");
+                    }
+                    if (stoppedFarm) {
+                        reply.append("; stopped keeping the farm");
                     }
                     if (stoppedGoal) {
                         reply.append("; cancelled the persistent mining goal");
@@ -6530,6 +6731,10 @@ public final class AgentBrain {
         out.put("mineBroken", this.mineJob == null ? -1 : this.mineJob.broken);
         out.put("jevSkippedMiningTargets", this.jevSkippedTargets.size());
         out.put("miningGoal", this.miningGoal == null ? "(none)" : this.describeCurrentAction());
+        out.put("farm", this.farmGoal == null ? "(none)"
+                : this.farmGoal.centre.toShortString() + " r=" + this.farmGoal.radius
+                        + " harvested=" + this.farmGoal.harvested
+                        + " replanted=" + this.farmGoal.replanted);
         out.put("lastMiningGoalOutcome",
                 this.lastMiningGoalOutcome == null ? "(none)" : this.lastMiningGoalOutcome);
         out.put("busy", this.describeCurrentAction());

@@ -2606,3 +2606,96 @@ ANVILTEST VERDICT: PASS (repair to full durability, enchant applied, both refusa
 永远匹配不上 —— 断言短语里不能有撇号。
 
 **未部署**：以上都只在 dev server 上验证过，生产服还没换 jar。
+
+---
+
+## 里程碑 14：bot 为什么一直死；护甲终于能穿了；种田（第一步）
+
+### 14.1 取证结论：**不是装备垃圾，是缺逻辑**
+
+把 33 个归档 + `latest.log`（293,786 行，排除 `debug-*.log.gz`）里 62 次死亡和之前的工具调用流对齐，
+完整报告在 `/ymtc/Repos/mc_forensics/REPORT.md`：
+
+| 死因 | 次数 |
+|---|---|
+| Zombie | 27 |
+| Skeleton | 7 |
+| 窒息（自己挖 1x1 竖井） | 6 |
+| 溺水 | 5 |
+| Phantom | 4 |
+| Bear / Pillager | 3 / 3 |
+| Spider / 女仆弹幕 / Drowned / Undead Miner / 管理员 /kill | 各 1–2 |
+
+四条硬结论：
+
+1. **84%（52/62）的死发生在战斗之外** —— 25 次在挖矿/挖隧道、21 次在走路，是被路上伏击的。
+   死前 120 秒内调用过 `attack` 的只有 10 次。
+2. **它根本穿不上护甲。** 它自己合成了整套铁甲 + 钻石头盔，然后用 `hold()` 去"装备"——
+   43 次调用，而 `hold` 只填主手。`/data get entity Agent Inventory` 的 dump 只有 Slot 0–35，
+   **没有 36–39（护甲槽）**。最清楚的一次：被僵尸杀死时手上拿着**铁靴子**（攻击力 0）。
+   它自己还记了笔记：`armor cannot be equipped with my tools: hold` —— 这句是对的，当时确实没有。
+3. **真打起来也是结构性失败**：52 次交战里 28 次以 `could not find a route` 结束，
+   100 个命中计数里 **57 个是 0 命中**，6 次打到 30 秒超时零命中；飞行怪（幻翼）近战直接
+   `target is out of reach`。
+4. **低血量没有任何反应**：`health=0.3` 还在继续挖矿（`mining skill is returning: ... health=0.3`
+   之后 3 秒被骷髅射死）。撤退/吃东西/`/home` 都存在，但都不是危险触发的（只有 29% / 10% 的死
+   之前有过）。还有一条**确定性送死循环**：重生后把同一串 waypoint 原样再走一遍，
+   2 分 27 秒内同一坐标死 4 次。
+
+### 14.2 已修：`hold()` 现在真的把护甲穿上
+
+`Actions.holdItem` 先问原版（`Equipable.getEquipmentSlot`）这件东西该在哪个槽：
+护甲进头/胸/腿/脚，盾牌进副手，主手留给武器。一次只穿一件（穿一摞头盔会毁掉两个），
+换下来的旧件回背包。模组护甲实现了 `Equipable` 就自动正确。
+
+实跑 `MCAGENT_ARMOR_TEST`（脚本模型复刻生产那 5 次调用）：
+
+```
+Bot ArmorBot called hold(item="iron_helmet") -> Iron Helmet is now worn (head)
+Bot ArmorBot called hold(item="iron_chestplate") -> Iron Chestplate is now worn (chest)
+Bot ArmorBot called hold(item="iron_leggings") -> Iron Leggings is now worn (legs)
+Bot ArmorBot called hold(item="iron_boots") -> Iron Boots is now worn (feet)
+Bot ArmorBot called hold(item="shield") -> Shield is now in your offhand
+ARMORTEST worn: head=Iron Helmet chest=Iron Chestplate legs=Iron Leggings feet=Iron Boots
+                offhand=Shield mainhand=(empty)
+ARMORTEST armour points: 15 (iron set is 15)
+ARMORTEST VERDICT: PASS
+```
+
+**15 点护甲，之前是 0。**
+
+### 14.3 种田第一步：成熟自动收割，**不花 LLM**
+
+- `rt/perception/Crops.java`：类型驱动判断作物与成熟（`CropBlock.isMaxAge`、下界疣 age），
+  补种用 `Block.getCloneItemStack`（就是玩家的选取方块），所以模组作物不用改代码也能种回去。
+- 观察里新增 `Crops ready to harvest:`（带坐标，最近的在前）和 `Still growing:` 汇总。
+- `rt/action/Farming.java`：`plant()` / `till()`（锄头由便宜到贵，省耐久）。
+- `FarmGoal`（`AgentBrain`）：`farm(x,y,z,radius)` 认领一块地，之后**每个成熟作物自动收割 + 补种**。
+  和挖矿技能的唯一区别：**只有真有活干时才占用这一 tick**，地里的作物在长的时候 bot 是自由的，
+  不会被一块田吞掉。
+
+实跑 `MCAGENT_FARM_TEST`（6 株成熟 + 4 株未成熟小麦，脚本模型只回答 `silent()`）：
+
+```
+Bot FarmBot called farm(x=-70, y=-36, z=70, radius=6) -> keeping the field centred on -70, -36, 70 (radius 6): 6 crop(s) are ripe...
+Bot FarmBot farm: harvesting Wheat Crops at -71, -36, 70 (1 harvested, 0 replanted so far)
+... 6 次 ...
+FARMTEST harvested=6/6 growing-left-intact=4/4 farmland-intact=true farm-state=... harvested=6 replanted=6
+FARMTEST model requests for the whole run: 1 (one to adopt the field, then silence)
+FARMTEST VERDICT: PASS
+```
+
+**整场只花了 1 次模型请求**（就是认领田地那次）—— 收割本身一次规划轮都没买。
+未成熟的 4 株没被动，耕地也没被破坏。
+
+### 14.4 种田还没做的（下一步）
+
+用户要的另外两件还没做，明确记下来：
+
+1. **选址**：`farm` 目前是操作员/模型给中心点；还没有"自己挑一块好地"（平坦、有光照、离建筑远、
+   能引水、够大）的选址逻辑。
+2. **整套农田建造工具化**：锄地/放水/插火把/播种的**批量建造**（现在只有单块的 `till`/`plant`，
+   火把走 `place`、水走 `use`+水桶，但没有"建一块 NxM 带水渠和火把的田"这个动作）。
+3. 还有一个已知交互：`PlayerStructure` 里 **torch 同时是 CONSTRUCTED 和 FIXTURE**，
+   所以一块插了很多火把的田可能触发结构保护（阈值是 16 块建造方块 + 至少 1 个 fixture），
+   建造时要显式豁免作物/耕地，否则收割会被自己的火把挡住。
