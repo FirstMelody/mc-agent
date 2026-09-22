@@ -63,25 +63,37 @@ public final class RecipeKnowledgeIndex {
     }
 
     /**
-     * Build the index for a running server.
+     * Build the index from an already-snapshotted recipe list.
      *
-     * <p>Must be called when tags are bound — at server start, not inside a datapack reload's
+     * <p>The list has to have been read on the server thread, because reading the recipe manager is
+     * world state. Everything below is computation over immutable holders, which is what lets the
+     * caller run it off-thread - see {@link KnowledgeManager#rebuild}.
+     *
+     * <p>Must not run before tags are bound — at server start, not inside a datapack reload's
      * {@code apply} — because reading {@code Ingredient.getItems()} too early can permanently
      * cache empty tag contents.
      *
      * <p>A single malformed recipe from any of the hundreds of installed mods must not break the
      * index, so each recipe is converted defensively and failures are counted, not thrown.
+     *
+     * <p>The interrupt flag is checked between recipes: this runs on a worker thread that a reload
+     * may have to stop before it closes the runtime class loader out from under it.
      */
-    public static RecipeKnowledgeIndex build(MinecraftServer server) {
+    public static RecipeKnowledgeIndex build(net.minecraft.core.HolderLookup.Provider registries,
+                                             List<RecipeHolder<?>> recipes) {
         RecipeKnowledgeIndex index = new RecipeKnowledgeIndex();
         long start = System.nanoTime();
 
         index.indexItems();
 
-        var registryAccess = server.registryAccess();
-        for (RecipeHolder<?> holder : server.getRecipeManager().getRecipes()) {
+        for (RecipeHolder<?> holder : recipes) {
+            if (Thread.currentThread().isInterrupted()) {
+                LOG.warn("Knowledge index build interrupted after {} recipe(s); the next load rebuilds it",
+                        index.recipeCount);
+                return index;
+            }
             try {
-                index.indexRecipe(holder, registryAccess);
+                index.indexRecipe(holder, registries);
             } catch (Throwable t) {
                 index.skipped++;
                 LOG.debug("Skipping recipe {}: {}", holder.id(), t.toString());

@@ -414,9 +414,31 @@ public final class Actions {
         bot.swing(InteractionHand.MAIN_HAND, true);
 
         if (result.consumesAction()) {
-            return Result.ok("used item on " + describeBlock(bot, pos));
+            return Result.ok("used item on " + describeBlock(bot, pos) + unoperableMenuHint(bot));
         }
         return Result.fail("nothing happened (the block did not accept that item)");
+    }
+
+    /**
+     * What a machine the bot has just opened actually needs, when it is one a bare right-click
+     * cannot operate.
+     *
+     * <p>The anvil and the enchanting table install their menu on the server the moment they are
+     * right-clicked, so {@code use} reported a plain success and a model told to save a nearly
+     * broken pickaxe reasonably concluded it had: the menu was open, and a bot has no client to
+     * click it. Naming the tool that can actually do the job is the difference between the bot
+     * repairing the pickaxe and the bot announcing it did and then breaking it.
+     */
+    private static String unoperableMenuHint(ServerPlayer bot) {
+        if (bot.containerMenu instanceof net.minecraft.world.inventory.AnvilMenu) {
+            return " - the anvil is open, but its slots cannot be clicked from here: use the 'repair' "
+                    + "tool to actually repair an item";
+        }
+        if (bot.containerMenu instanceof net.minecraft.world.inventory.EnchantmentMenu) {
+            return " - the enchanting table is open, but its slots cannot be clicked from here: use "
+                    + "the 'enchant' tool to actually enchant an item";
+        }
+        return "";
     }
 
     /** Use the held item in the air, as a player does by right-clicking while looking at nothing. */
@@ -593,8 +615,8 @@ public final class Actions {
         return Result.fail("you are not carrying any '" + itemQuery + "'");
     }
 
-    /** Does this stack answer to the requested id or name? */
-    private static boolean matchesItem(ItemStack stack, String wantedId, String rawQuery) {
+    /** Does this stack answer to the requested id or name? Shared with {@link Stations}. */
+    static boolean matchesItem(ItemStack stack, String wantedId, String rawQuery) {
         if (stack.isEmpty()) {
             return false;
         }

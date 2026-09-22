@@ -7,6 +7,7 @@ import java.util.concurrent.TimeUnit;
 import com.melody.mcagent.rt.Agent;
 import com.melody.mcagent.rt.TestHook;
 import com.melody.mcagent.rt.brain.AgentBrain;
+import com.melody.mcagent.rt.knowledge.KnowledgeManager;
 import com.melody.mcagent.rt.llm.JevClient;
 
 import net.minecraft.server.MinecraftServer;
@@ -28,11 +29,15 @@ import org.slf4j.LoggerFactory;
  * 51 reloads at 2005 +/- 5 ms, each followed by "Can't keep up! ... 50 ticks behind" - and then
  * interrupted the call anyway, which unwinds it in about 8 ms.
  *
- * <p>This test puts one call in flight against a model that answers after {@link #MODEL_DELAY_MS}
- * and times {@link AgentBrain#shutdown()} - the same call, on the same thread, that the reload makes.
- * It deliberately measures that call and not the whole reload: the rest of the reload is Minecraft
- * work (removing bots, re-registering commands) that has to stay on the server thread and is
- * reported by the reload's own log lines.
+ * <p>It measures the two things a reload used to spend that thread on. First the knowledge index:
+ * {@link KnowledgeManager#rebuild} must return after snapshotting the recipe list, with the indexing
+ * itself on a worker, and the index must still arrive and still answer queries. Then the model
+ * executor: one call in flight against a model that answers after {@link #MODEL_DELAY_MS}, with
+ * {@link AgentBrain#shutdown()} - the same call, on the same thread, that the reload makes - timed.
+ *
+ * <p>It deliberately measures those two calls and not the whole reload: what is left is Minecraft
+ * work (removing bots, re-registering commands) that has to stay on the server thread, and the
+ * reload's own log lines report it.
  *
  * <p>Enabled with {@code MCAGENT_RELOAD_TEST=true}. Positive control:
  * {@code MCAGENT_RELOAD_TEST=true MCAGENT_RELOAD_INTERRUPT=off} restores the old wait-then-interrupt
@@ -61,6 +66,9 @@ public final class ReloadLatencySmokeTest implements TestHook {
     /** Ticks to wait for the bot to get a call out to the model before giving up on the run. */
     private static final int WAIT_FOR_CALL_TICKS = 600;
 
+    /** Ticks to wait for the background index build to publish before calling it lost. */
+    private static final int INDEX_READY_TIMEOUT_TICKS = 400;
+
     private final MinecraftServer server;
 
     private ScriptedLlmServer model;
@@ -70,6 +78,9 @@ public final class ReloadLatencySmokeTest implements TestHook {
     private boolean started;
     private boolean finished;
     private int ticks;
+    private boolean indexPhaseDone;
+    private long indexCallMs;
+    private int indexStartTick;
 
     private ReloadLatencySmokeTest(MinecraftServer server) {
         this.server = server;
@@ -95,10 +106,16 @@ public final class ReloadLatencySmokeTest implements TestHook {
         }
         if (!this.started) {
             this.started = true;
-            this.begin();
+            this.measureIndexRebuild();
             return;
         }
         this.ticks++;
+
+        // Phase one: the knowledge index, which a reload also used to build on this thread.
+        if (!this.indexPhaseDone) {
+            this.checkIndexReady();
+            return;
+        }
 
         if (this.model == null) {
             return;
@@ -112,6 +129,53 @@ public final class ReloadLatencySmokeTest implements TestHook {
                     + "flight and this run proves nothing about the reload");
             this.finishQuietly();
         }
+    }
+
+    /**
+     * Phase one: rebuilding the item/recipe index must not cost the caller anything.
+     *
+     * <p>Indexing 54191 items and 27221 recipes is 107-591 ms in production, and a reload arrives at
+     * the same answer it already had - recipes do not change when the runtime jar is swapped. What a
+     * reload cannot do is keep the previous object, because it belongs to the class loader being
+     * closed. So the recipe list is snapshotted here and the indexing runs on a worker, and this
+     * measures exactly that: the call must come back at once, and the index must still turn up.
+     */
+    private void measureIndexRebuild() {
+        long start = System.nanoTime();
+        KnowledgeManager.rebuild(this.server);
+        this.indexCallMs = (System.nanoTime() - start) / 1_000_000L;
+        this.indexStartTick = this.ticks;
+        LOG.info("RELOADTEST knowledge index: rebuild returned in {} ms (snapshot only; the indexing "
+                + "runs on a worker)", this.indexCallMs);
+    }
+
+    /** Phase one, continued: wait for the worker to publish, then prove the index answers. */
+    private void checkIndexReady() {
+        var index = KnowledgeManager.get();
+        if (index == null) {
+            if (this.ticks - this.indexStartTick > INDEX_READY_TIMEOUT_TICKS) {
+                LOG.error("RELOADTEST VERDICT: FAIL - the index was never published; the reload is "
+                        + "fast because the work was dropped, not moved");
+                this.finishQuietly();
+            }
+            return;
+        }
+        long ms = (this.ticks - this.indexStartTick) * 50L;
+        int items = index.indexedItemCount();
+        int stickRecipes = index.recipesProducing("minecraft:stick").size();
+        boolean usable = items > 0 && stickRecipes > 0;
+        LOG.info("RELOADTEST knowledge index: published about {} ms later - {} items indexed, {} "
+                + "recipe(s) produce a stick -> {}", ms, items, stickRecipes,
+                usable ? "usable" : "EMPTY");
+        if (!usable) {
+            LOG.error("RELOADTEST VERDICT: FAIL - the index was published but does not answer");
+            this.finishQuietly();
+            return;
+        }
+        LOG.info("RELOADTEST VERDICT: INDEX-PASS ({} ms of server thread instead of the whole build; "
+                + "the index is complete and answering)", this.indexCallMs);
+        this.indexPhaseDone = true;
+        this.begin();
     }
 
     /**
@@ -144,6 +208,8 @@ public final class ReloadLatencySmokeTest implements TestHook {
                 ? "PASS (the server thread is not held while a model call unwinds)"
                 : "FAIL - the shutdown still cost " + ms + " ms of server thread; an in-flight call "
                         + "is being waited on rather than interrupted");
+        LOG.info("RELOADTEST reload's blocking work: knowledge index {} ms + model executor {} ms",
+                this.indexCallMs, ms);
         this.finishQuietly();
     }
 

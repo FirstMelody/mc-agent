@@ -100,8 +100,9 @@ MCAGENT_SPEECH_TEST=true MCAGENT_NARRATION_GUARD=off ... runServer --offline  # 
 MCAGENT_CMD_UX_TEST=true    ... runServer --offline   # spawn resumes at the logout position; tab completion
 MCAGENT_RELOAD_TEST=true    ... runServer --offline   # a reload must not wait on an in-flight model call
 MCAGENT_RELOAD_TEST=true MCAGENT_RELOAD_INTERRUPT=off ... runServer --offline  # its positive control
-MCAGENT_ANVIL_TEST=true     ... runServer --offline   # what the bot can do with an anvil / enchanting
-                                                      # table: both refuse open_container, use() lies
+MCAGENT_ANVIL_TEST=true     ... runServer --offline   # anvil repair + enchanting table through the
+                                                      # real tool loop, and the refusals that must be
+                                                      # honest (no durability / nothing to repair with)
 ```
 
 Decompiled Minecraft/NeoForge sources for API reference: `/ymtc/Repos/.mcai-scratch/mcsrc/`
@@ -243,6 +244,22 @@ The most expensive mistakes in this project's history were **confident claims th
   contents are recorded automatically; everything else is the model's choice.
 - `maxTokens` must clear the model's *thinking* budget, not just its answer — too low and a reasoning
   model spends the whole turn thinking and emits no tool call at all.
+- **The anvil and the enchanting table are not containers** (`rt/action/Stations.java`). Neither is
+  a `Container` block entity, so `open_container` cannot see either of them, and a bare `use` only
+  installs the vanilla menu on a player who has no client to click it - which is why `use` now says
+  so and names the tool that can. `repair` and `enchant` drive the menus directly: put the item in,
+  press the button or take the result, then put everything back. Which material repairs what is
+  decided by vanilla's `Item.isValidRepairItem`, so a modded tool that implements it works unchanged.
+  `repair` also merges two worn copies of the same item, which is what a player does with no
+  material. An anvil is the one machine here with **no block entity**, so `Perception.isLandmark`
+  names it explicitly; otherwise it would never appear as something worth walking to.
+- **The knowledge index builds on a worker thread** (`mcagent-knowledge`), not on the server thread.
+  Only the recipe-list snapshot happens on the caller's thread, because reading the recipe manager is
+  world state; the indexing is computation over immutable holders. That took 107-591 ms out of every
+  reload (the answer never changes when the jar is swapped, but the object cannot survive the class
+  loader being closed, so each generation builds its own). Until the worker publishes, the item and
+  recipe tools answer "the item/recipe index is not ready yet; try again shortly" - about 200 ms in
+  production. `KnowledgeManager.clear()` interrupts and joins that worker before the loader closes.
 - **Player-built structures are protected** (`rt/perception/PlayerStructure.java`): fixtures (beds,
   storage, workstations, anything with a block entity) are never breakable, and a cluster of building
   blocks around a fixture protects its whole box plus 6 blocks of foundation. Every breaking path

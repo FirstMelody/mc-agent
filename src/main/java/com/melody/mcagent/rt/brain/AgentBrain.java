@@ -18,6 +18,7 @@ import com.melody.mcagent.rt.action.ActionPolicy;
 import com.melody.mcagent.rt.action.Actions;
 import com.melody.mcagent.rt.action.Containers;
 import com.melody.mcagent.rt.action.Crafting;
+import com.melody.mcagent.rt.action.Stations;
 import com.melody.mcagent.rt.bot.MovementDriver;
 import com.melody.mcagent.rt.llm.LlmClient;
 import com.melody.mcagent.rt.llm.JevClient;
@@ -131,7 +132,7 @@ public final class AgentBrain {
             "sleep", "wake", "place", "use", "open_container", "withdraw", "deposit",
             "craft", "craftable_now", "attack", "chat_command", "find_item", "find_uses",
             "remember", "recall", "forget", "find_resource", "mine_resource", "dig_tunnel",
-            "escape_up", "return_to_spawn");
+            "escape_up", "return_to_spawn", "repair", "enchant");
     /** One escape call stays small enough to fit beside other queued work. */
     private static final int MAX_ESCAPE_STEPS = 8;
     /** One local tunnel macro covers useful ground while remaining bounded and interruptible. */
@@ -3553,7 +3554,11 @@ public final class AgentBrain {
         return switch (tool) {
             case "mine", "mine_resource", "dig_tunnel", "escape_up" -> this.policy.canBreakBlocks();
             case "place", "use" -> this.policy.canPlaceBlocks();
-            case "open_container", "withdraw", "deposit" -> this.policy.canUseContainers();
+            // The anvil and the enchanting table are gated with the containers on purpose: both are
+            // "use the machine in front of you", and a separate switch would need a new key in the
+            // core's config spec, which costs a server restart to deploy.
+            case "open_container", "withdraw", "deposit", "repair", "enchant" ->
+                    this.policy.canUseContainers();
             case "attack" -> this.policy.canAttack();
             default -> true;
         };
@@ -4093,6 +4098,31 @@ public final class AgentBrain {
                             "x", "number: X", "y", "number: Y", "z", "number: Z",
                             "item", "string: item id",
                             "count", "number: how many"), List.of("x", "y", "z", "item", "count"))));
+
+            tools.add(new LlmClient.ToolSpec("repair",
+                    "Repair a worn tool, weapon or piece of armour on an anvil, using the material it "
+                    + "is made of (a diamond for diamond tools, leather for leather armour) or a "
+                    + "second copy of the same item. Do this before an expensive tool breaks: your "
+                    + "held item's durability is shown in your state, e.g. "
+                    + "'1x Diamond Pickaxe (durability 12/1561)'. Costs experience levels.",
+                    LlmClient.schema(LlmClient.params(
+                            "x", "number: X of the anvil", "y", "number: Y", "z", "number: Z",
+                            "item", "string: the item to repair, e.g. diamond_pickaxe",
+                            "material", "string: optional - what to repair it with; left out, you "
+                                    + "use the best thing you are carrying"),
+                            List.of("x", "y", "z", "item"))));
+
+            tools.add(new LlmClient.ToolSpec("enchant",
+                    "Enchant an item at an enchanting table. Costs experience levels and one lapis "
+                    + "lazuli per offer slot. The table shows three offers, cheapest first: pass "
+                    + "offer 1, 2 or 3 (1 by default). Which enchantment each one is is decided when "
+                    + "it is taken, so choose by price.",
+                    LlmClient.schema(LlmClient.params(
+                            "x", "number: X of the enchanting table", "y", "number: Y",
+                            "z", "number: Z",
+                            "item", "string: the item to enchant, e.g. diamond_sword",
+                            "offer", "number: 1, 2 or 3 - the cheapest is 1"),
+                            List.of("x", "y", "z", "item"))));
         }
 
         tools.add(new LlmClient.ToolSpec("craft",
@@ -5446,6 +5476,22 @@ public final class AgentBrain {
                     }
                     return result(Containers.deposit(this.bot, blockPos(args),
                             string(args, "item", ""), (int) arg(args, "count", 1)));
+                }
+
+                case "repair": {
+                    if (!this.policy.canUseContainers()) {
+                        return "failed: you are not allowed to use the machines in the world";
+                    }
+                    return result(Stations.repair(this.bot, blockPos(args),
+                            string(args, "item", ""), string(args, "material", "")));
+                }
+
+                case "enchant": {
+                    if (!this.policy.canUseContainers()) {
+                        return "failed: you are not allowed to use the machines in the world";
+                    }
+                    return result(Stations.enchant(this.bot, blockPos(args),
+                            string(args, "item", ""), (int) arg(args, "offer", 1)));
                 }
 
                 case "craft": {

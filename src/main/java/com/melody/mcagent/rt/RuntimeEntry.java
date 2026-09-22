@@ -32,7 +32,6 @@ import com.melody.mcagent.rt.command.BotCommands;
 import com.melody.mcagent.rt.command.CommandSmokeTest;
 import com.melody.mcagent.rt.command.InventoryCommandSmokeTest;
 import com.melody.mcagent.rt.knowledge.KnowledgeManager;
-import com.melody.mcagent.rt.knowledge.RecipeKnowledgeIndex;
 import com.melody.mcagent.rt.memory.BotMemory;
 import com.melody.mcagent.rt.perception.ChatLog;
 
@@ -81,15 +80,13 @@ public final class RuntimeEntry implements AgentRuntime {
 
         // Build the item/recipe index now: recipes are guaranteed available at server start, and
         // building it later risks reading ingredients before tags are bound.
-        try {
-            KnowledgeManager.rebuild(server);
-            RecipeKnowledgeIndex index = KnowledgeManager.get();
-            LOG.info("Item/recipe index ready: {} items indexed",
-                    index == null ? 0 : index.indexedItemCount());
-        } catch (Throwable t) {
-            // A broken mod recipe must not stop the server from running.
-            LOG.error("Could not build the item/recipe index; bots will lack recipe knowledge", t);
-        }
+        //
+        // It builds in the background. The recipe list is snapshotted on this thread and the indexing
+        // runs on a worker, because this method is also the reload path and indexing is the most
+        // expensive step in it (107-591 ms in production). Until the worker publishes, the item and
+        // recipe tools answer "the item/recipe index is not ready yet; try again shortly" - a far
+        // better trade than freezing the server thread for it on every reload.
+        KnowledgeManager.rebuild(server);
 
         // Pull in whatever the config files currently say. This also runs on every reload.
         Config.apply();

@@ -6,15 +6,12 @@ import com.melody.mcagent.rt.Agent;
 import com.melody.mcagent.rt.TestHook;
 import com.melody.mcagent.rt.action.Actions;
 import com.melody.mcagent.rt.action.Containers;
+import com.melody.mcagent.rt.action.Stations;
 import com.melody.mcagent.rt.brain.AgentBrain;
 
 import net.minecraft.core.BlockPos;
-import net.minecraft.core.Direction;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
-import net.minecraft.world.inventory.AnvilMenu;
-import net.minecraft.world.inventory.ClickType;
-import net.minecraft.world.inventory.EnchantmentMenu;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.block.Blocks;
@@ -24,17 +21,19 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * What the bot can actually do with an anvil and an enchanting table.
+ * The anvil and the enchanting table, driven through the real tool API.
  *
- * <p>Both are machines a player drives through a GUI, and the bot has no client: it acts through a
- * tool API and never clicks a slot. This harness therefore asks the question at the level that
- * matters - it scripts the exact calls a model would make ({@code open_container}, then {@code use}),
- * and reports what each one told the model, what menu the interaction actually installed on the
- * player, and whether the operation can be completed from there.
+ * <p>Both are machines a player works through a GUI, and a bot has no client: it never clicks a slot.
+ * The first version of this harness asked only what happened when a model reached for the tools it
+ * already had, and the answer was bad - {@code open_container} refused both, and {@code use} reported
+ * "used item on Anvil" while nothing whatsoever happened, so a bot told to save a pickaxe would say
+ * it had and then break it on the next block.
  *
- * <p>The distinction the last part draws is the point of the harness. "The vanilla menu opened" and
- * "the bot can finish the job" are different claims, and only the second one answers whether an
- * operator should expect a bot to repair a pickaxe or enchant a sword.
+ * <p>So it now scripts the calls a model makes with the tools that exist for this: repair a nearly
+ * broken pickaxe, enchant a sword, and two cases that must be refused honestly rather than silently
+ * (an item with no durability, and a tool with nothing to repair it with). What is asserted is the
+ * state afterwards, not the wording: durability really up, item really still carried, levels really
+ * spent, sword really enchanted.
  *
  * <p>Enabled with {@code MCAGENT_ANVIL_TEST=true}.
  */
@@ -43,9 +42,15 @@ public final class AnvilEnchantSmokeTest implements TestHook {
     private static final Logger LOG = LoggerFactory.getLogger("mcagent/anviltest");
 
     private static final String BOT = "AnvilBot";
+    private static final String PICKAXE = "diamond_pickaxe";
+    private static final String SWORD = "diamond_sword";
+    /** A diamond pickaxe holds 1561; this one is four hits from breaking. */
+    private static final int PICKAXE_DAMAGE = 1549;
 
-    /** Ticks to wait for the scripted sequence (four tool calls, each its own decision). */
-    private static final int SEQUENCE_TIMEOUT_TICKS = 1400;
+    /** Ticks to wait for the scripted sequence (five tool calls, each its own decision). */
+    private static final int SEQUENCE_TIMEOUT_TICKS = 1600;
+    /** Turns the scripted model has been asked for by the time the run is judged. */
+    private static final int TURNS = 7;
 
     private final MinecraftServer server;
 
@@ -59,7 +64,9 @@ public final class AnvilEnchantSmokeTest implements TestHook {
     private boolean started;
     private boolean finished;
     private int ticks;
-    private String lastMenu = "(none)";
+    private int levelsBefore;
+    /** What the bot actually starts with: an earlier run can leave items lying on the plot. */
+    private int lapisBefore;
 
     private AnvilEnchantSmokeTest(MinecraftServer server) {
         this.server = server;
@@ -90,29 +97,16 @@ public final class AnvilEnchantSmokeTest implements TestHook {
         }
         this.ticks++;
 
-        // What the interaction actually installed on the player, as it changes. A menu the bot
-        // cannot drive is still worth seeing: it is the difference between "nothing happened" and
-        // "the vanilla GUI is open in front of a player with no hands".
-        BotManager.BotHandle handle = Agent.botManager() == null
-                ? null : Agent.botManager().get(BOT);
-        if (handle != null) {
-            String menu = handle.player().containerMenu.getClass().getSimpleName();
-            if (!menu.equals(this.lastMenu)) {
-                LOG.info("ANVILTEST bot's open menu is now {} (was {})", menu, this.lastMenu);
-                this.lastMenu = menu;
-            }
-        }
-
         if (this.model == null) {
             return;
         }
-        if (this.model.requestCount() >= 5) {
-            this.probe();
+        if (this.model.requestCount() >= TURNS) {
+            this.verify();
             return;
         }
         if (this.ticks > SEQUENCE_TIMEOUT_TICKS) {
-            LOG.error("ANVILTEST VERDICT: FAIL - the scripted sequence never completed ({} request(s) "
-                    + "so far)", this.model.requestCount());
+            LOG.error("ANVILTEST VERDICT: FAIL - the scripted sequence stalled after {} request(s)",
+                    this.model.requestCount());
             this.finishQuietly();
         }
     }
@@ -129,16 +123,24 @@ public final class AnvilEnchantSmokeTest implements TestHook {
         this.buildSite();
 
         try {
-            // Exactly what a model would try, in the order it would try it: the container tool it
-            // already knows, then a right-click on the block itself.
             int[] turn = { 0 };
             BlockPos anvilPos = this.anvil;
             BlockPos tablePos = this.table;
             this.model = new ScriptedLlmServer(body -> switch (turn[0]++) {
+                // The tool a model reaches for first, and still the wrong one for a machine.
                 case 0 -> ScriptedLlmServer.toolCall("a1", "open_container", coords(anvilPos));
+                // A bare right-click: it opens the menu and must say that this is not enough.
                 case 1 -> ScriptedLlmServer.toolCall("a2", "use", coords(anvilPos));
-                case 2 -> ScriptedLlmServer.toolCall("a3", "open_container", coords(tablePos));
-                case 3 -> ScriptedLlmServer.toolCall("a4", "use", coords(tablePos));
+                case 2 -> ScriptedLlmServer.toolCall("a3", "repair",
+                        coords(anvilPos, "\"item\":\"" + PICKAXE + "\""));
+                case 3 -> ScriptedLlmServer.toolCall("a4", "enchant",
+                        coords(tablePos, "\"item\":\"" + SWORD + "\",\"offer\":1"));
+                // A stick has no durability: the anvil cannot help and must say so.
+                case 4 -> ScriptedLlmServer.toolCall("a5", "repair",
+                        coords(anvilPos, "\"item\":\"stick\""));
+                // A damaged shovel with no iron ingot and no second shovel: nothing to repair it with.
+                case 5 -> ScriptedLlmServer.toolCall("a6", "repair",
+                        coords(anvilPos, "\"item\":\"iron_shovel\""));
                 default -> ScriptedLlmServer.silent();
             });
             this.savedSettings = ScriptedLlmServer.settings();
@@ -157,23 +159,30 @@ public final class AnvilEnchantSmokeTest implements TestHook {
             return;
         }
         handle.player().getInventory().clearContent();
-        // A damaged sword and a diamond, so the anvil has something to repair; lapis, so the
-        // enchanting table has something to spend; and levels, so neither refuses for want of XP.
-        ItemStack sword = new ItemStack(Items.DIAMOND_SWORD);
-        sword.setDamageValue(100);
-        handle.player().getInventory().add(sword);
+        ItemStack pickaxe = new ItemStack(Items.DIAMOND_PICKAXE);
+        pickaxe.setDamageValue(PICKAXE_DAMAGE);
+        int pickaxeMax = pickaxe.getMaxDamage();
+        handle.player().getInventory().add(pickaxe);
         handle.player().getInventory().add(new ItemStack(Items.DIAMOND, 8));
-        handle.player().getInventory().add(new ItemStack(Items.LAPIS_LAZULI, 64));
-        handle.player().giveExperienceLevels(50);
+        handle.player().getInventory().add(new ItemStack(Items.DIAMOND_SWORD));
+        ItemStack shovel = new ItemStack(Items.IRON_SHOVEL);
+        shovel.setDamageValue(100);
+        handle.player().getInventory().add(shovel);
+        handle.player().getInventory().add(new ItemStack(Items.LAPIS_LAZULI, 8));
+        handle.player().getInventory().add(new ItemStack(Items.STICK, 4));
+        handle.player().setExperienceLevels(40);
+        this.levelsBefore = handle.player().experienceLevel;
+        this.lapisBefore = count(handle.player(), Items.LAPIS_LAZULI);
 
         if (!Agent.attachBrain(handle.player())) {
             LOG.error("ANVILTEST: FAIL - could not attach a brain");
             this.finishQuietly();
             return;
         }
-        LOG.info("ANVILTEST anvil at {}, enchanting table at {} (bookshelves around it); the scripted "
-                + "model will try open_container then use on each",
-                this.anvil.toShortString(), this.table.toShortString());
+        LOG.info("ANVILTEST anvil at {}, enchanting table at {}; bot carries a {} at {}/{} durability, "
+                + "8 diamonds, a sword, an iron shovel, 8 lapis and {} levels",
+                this.anvil.toShortString(), this.table.toShortString(), PICKAXE,
+                PICKAXE_DAMAGE, pickaxeMax, this.levelsBefore);
     }
 
     /** A flat stone platform with the two machines on it, plus bookshelves for real offers. */
@@ -185,6 +194,14 @@ public final class AnvilEnchantSmokeTest implements TestHook {
                     this.level.setBlockAndUpdate(this.plot.offset(dx, dy, dz), Blocks.AIR.defaultBlockState());
                 }
             }
+        }
+        // An earlier run of this harness can leave dropped items here: vanilla's EnchantmentMenu
+        // drops whatever is still in its slots when it closes, and a bot standing on the plot would
+        // then pick them up and quietly start the run with more lapis than the test handed it.
+        for (net.minecraft.world.entity.item.ItemEntity dropped : this.level.getEntitiesOfClass(
+                net.minecraft.world.entity.item.ItemEntity.class,
+                new net.minecraft.world.phys.AABB(this.plot).inflate(8.0D))) {
+            dropped.discard();
         }
         this.level.setBlockAndUpdate(this.anvil, Blocks.ANVIL.defaultBlockState());
         this.level.setBlockAndUpdate(this.table, Blocks.ENCHANTING_TABLE.defaultBlockState());
@@ -202,106 +219,129 @@ public final class AnvilEnchantSmokeTest implements TestHook {
         }
     }
 
+    /** A complete JSON arguments object for a call that needs nothing but coordinates. */
     private static String coords(BlockPos pos) {
-        return "{\"x\":" + pos.getX() + ",\"y\":" + pos.getY() + ",\"z\":" + pos.getZ() + "}";
+        return coords(pos, "");
     }
 
     /**
-     * What the model was told, and whether the operation is completable from where the bot ends up.
+     * The same, with extra fields spliced in before the closing brace.
+     *
+     * <p>Built as one object on purpose. An earlier version of this harness left the brace off, so
+     * every call arrived with no arguments at all and the tools read the position as 0, 0, 0 - the
+     * test then failed for a reason that had nothing to do with the code under test.
      */
-    private void probe() {
-        String transcript = this.model.lastRequest();
-        boolean containerRefusedForAnvil = transcript.contains("there is no container at "
-                + this.anvil.toShortString());
-        boolean containerRefusedForTable = transcript.contains("there is no container at "
-                + this.table.toShortString());
-        boolean useReportedAnvil = transcript.contains("used item on Anvil");
-        boolean useReportedTable = transcript.contains("used item on Enchanting Table");
+    private static String coords(BlockPos pos, String extraFields) {
+        return "{\"x\":" + pos.getX() + ",\"y\":" + pos.getY() + ",\"z\":" + pos.getZ()
+                + (extraFields.isEmpty() ? "" : "," + extraFields) + "}";
+    }
 
-        LOG.info("ANVILTEST what the model was told: open_container(anvil) refused={} "
-                + "open_container(table) refused={} use(anvil) reported success={} "
-                + "use(table) reported success={}",
-                containerRefusedForAnvil, containerRefusedForTable, useReportedAnvil, useReportedTable);
-
+    /**
+     * Judge the state, not the prose: what the bot is carrying and what it cost.
+     */
+    private void verify() {
         BotManager.BotHandle handle = Agent.botManager().get(BOT);
         var bot = handle.player();
+        ItemStack pickaxe = carried(bot, Items.DIAMOND_PICKAXE);
+        ItemStack sword = carried(bot, Items.DIAMOND_SWORD);
+        int levelsSpent = this.levelsBefore - bot.experienceLevel;
+        int lapisLeft = count(bot, Items.LAPIS_LAZULI);
 
-        // --- the tool surface, called exactly as the dispatcher calls it -------------------------
-        LOG.info("ANVILTEST tool surface: isContainer(anvil)={} isContainer(table)={}",
-                Containers.isContainer(bot, this.anvil), Containers.isContainer(bot, this.table));
-        Actions.Result withdrawAnvil = Containers.withdraw(bot, this.anvil, "minecraft:diamond", 1);
-        LOG.info("ANVILTEST tool surface: withdraw(anvil) -> {} {}",
-                withdrawAnvil.success() ? "ok" : "FAILED", withdrawAnvil.message());
+        boolean pickaxeSurvived = !pickaxe.isEmpty();
+        boolean repaired = pickaxeSurvived && pickaxe.getDamageValue() < PICKAXE_DAMAGE;
+        boolean repairedFully = pickaxeSurvived && pickaxe.getDamageValue() == 0;
+        boolean enchanted = !sword.isEmpty() && sword.isEnchanted();
+        boolean paid = levelsSpent > 0;
+        boolean lapisSpent = lapisLeft < this.lapisBefore;
 
-        // --- is the menu the interaction opened actually functional? -----------------------------
-        probeAnvil(bot);
-        probeTable(bot);
+        LOG.info("ANVILTEST state: pickaxe={} (damage {}) sword={} levels {} -> {} lapis {} -> {}",
+                pickaxeSurvived ? "carried" : "LOST", pickaxeSurvived ? pickaxe.getDamageValue() : -1,
+                enchanted ? "enchanted" : "plain", this.levelsBefore, bot.experienceLevel,
+                this.lapisBefore, lapisLeft);
 
-        LOG.info("ANVILTEST VERDICT: the bot cannot use an anvil or an enchanting table. Both refuse "
-                + "open_container (neither is a Container block entity), and although use() reports "
-                + "success and does install the vanilla menu, no tool can move an item into that "
-                + "menu's slots or take its result - so the model is told it did something it did "
-                + "not do.");
+        // The two refusals have to reach the model as refusals: an item with no durability, and a
+        // tool with nothing to repair it with. Silent success here is how the pickaxe got broken.
+        // Counted across every request, not just the last one: the transcript is compacted as it
+        // grows, so a result five turns old is collapsed to a summary and a lastRequest() check
+        // would fail for a reason that has nothing to do with the tool. (This caught the author.)
+        boolean stickRefused = this.model.maxOccurrences("has no durability") >= 1;
+        boolean nothingToRepairWith = this.model.maxOccurrences("you have nothing to repair") >= 1;
+        boolean containerStillRefused = this.model.maxOccurrences("there is no container at") >= 1;
+        // A right-click that opens a GUI the bot cannot click must not read as "job done".
+        //
+        // The phrase has no apostrophes on purpose: these are matched against the raw request body,
+        // and GSON escapes them to \u0027, so an assertion containing one can never match however
+        // right the tool is. (It cost a run to notice.)
+        boolean usePointsAtTheTool =
+                this.model.maxOccurrences("tool to actually repair an item") >= 1;
+
+        LOG.info("ANVILTEST refusals: stick={} no-material={} open_container(anvil)={} "
+                + "use(anvil)-points-at-repair={}", stickRefused, nothingToRepairWith,
+                containerStillRefused, usePointsAtTheTool);
+
+        boolean pass = repaired && pickaxeSurvived && enchanted && paid && lapisSpent
+                && stickRefused && nothingToRepairWith && containerStillRefused && usePointsAtTheTool;
+        LOG.info("ANVILTEST VERDICT: {}{}", pass ? "PASS" : "FAIL - ",
+                pass ? " (repair " + (repairedFully ? "to full durability" : "improved durability")
+                        + ", enchant applied, both refusals honest)"
+                     : describeFailure(repaired, pickaxeSurvived, enchanted, paid, lapisSpent,
+                             stickRefused, nothingToRepairWith, usePointsAtTheTool));
         this.finishQuietly();
     }
 
-    /**
-     * Repair a sword through the anvil menu by hand.
-     *
-     * <p>Not something the bot can do - it is here to separate "vanilla cannot" from "the tool
-     * surface does not reach it". If this works, a repair tool is a wiring job, not a research one.
-     */
-    private void probeAnvil(net.minecraft.server.level.ServerPlayer bot) {
-        Actions.Result used = Actions.useOnBlock(bot, this.anvil, Direction.UP);
-        if (!(bot.containerMenu instanceof AnvilMenu anvilMenu)) {
-            LOG.info("ANVILTEST anvil menu probe: use() -> {} but the open menu is {}, not an AnvilMenu",
-                    used.message(), bot.containerMenu.getClass().getSimpleName());
-            return;
+    private static String describeFailure(boolean repaired, boolean survived, boolean enchanted,
+                                          boolean paid, boolean lapisSpent, boolean stickRefused,
+                                          boolean nothingToRepairWith, boolean usePointsAtTheTool) {
+        StringBuilder sb = new StringBuilder();
+        if (!survived) {
+            sb.append("the pickaxe was lost; ");
+        } else if (!repaired) {
+            sb.append("the pickaxe was not repaired; ");
         }
-        ItemStack sword = new ItemStack(Items.DIAMOND_SWORD);
-        sword.setDamageValue(100);
-        anvilMenu.getSlot(AnvilMenu.INPUT_SLOT).set(sword);
-        anvilMenu.getSlot(AnvilMenu.ADDITIONAL_SLOT).set(new ItemStack(Items.DIAMOND));
-        ItemStack result = anvilMenu.getSlot(AnvilMenu.RESULT_SLOT).getItem();
-        LOG.info("ANVILTEST anvil menu probe: damaged sword + diamond -> result={} cost={} levels",
-                result.isEmpty() ? "(none)" : result.getDisplayName().getString() + " x" + result.getCount(),
-                anvilMenu.getCost());
-        if (result.isEmpty()) {
-            return;
+        if (!enchanted) {
+            sb.append("the sword was not enchanted; ");
         }
-        int levelsBefore = bot.experienceLevel;
-        anvilMenu.clicked(AnvilMenu.RESULT_SLOT, 0, ClickType.PICKUP, bot);
-        // Vanilla puts a picked-up result on the cursor, exactly as it does for a real client's
-        // first click; a second click would move it into the inventory. Both are reported so the
-        // claim "the menu is functional" rests on what actually happened, not on one of them.
-        ItemStack carried = anvilMenu.getCarried();
-        LOG.info("ANVILTEST anvil menu probe: taking the result by hand -> carried={} inInventory={} "
-                + "levels {} -> {}", carried.isEmpty() ? "(empty)" : carried.getDisplayName().getString(),
-                bot.getInventory().contains(result), levelsBefore, bot.experienceLevel);
+        if (!paid) {
+            sb.append("no experience was spent; ");
+        }
+        if (!lapisSpent) {
+            sb.append("no lapis was spent; ");
+        }
+        if (!stickRefused) {
+            sb.append("a stick was not refused as unrepairable; ");
+        }
+        if (!nothingToRepairWith) {
+            sb.append("a tool with no material was not refused; ");
+        }
+        if (!usePointsAtTheTool) {
+            sb.append("use() on the anvil did not point at the repair tool; ");
+        }
+        return sb.toString();
     }
 
-    /** Enchant a sword through the enchanting menu by hand, the same way. */
-    private void probeTable(net.minecraft.server.level.ServerPlayer bot) {
-        Actions.Result used = Actions.useOnBlock(bot, this.table, Direction.UP);
-        if (!(bot.containerMenu instanceof EnchantmentMenu enchantMenu)) {
-            LOG.info("ANVILTEST table menu probe: use() -> {} but the open menu is {}, not an "
-                    + "EnchantmentMenu", used.message(), bot.containerMenu.getClass().getSimpleName());
-            return;
+    private static ItemStack carried(net.minecraft.server.level.ServerPlayer bot,
+                                     net.minecraft.world.item.Item item) {
+        var inventory = bot.getInventory();
+        for (int i = 0; i < inventory.getContainerSize(); i++) {
+            ItemStack stack = inventory.getItem(i);
+            if (!stack.isEmpty() && stack.is(item)) {
+                return stack;
+            }
         }
-        enchantMenu.getSlot(0).set(new ItemStack(Items.DIAMOND_SWORD));
-        enchantMenu.getSlot(1).set(new ItemStack(Items.LAPIS_LAZULI, 3));
-        LOG.info("ANVILTEST table menu probe: offers={} {} {}", enchantMenu.costs[0],
-                enchantMenu.costs[1], enchantMenu.costs[2]);
-        if (enchantMenu.costs[0] <= 0) {
-            LOG.info("ANVILTEST table menu probe: no offer to take, so the button cannot be pressed");
-            return;
+        return ItemStack.EMPTY;
+    }
+
+    private static int count(net.minecraft.server.level.ServerPlayer bot,
+                             net.minecraft.world.item.Item item) {
+        var inventory = bot.getInventory();
+        int total = 0;
+        for (int i = 0; i < inventory.getContainerSize(); i++) {
+            ItemStack stack = inventory.getItem(i);
+            if (!stack.isEmpty() && stack.is(item)) {
+                total += stack.getCount();
+            }
         }
-        int levelsBefore = bot.experienceLevel;
-        enchantMenu.clickMenuButton(bot, 0);
-        ItemStack enchanted = enchantMenu.getSlot(0).getItem();
-        LOG.info("ANVILTEST table menu probe: clickMenuButton(0) by hand -> item={} enchanted={} "
-                + "levels {} -> {}", enchanted.getDisplayName().getString(),
-                enchanted.isEnchanted(), levelsBefore, bot.experienceLevel);
+        return total;
     }
 
     private void finishQuietly() {

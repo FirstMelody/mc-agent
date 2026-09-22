@@ -2527,3 +2527,82 @@ ANVILTEST tool surface: withdraw(anvil) -> FAILED the bot has not opened that co
 附魔台放料 + 读三档 `costs` + `clickMenuButton(player, index)`，并把结果如实回报
 （"修好了钻石剑，花了 1 级"），完事 `closeContainer()`。顺带也该修 `use`：
 在一个 bot 无法操作的 GUI 上不该只报一句成功。
+
+---
+
+## 里程碑 13：知识索引不再占主线程；铁砧 / 附魔台真的能用了
+
+### 13.1 知识索引：**重建搬到 worker**（"reload 不重建"能做的版本）
+
+要求是「只在服务器启动时建立，reload 不要重建」。**字面做不到，原因在架构里**：索引对象属于
+这一代的 ClassLoader，reload 时那个 loader 正要被关掉，新的一代如果抓住旧索引，整个旧代就被钉住
+（AGENTS.md 第 1 节的硬规则）。所以每一代必须有自己的索引。
+
+能做到、也正是这条要求真正想要的：**reload 不要为它花主线程时间**。现在
+`KnowledgeManager.rebuild()` 只在调用线程上做一件事 —— `List.copyOf(server.getRecipeManager().getRecipes())`
+（读配方管理器是世界状态，必须留在主线程，约 1 ms），剩下的索引计算跑在 `mcagent-knowledge`
+worker 上，结果发布到原来的 volatile 字段。发布之前 `get()` 返回 null，而所有调用点早就会处理
+这种情况（`find_item` 本来就说「the item/recipe index is not ready yet; try again shortly」）。
+
+配套的两件事：
+- worker 每收一个配方检查一次中断标志；`KnowledgeManager.clear()` 会 interrupt + 有界 join
+  （500 ms），因为 loader 马上要关，跑着的 worker 会死在半路（`NoClassDefFoundError`）。
+  正常情况这个 join 是 0 ms —— 构建只要几百毫秒，而下一次 reload 在几分钟以后。
+- 每条路径都有上限：worker 超过 500 ms 没停就**明说**，不再静默。
+
+实跑（`MCAGENT_RELOAD_TEST`，新增的索引阶段）：
+
+```
+[mcagent-knowledge] Knowledge index built in 10 ms: 2666 items, 1290 recipes (0 skipped)   ← 线程名就是证据
+RELOADTEST knowledge index: rebuild returned in 0 ms (snapshot only; the indexing runs on a worker)
+RELOADTEST knowledge index: published about 50 ms later - 2666 items indexed, 2 recipe(s) produce a stick -> usable
+RELOADTEST VERDICT: INDEX-PASS (0 ms of server thread instead of the whole build; the index is complete and answering)
+```
+
+生产上是 54191 items / 27221 recipes，实测构建 107–591 ms —— 这一段现在完全不占主线程。
+reload 剩下的成本是移除 bot（271–497 ms，世界状态，必须在主线程）和命令重注册（21–248 ms）。
+
+### 13.2 铁砧修复 + 附魔台：新工具 `repair` / `enchant`
+
+12.4 记的那个洞补上了。两个机器都不是 `Container`，所以 `Containers` 看不见它们；而一次光秃秃的
+`use` 只会在一个没有客户端的玩家身上装一个原版菜单。新文件 `rt/action/Stations.java` 按玩家的顺序
+把菜单开完：
+
+- **`repair(x,y,z,item,material?)`**：把物品放进输入槽，第二格放修复材料（**用哪个材料由原版的
+  `Item.isValidRepairItem` 决定**，所以实现了它的模组工具自动就能用；没给 material 就先找材料、
+  再找同款第二件来合并耐久），读 `getCost()`，等级不够就**如实拒绝并说明**，够了就 shift-click
+  取产物，最后把剩下的材料和产物都收回背包、关掉菜单。
+- **`enchant(x,y,z,item,offer?)`**：放物品 + 青金石（第 N 档要 N 个），读三档 `costs`，
+  `clickMenuButton` 按下按钮，结果和花掉的等级一起回报。附魔是按下才随机的，所以模型只能按价格选档，
+  这一点写进了工具描述。
+- **`use` 不再假成功**：右键铁砧/附魔台现在会附带一句「菜单开了，但这里点不了槽位：用 repair/enchant
+  工具」。原来那句 "used item on Anvil" 就是让模型以为修好了、然后下一格把镐子用断的原因。
+- 感知：铁砧是**唯一没有方块实体的机器**，`Perception.isLandmark` 原来只认「有方块实体/流体/原木/树叶」，
+  所以它永远不会出现在「things worth walking to」里。现在显式点名铁砧。
+
+实跑（`MCAGENT_ANVIL_TEST`，脚本模型走真实工具分发）：
+
+```
+Bot AnvilBot called open_container(x=72, y=-36, z=70) -> failed: there is no container at 72, -36, 70
+Bot AnvilBot called use(x=72, y=-36, z=70) -> used item on Anvil at 72, -36, 70 - the anvil is open, but its
+    slots cannot be clicked from here: use the 'repair' tool to actually repair an item
+Bot AnvilBot called repair(x=72, y=-36, z=70, item="diamond_pickaxe") -> repaired Diamond Pickaxe:
+    durability 12 -> 1561/1561, using Diamond, for 4 experience level(s)
+Bot AnvilBot called enchant(x=68, y=-36, z=70, item="diamond_sword", offer=1) -> enchanted Diamond Sword with
+    Sweeping Edge I for 1 experience level(s) (the three offers cost 4, 9, 30 levels)
+Bot AnvilBot called repair(x=72, y=-36, z=70, item="stick") -> failed: Stick has no durability, so an anvil cannot repair it
+Bot AnvilBot called repair(x=72, y=-36, z=70, item="iron_shovel") -> failed: you have nothing to repair Iron
+    Shovel with: carry a second one, or the material it is made of (...)
+ANVILTEST state: pickaxe=carried (damage 0) sword=enchanted levels 40 -> 35 lapis 8 -> 7
+ANVILTEST VERDICT: PASS (repair to full durability, enchant applied, both refusals honest)
+```
+
+断言的是**状态**而不是措辞：镐子还在背包里、耐久真的从 1549 掉到 0、剑真的带附魔、等级真的花了 5 级、
+青金石真的少了 1 个。
+
+三个自己踩的坑，都记在测试注释里：`coords()` 少了一个 `}` 让所有参数变成 0,0,0（测试因为与被测代码
+无关的原因失败）；上一次运行在附魔台菜单里留下的青金石被原版丢到地上、被这一轮的 bot 捡走（现在开局
+先清场地掉落物，并记录真实起始数量）；**GSON 会把 `'` 转义成 `\u0027`**，所以任何带撇号的转录断言
+永远匹配不上 —— 断言短语里不能有撇号。
+
+**未部署**：以上都只在 dev server 上验证过，生产服还没换 jar。

@@ -247,6 +247,8 @@ super.travel(...)  // 由原版 LivingEntity.tick() 自动调用
 | `place(pos, item, face)` | 放置校验（碰撞、可替换性） |
 | `craft(recipe_id, count)` | 走 `RecipeManager`，素材从背包校验/扣除 |
 | `open_container(pos)` / `withdraw` / `deposit` | 真实打开 + 物品转移 |
+| `repair(pos, item, material?)` | 铁砧修复：放料 → 读 `getCost()` → 取产物，等级与耐久如实回报 |
+| `enchant(pos, item, offer?)` | 附魔台：放物品 + 青金石 → `clickMenuButton`，按价格选三档之一 |
 | `use_item` / `use_on(pos)` | 右击物品 / 对方块使用 |
 | `attack(entity)` | 攻击，含冷却 |
 | `chat(text)` | 以玩家身份发言（会被其他玩家看到） |

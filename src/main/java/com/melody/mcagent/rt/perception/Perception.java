@@ -472,6 +472,14 @@ public final class Perception {
         if (state.hasBlockEntity()) {
             return true;
         }
+        // An anvil is the one machine a bot acts on that has no block entity, so the rule above
+        // would never report it as something worth walking to - and "repair this pickaxe before it
+        // breaks" is a job that starts with finding one. It is named explicitly for that reason;
+        // every other station a tool here can drive (the enchanting table) already has a block
+        // entity and comes through the check above.
+        if (state.getBlock() instanceof net.minecraft.world.level.block.AnvilBlock) {
+            return true;
+        }
         if (!state.getFluidState().isEmpty()) {
             return true;
         }

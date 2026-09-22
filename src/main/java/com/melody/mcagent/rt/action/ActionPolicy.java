@@ -128,7 +128,7 @@ public final class ActionPolicy {
             sb.append(", attack");
         }
         if (this.allowContainers) {
-            sb.append(", open containers");
+            sb.append(", open containers and use machines");
         }
         sb.append(". Commands: /").append(String.join(", /", this.allowedCommands));
         sb.append(". NOT an operator.");
