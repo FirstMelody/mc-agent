@@ -2332,6 +2332,12 @@ public final class AgentBrain {
             if (!safe) {
                 break;
             }
+            // Same rule as the escape stair: a tunnel whose ceiling is gravel drops it on the digger.
+            if (ceilingWouldFall(level, feet, 2)) {
+                stoppedBy = "the gravel or sand above " + feet.toShortString()
+                        + ", which would fall in on you";
+                break;
+            }
             route.add(new TunnelStep(feet.immutable(), List.copyOf(clear)));
         }
 
@@ -2564,6 +2570,11 @@ public final class AgentBrain {
                 if (!safe) {
                     break;
                 }
+                // Clearing this tread would drop the gravel above it onto the bot. Six deaths came
+                // from exactly that, so the route simply does not go that way.
+                if (ceilingWouldFall(level, feet, 2)) {
+                    break;
+                }
 
                 steps.add(new EscapeStep(feet.immutable(), List.copyOf(clear)));
                 int surfaceFeetY = level.getHeight(
@@ -2707,6 +2718,8 @@ public final class AgentBrain {
         this.logStatsWindow();
 
         // Advance whatever long-running thing owns the bot, and notice when a journey ends.
+        this.tickDangerReflex();
+
         boolean busy = this.tickCombatJob();
         busy = this.tickMineJob() || busy;
         busy = this.tickFarmBuildJob() || busy;
@@ -2878,6 +2891,198 @@ public final class AgentBrain {
                 ? "you are asleep in the bed at " + bed.toShortString()
                         + "; it is now your respawn point"
                 : "you could not sleep: " + outcome.message());
+    }
+
+    /** Health at which the bot breaks off what it is doing, and health at which it may resume. */
+    private static final float RETREAT_HEALTH = 8.0F;
+    private static final float RECOVERED_HEALTH = 14.0F;
+    /** Food level at which eating stops being the model's choice and becomes a reflex. */
+    private static final int EAT_FOOD = 6;
+    /** The reflex runs at most this often; it is a reflex, not a per-tick loop. */
+    private static final int REFLEX_INTERVAL_TICKS = 20;
+
+    /** True while the bot has broken off work to recover. */
+    private boolean retreating;
+    private long lastReflexTick = -1L;
+    /** The last thing the reflex said, so it does not repeat itself every second. */
+    private String lastReflexReport = "";
+
+    /**
+     * Survival reflexes: what the bot does about a threat without being asked.
+     *
+     * <p>Production made the case for this. 84% of the bot's deaths happened outside combat - 25
+     * while mining, 21 while walking - because nothing ever interrupted work for a threat. It kept
+     * digging at {@code health=0.3} and died three seconds later, and it asked players for food in
+     * chat ("血量只剩5了，你有食物吗？") while standing next to its own full inventory.
+     *
+     * <p>Two rules, both of them things a player does without deciding to:
+     * <ul>
+     *   <li><b>Phantoms are not fought.</b> They cannot be reached on foot, and sleeping is what
+     *       stops them. The bot goes home and gets into bed.</li>
+     *   <li><b>Low health breaks off work.</b> The current job is abandoned, the bot eats if it is
+     *       hungry, and it goes home. It stays in that state until it has actually recovered, so a
+     *       model that re-issues "mine" while the bot is nearly dead is refused rather than obeyed
+     *       into its own grave.</li>
+     * </ul>
+     */
+    private void tickDangerReflex() {
+        if (this.bot.isRemoved() || this.bot.isDeadOrDying() || this.paused) {
+            return;
+        }
+        long now = this.bot.level().getGameTime();
+        if (this.lastReflexTick >= 0 && now - this.lastReflexTick < REFLEX_INTERVAL_TICKS) {
+            return;
+        }
+        this.lastReflexTick = now;
+
+        if (this.phantomThreatening()) {
+            this.breakOffForDanger("phantoms are circling and cannot be fought on foot");
+            // Eat on the way. Found by the harness: the phantom branch returned before the eating
+            // branch ever ran, so a bot hiding from phantoms at food 4 never regenerated and sat at
+            // 5 health until something else killed it.
+            this.eatIfNeeded();
+            this.headHome(true);
+            return;
+        }
+
+        float health = this.bot.getHealth();
+        if (!this.retreating && health <= RETREAT_HEALTH) {
+            this.retreating = true;
+            this.breakOffForDanger("health was " + String.format(java.util.Locale.ROOT, "%.1f", health));
+        }
+        if (!this.retreating) {
+            return;
+        }
+        if (health >= RECOVERED_HEALTH && !this.underAttack()) {
+            this.retreating = false;
+            this.lastReflexReport = "";
+            this.actionReports.addLast("recovered to "
+                    + String.format(java.util.Locale.ROOT, "%.1f", health)
+                    + " health; I can work again");
+            return;
+        }
+        this.eatIfNeeded();
+        this.headHome(false);
+    }
+
+    /**
+     * Would standing here get the bot buried?
+     *
+     * <p>Breaking a block takes the support out from under whatever is falling above it, and what
+     * lands is the bot. Six of production's deaths were exactly this - self-dug shafts in gravel and
+     * sand, "suffocated in a wall", most of them within seconds of starting the dig. The check is on
+     * the block <em>above the cleared space</em>, because that is the one the dig would drop: the
+     * excavation macros already refuse to break a falling block directly, which is not the same thing.
+     *
+     * @param headroom how many blocks the bot needs clear above its feet
+     */
+    private static boolean ceilingWouldFall(net.minecraft.server.level.ServerLevel level,
+                                            BlockPos feet, int headroom) {
+        for (int up = 1; up <= headroom + 1; up++) {
+            BlockPos above = feet.above(up);
+            if (level.isOutsideBuildHeight(above)) {
+                return false;
+            }
+            BlockState state = level.getBlockState(above);
+            if (state.getBlock() instanceof FallingBlock) {
+                return true;
+            }
+            // Anything solid above stops the fall, so only the first obstruction matters.
+            if (!state.getCollisionShape(level, above).isEmpty()) {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    /** Is a phantom visible nearby, or was the bot just bitten by one? */
+    private boolean phantomThreatening() {
+        if (this.bot.getLastHurtByMob() instanceof net.minecraft.world.entity.monster.Phantom) {
+            return true;
+        }
+        for (Perception.SeenEntity seen : Perception.visibleEntities(this.bot)) {
+            if (seen.entity() instanceof net.minecraft.world.entity.monster.Phantom) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Was the bot hurt in the last few seconds? */
+    private boolean underAttack() {
+        return this.bot.getLastHurtByMob() != null
+                && this.bot.tickCount - this.bot.getLastHurtByMobTimestamp() < 100;
+    }
+
+    /**
+     * Drop whatever the bot is doing because of a threat, and say so once per episode.
+     *
+     * <p>Only once: a bot that is being bitten reports it, and then acts. Repeating it every second
+     * would fill the log with the same line and tell the model nothing new.
+     */
+    private void breakOffForDanger(String reason) {
+        boolean busy = this.isLongActionRunning() || !this.queue.isEmpty();
+        if (busy) {
+            this.abandonCurrentAction();
+            this.abandonPlan("I broke off: " + reason);
+        }
+        this.miningGoal = null;
+        if (this.farmBuildJob != null) {
+            this.finishFarmBuild("abandoned: " + reason);
+        }
+        if (!reason.equals(this.lastReflexReport)) {
+            this.lastReflexReport = reason;
+            this.actionReports.addLast("I stopped what I was doing because " + reason);
+            LOG.info("Bot {} broke off for danger: {}", this.bot.getName().getString(), reason);
+        }
+    }
+
+    /** Eat if the bot is hungry and carrying food; the same action the {@code eat} tool performs. */
+    private void eatIfNeeded() {
+        if (this.bot.getFoodData().getFoodLevel() > EAT_FOOD || this.bot.isUsingItem()) {
+            return;
+        }
+        String eaten = this.eat("");
+        if (!eaten.startsWith("failed")) {
+            this.actionReports.addLast("I ate because my food was low: " + eaten);
+        }
+    }
+
+    /**
+     * Walk home, and get into bed if that is what the bot came for.
+     *
+     * <p>Home is the bed it last slept in - the respawn point - which is also where its chests and
+     * its spare armour are. A bot with no bed has nowhere to go, and is told so rather than being
+     * left to pace.
+     */
+    private void headHome(boolean sleepWhenThere) {
+        BlockPos home = this.homePosition();
+        if (home == null) {
+            if (sleepWhenThere && !"no bed".equals(this.lastReflexReport)) {
+                this.lastReflexReport = "no bed";
+                this.actionReports.addLast("I have no bed to go to: phantoms keep coming until "
+                        + "somebody sleeps, so place a bed and sleep in it");
+            }
+            return;
+        }
+        double distance = Math.sqrt(this.bot.blockPosition().distSqr(home));
+        if (distance > 3.0D) {
+            if (!this.isMoving()) {
+                var handle = com.melody.mcagent.rt.Agent.botManager() == null ? null
+                        : com.melody.mcagent.rt.Agent.botManager()
+                                .get(this.bot.getName().getString());
+                if (handle != null) {
+                    handle.movement().setPathTarget(home, GOTO_PLAN_RANGE);
+                }
+            }
+            return;
+        }
+        if (sleepWhenThere && !this.bot.isSleeping()) {
+            BlockPos bed = Actions.findBed(this.bot, 16);
+            if (bed != null) {
+                this.pendingSleep = bed;
+            }
+        }
     }
 
     /** True if the bot was walking last tick and has now arrived or given up. */
@@ -4954,6 +5159,16 @@ public final class AgentBrain {
     private String startCombat(Entity target) {
         if (!(target instanceof LivingEntity living) || !living.isAlive() || target.isRemoved()) {
             return "failed: that target is not alive";
+        }
+        // Phantoms are never fought. Production: four deaths to them, three more attacks that came
+        // back "target is out of reach", and a bow that was used twice in the whole corpus. A
+        // phantom dives, bites and climbs again; a bot on foot cannot chase it, and the 30-second
+        // combat timeout means the attempt ends with the bot standing in the open being bitten.
+        // Sleeping is the actual mechanic - phantoms exist because nobody has slept - so that is
+        // what the bot is told to do, and what the reflex below makes it do.
+        if (target instanceof net.minecraft.world.entity.monster.Phantom) {
+            return "failed: a phantom cannot be fought on foot - it flies out of reach between dives. "
+                    + "They only stop coming if you sleep, so go home and get into bed.";
         }
         this.stopMoving();
         this.combatJob = new CombatJob(target);
@@ -7193,6 +7408,11 @@ public final class AgentBrain {
         out.put("tokenBudget", this.tokenBudget);
         out.put("standingGoal", this.standingGoal == null ? "(none)" : this.standingGoal);
         out.put("paused", this.paused);
+        // What the survival reflex is doing: whether the bot has broken off work to recover, and
+        // what it last said about it. Read by the danger harness and by anyone debugging a bot that
+        // "suddenly stopped".
+        out.put("retreating", this.retreating);
+        out.put("lastReflex", this.lastReflexReport.isEmpty() ? "(none)" : this.lastReflexReport);
         // What the cheap layer is doing: which trigger the next decision will be labelled with, and
         // per-trigger asked/continued/escalated/failed tallies. Read by /mcagent status and by the
         // gated routing test, which asserts on the counters rather than on log text.

@@ -57,6 +57,38 @@ tasks.withType(Javadoc).configureEach { options.encoding = 'UTF-8' }
 // done here, at packaging time, rather than with a second Gradle project: one compilation unit is
 // what keeps the runtime able to reference core types without a build-order dance.
 
+/**
+ * Every logger name in this mod, written into the runtime jar as a resource.
+ *
+ * <p>Needed because log4j2 splits logger names on '.', not on '/': "mcagent/brain" is NOT a child of
+ * "mcagent", so a single logger config cannot cover the mod and route its lines out of the console.
+ * Generating the list from the source means adding a logger never silently leaves its lines in the
+ * server console - which is exactly the kind of quiet rot this project has been bitten by.
+ */
+def mcagentLoggerNames = tasks.register('mcagentLoggerNames') {
+    def sources = fileTree('src/main/java') { include '**/*.java' }
+    // A directory output, written under the runtime's package path so the jar task's include filter
+    // keeps it: `from(task)` copies a directory output preserving its structure.
+    def outputDir = layout.buildDirectory.dir('generated/loggerNames')
+    inputs.files(sources)
+    outputs.dir(outputDir)
+    doLast {
+        def names = new TreeSet<String>()
+        sources.each { file ->
+            file.eachLine { line ->
+                def matcher = line =~ /getLogger\("([^"]+)"\)/
+                if (matcher.find()) {
+                    names.add(matcher.group(1))
+                }
+            }
+        }
+        def target = new File(outputDir.get().asFile, 'com/melody/mcagent/rt/mcagent-loggers.txt')
+        target.parentFile.mkdirs()
+        target.text = names.join('\n') + '\n'
+        logger.lifecycle("mcagent logger names: ${names.size()} written to ${target}")
+    }
+}
+
 def runtimeJar = tasks.register('runtimeJar', Jar) {
     group = 'build'
     description = 'Packages the replaceable runtime (com.melody.mcagent.rt.*) into build/libs/mcagent-runtime.jar.'
@@ -64,6 +96,7 @@ def runtimeJar = tasks.register('runtimeJar', Jar) {
     destinationDirectory = layout.buildDirectory.dir('libs')
     from sourceSets.main.output
     include 'com/melody/mcagent/rt/**'
+    from(mcagentLoggerNames)
     manifest {
         attributes(
                 'Implementation-Title': 'MC Agent runtime',

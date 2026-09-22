@@ -344,11 +344,41 @@ public final class AnvilEnchantSmokeTest implements TestHook {
         return total;
     }
 
+    /**
+     * Put the site back the way it was found.
+     *
+     * <p>This world is shared with every other harness, and the fixtures this test builds - an anvil,
+     * an enchanting table, a ring of bookshelves - are exactly what the structure guard protects. Left
+     * behind, they made an unrelated tunnel test fail with "you are standing inside the player-built
+     * structure": a test that pollutes the world is a test that breaks the next one.
+     */
+    private void cleanUpSite() {
+        if (this.level == null || this.plot == null) {
+            return;
+        }
+        for (int dx = -6; dx <= 6; dx++) {
+            for (int dz = -6; dz <= 6; dz++) {
+                for (int dy = 0; dy <= 2; dy++) {
+                    net.minecraft.core.BlockPos pos = this.plot.offset(dx, dy, dz);
+                    var state = this.level.getBlockState(pos);
+                    if (state.is(Blocks.ANVIL) || state.is(Blocks.ENCHANTING_TABLE)
+                            || state.is(Blocks.BOOKSHELF) || state.is(Blocks.TORCH)
+                            || state.is(Blocks.OAK_PLANKS) || state.is(Blocks.CHEST)
+                            || state.is(Blocks.WHEAT) || state.is(Blocks.FARMLAND)
+                            || state.is(Blocks.RED_BED)) {
+                        this.level.setBlockAndUpdate(pos, Blocks.AIR.defaultBlockState());
+                    }
+                }
+            }
+        }
+    }
+
     private void finishQuietly() {
         if (this.finished) {
             return;
         }
         this.finished = true;
+        this.cleanUpSite();
         if (Agent.botManager() != null) {
             Agent.botManager().remove(BOT);
         }

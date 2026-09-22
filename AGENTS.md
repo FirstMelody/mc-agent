@@ -108,6 +108,8 @@ MCAGENT_FARM_TEST=true      ... runServer --offline   # ripe crops harvested and
 MCAGENT_ARMOR_TEST=true     ... runServer --offline   # hold() puts armour on the body, not in the hand
 MCAGENT_FARMBUILD_TEST=true ... runServer --offline   # chooses its own ground, then tills, waters,
                                                       # lights and sows a field with no planning turns
+MCAGENT_DANGER_TEST=true    ... runServer --offline   # a phantom attack is refused and a wounded bot
+                                                      # drops its job, eats and heads home by itself
 ```
 
 Decompiled Minecraft/NeoForge sources for API reference: `/ymtc/Repos/.mcai-scratch/mcsrc/`
@@ -273,6 +275,31 @@ The most expensive mistakes in this project's history were **confident claims th
   from the mining goal in one way: it only claims a tick when something is ripe, so a growing field
   never swallows the bot. Crop maturity is type-driven (`CropBlock.isMaxAge`, nether wart age), and
   the replant item comes from `Block.getCloneItemStack`, so modded crops work unmodified.
+- **Logs go to their own file, not the console** (`rt/Logging.java`). Everything this mod logs lands
+  in `logs/mcagent.log` (override with `MCAGENT_LOG_FILE`, or `MCAGENT_LOG_CONSOLE=true` for both) -
+  the bot talks constantly and on a server with players on it that buries every other mod's warnings.
+  This means **`latest.log` no longer contains mcagent lines**, so a forensics grep has to read
+  `logs/mcagent.log` (and its rolled `.gz` files). Two things to know if you touch it: log4j2 splits
+  logger names on '.', so `mcagent/brain` is *not* a child of `mcagent` and one logger config cannot
+  cover the mod - hence the generated list of names in the jar (the `mcagentLoggerNames` Gradle task),
+  which means a new logger cannot quietly stay in the console; and the appender is added from the
+  runtime, so routing is hot-deployable rather than a `log4j2.xml` that would change how every other
+  mod logs.
+- **Survival reflexes** (`tickDangerReflex`). Two rules, both of them things a player does without
+  deciding to, and both from production: **phantoms are never fought** (they fly, three attacks came
+  back `target is out of reach`, and four deaths - the bot goes home and sleeps, which is the actual
+  mechanic), and **low health breaks off work** (the job is abandoned, the bot eats, and it walks
+  home; it stays in that state until it has recovered, so a model that re-issues "mine" at 5 health
+  is refused rather than obeyed into its own grave). The harness caught a real gap in the first
+  version: the phantom branch returned before the eating branch ran, so a bot hiding from phantoms at
+  food 4 never regenerated.
+- **Falling blocks are checked above the dig, not just in it.** The excavation macros already refused
+  to *break* gravel or sand; they did not check the block *above the space being cleared*, which is
+  the one a dig drops. Six of production's deaths were "suffocated in a wall" in self-dug shafts, so
+  `ceilingWouldFall` now gates both the escape stair and the tunnel.
+- **Harnesses must clean up their sites.** The dev world is shared by every harness, and a test that
+  leaves an enchanting table and a ring of bookshelves behind makes the next one fail with "you are
+  standing inside the player-built structure" - which is exactly what happened to the tunnel test.
 - **Building a field has an order, and the order is the feature** (`build_farm`, `FarmBuildJob`,
   `rt/perception/FarmSite.java`). Site first, and never on a whim: level ground a hoe will turn, air
   above every cell, no fluid through it, and not inside anything a player built - the guard is asked,

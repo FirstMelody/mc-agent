@@ -2735,3 +2735,66 @@ FARMBUILDTEST VERDICT: PASS
 
 另外记一笔：`PlayerStructure` 里 **torch 同时算建造方块和 fixture**，所以一块插满火把的田可能触发结构保护；
 现在 `protectionReason` 对**作物和耕地**直接放行（收割作物不是拆建筑），火把本身仍然受保护。
+
+---
+
+## 里程碑 15：日志独立成文件、生存反射（幻翼/低血）、砾石埋人
+
+### 15.1 日志不再进 console
+
+`rt/Logging.java`：本 mod 的所有日志写到 **`logs/mcagent.log`**（`MCAGENT_LOG_FILE` 可改，
+`MCAGENT_LOG_CONSOLE=true` 可同时保留 console）。实跑验证：console 里 mcagent 行数 **0**，
+日志文件里 43 行（含测试判定行）。
+
+两个坑，都写进了 AGENTS.md：
+- **log4j2 的 logger 层级是按 `.` 切的，不是 `/`** —— `mcagent/brain` 并不是 `mcagent` 的子 logger，
+  所以一个 logger config 覆盖不了整个 mod。解决办法是构建时从源码里扫出所有 logger 名
+  （新的 Gradle 任务 `mcagentLoggerNames`，41 个）打进 runtime jar，加载时逐个注册；
+  以后新增 logger 也不会悄悄留在 console 里。
+- 做在 runtime 里而不是 `log4j2.xml`：服务器现有的日志配置是好的，换掉会影响**所有** mod 的日志；
+  放在 runtime 里还能跟着 `/mcagent reload` 一起热更新。
+
+**注意**：`latest.log` 里不再有 mcagent 行，以后的取证要读 `logs/mcagent.log`（以及滚动出来的 `.gz`）。
+
+### 15.2 生存反射（用户要求：幻翼不攻击、直接回家睡觉）
+
+`tickDangerReflex()`，每 20 tick 最多跑一次，两条规则：
+
+1. **幻翼永远不打。** 它在天上飞，近战够不着（生产里 4 次死亡 + 3 次 `target is out of reach`），
+   真正的机制是**睡觉**。现在 `startCombat` 直接拒绝幻翼并说明原因，反射会让 bot 回家上床。
+2. **低血（≤8）中断工作**：放弃当前任务、吃东西、往家走；直到恢复到 14 血才解除
+   （所以模型在 5 血时再下令挖矿会被拒绝，而不是被"服从"到死）。中断时**只报告一次**，不刷屏。
+
+实跑 `MCAGENT_DANGER_TEST`：
+
+```
+DANGERTEST wounded the bot mid-job: health 20 -> 5, food 20 -> 4
+DANGERTEST the bot dropped its mining job 6 tick(s) after being wounded
+Bot DangerBot broke off for danger: phantoms are circling and cannot be fought on foot
+Bot DangerBot called attack(target="phantom") -> failed: a phantom cannot be fought on foot - it flies
+    out of reach between dives. They only stop coming if you sleep, so go home and get into bed.
+DANGERTEST state: mineJobSeen=true mineJobDropped=true reflexSaid='phantoms are circling...'
+                  food 4 -> 12 health now 5 blocks from bed 1
+DANGERTEST VERDICT: PASS
+```
+
+**测试自己抓到一个真 bug**：第一版里幻翼分支在吃东西之前就 `return` 了，于是躲幻翼的 bot
+在食物 4 的情况下永远不回复（血量卡在 5）。现在幻翼分支也会先吃。
+
+顺带记录两个"测试环境的坑"：dev server 是 **peaceful**，敌怪一 tick 就被清掉（要先
+`setDifficulty(NORMAL)` 才能测幻翼）；bot 的 playerdata 会跨测试保留（上一轮设的重生点会让这一轮的
+"家附近 96 格禁止开挖"生效，要先清掉）。
+
+### 15.3 砾石/沙子埋人
+
+6 次"窒息在墙里"全是自己挖竖井时被上方落下的砾石/沙子埋的。原来的逃生/隧道宏**只拒绝挖落石方块本身**，
+没有检查**要清空的那格上方** —— 而后者才是会砸下来的那个。新增 `ceilingWouldFall()`，
+逃生阶梯和 dig_tunnel 都按它拒绝这一步。
+
+### 15.4 关于"重生后重走同一条路"
+
+用户明确说不用管（重生后状态是满的，允许重走），所以**没有**做死亡点黑名单。
+
+回归：`MCAGENT_ESCAPE_TEST` PASS、`MCAGENT_TUNNEL_TEST` PASS（先被我自己新测试遗留的附魔台+书架
+误伤过一次，现在所有新 harness 收尾时都会清理自己搭的东西）、`MCAGENT_ANVIL_TEST` PASS、
+`MCAGENT_FARM_TEST` PASS。

@@ -16,6 +16,7 @@ import com.melody.mcagent.rt.bot.ChatThrottleSmokeTest;
 import com.melody.mcagent.rt.bot.ChatInvokeSmokeTest;
 import com.melody.mcagent.rt.bot.CombatSmokeTest;
 import com.melody.mcagent.rt.command.CommandUxSmokeTest;
+import com.melody.mcagent.rt.bot.DangerReflexSmokeTest;
 import com.melody.mcagent.rt.bot.EscapeSmokeTest;
 import com.melody.mcagent.rt.bot.FarmBuildSmokeTest;
 import com.melody.mcagent.rt.bot.FarmSmokeTest;
@@ -72,6 +73,9 @@ public final class RuntimeEntry implements AgentRuntime {
     private boolean live;
 
     public RuntimeEntry() {
+        // First thing on every load: everything after this line goes to the mod's own log file
+        // instead of the server console. See Logging for why it is done from here.
+        Logging.routeToOwnFile();
     }
 
     @Override
@@ -240,6 +244,7 @@ public final class RuntimeEntry implements AgentRuntime {
         add(AnvilEnchantSmokeTest.arm(server));
         add(FarmSmokeTest.arm(server));
         add(FarmBuildSmokeTest.arm(server));
+        add(DangerReflexSmokeTest.arm(server));
         add(ArmorEquipSmokeTest.arm(server));
         add(BrainSmokeTest.arm(server));
         add(CommandSmokeTest.arm(server));

@@ -374,11 +374,37 @@ public final class FarmBuildSmokeTest implements TestHook {
         return sb.toString();
     }
 
+    /**
+     * Remove the house this harness builds to tempt the site search.
+     *
+     * <p>It is planks plus a chest - constructed blocks and a fixture - which is exactly what the
+     * structure guard protects, and this world is shared with every other harness. The field itself
+     * is left alone: farmland and crops are exempt from the guard, so they cannot mislead anything.
+     */
+    private void cleanUpSite() {
+        if (this.level == null || this.plot == null) {
+            return;
+        }
+        net.minecraft.core.BlockPos house = this.plot.offset(7, 0, 0);
+        for (int dx = -1; dx <= 4; dx++) {
+            for (int dz = -1; dz <= 4; dz++) {
+                for (int dy = 0; dy <= 3; dy++) {
+                    net.minecraft.core.BlockPos pos = house.offset(dx, dy, dz);
+                    var state = this.level.getBlockState(pos);
+                    if (state.is(Blocks.OAK_PLANKS) || state.is(Blocks.CHEST)) {
+                        this.level.setBlockAndUpdate(pos, Blocks.AIR.defaultBlockState());
+                    }
+                }
+            }
+        }
+    }
+
     private void finishQuietly() {
         if (this.finished) {
             return;
         }
         this.finished = true;
+        this.cleanUpSite();
         if (Agent.botManager() != null) {
             Agent.botManager().remove(BOT);
         }
