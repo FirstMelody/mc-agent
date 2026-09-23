@@ -1331,8 +1331,6 @@ public final class AgentBrain {
                 : this.bot.blockPosition();
         int radius = (int) Math.max(3, Math.min(24, arg(args, "radius", 8)));
         int ripe = this.ripeCropsIn(new FarmGoal(centre, radius, 0, 0)).size();
-        LOG.info("FARMDEBUG bot={} field set at {} radius {}", this.bot.getName().getString(),
-                centre.toShortString(), radius);
         this.farmGoal = new FarmGoal(centre, radius, ripe, this.bot.level().getGameTime());
         this.cooldownTicks = 0;
         LOG.info("Bot {} is now keeping the field at {} (radius {}): {} ripe crop(s) right now",
@@ -1804,8 +1802,6 @@ public final class AgentBrain {
         }
         field.lastRipeCheckTick = now;
         if (now - field.lastRipePingTick < FARM_RIPE_PING_COOLDOWN_TICKS) {
-            LOG.info("FARMPING bot={} quiet: {}s of ping cooldown left", this.bot.getName().getString(),
-                    (FARM_RIPE_PING_COOLDOWN_TICKS - (now - field.lastRipePingTick)) / 20L);
             return;
         }
         List<Perception.SeenBlock> ripe = this.ripeCropsIn(field);
@@ -1818,9 +1814,6 @@ public final class AgentBrain {
                 ? ripe.size() >= Math.max(1, (int) Math.ceil(crops * FARM_RIPE_FRACTION))
                 : now - field.lastHarvestTick >= FARM_RIPE_ESTIMATE_TICKS;
         if (!roughlyReady) {
-            LOG.info("FARMPING bot={} not ready: ripe={} crops={} sinceHarvest={}s",
-                    this.bot.getName().getString(), ripe.size(), crops,
-                    (now - field.lastHarvestTick) / 20L);
             return;
         }
         String state = "Minecraft farm check. bot=" + this.bot.getName().getString()
@@ -1842,8 +1835,6 @@ public final class AgentBrain {
         JevClient.GateMode mode = adviser == null ? JevClient.GateMode.OFF
                 : adviser.settings().interrupts();
         if (adviser == null || !adviser.settings().isUsable() || mode == JevClient.GateMode.OFF) {
-            LOG.info("FARMPING bot={} adviser unusable: adviser={} gate={}",
-                    this.bot.getName().getString(), adviser == null ? "none" : "present", mode);
             field.lastRipePingTick = now;
             return;
         }
@@ -1904,7 +1895,6 @@ public final class AgentBrain {
             return false;
         }
         if (this.bot.isRemoved() || this.bot.isDeadOrDying()) {
-            LOG.info("FARMDEBUG bot={} cleared by dead_or_removed", this.bot.getName().getString());
             this.farmGoal = null;
             return false;
         }
@@ -1912,8 +1902,6 @@ public final class AgentBrain {
         if (this.bot.getHealth() <= 6.0F) {
             this.actionReports.addLast("farm: stopping, health is "
                     + String.format(java.util.Locale.ROOT, "%.1f", this.bot.getHealth()));
-            LOG.info("FARMDEBUG bot={} cleared by low_health={}", this.bot.getName().getString(),
-                    String.format(java.util.Locale.ROOT, "%.1f", this.bot.getHealth()));
             this.farmGoal = null;
             return false;
         }
@@ -7933,7 +7921,6 @@ public final class AgentBrain {
                     int cancelled = this.queue.size();
                     this.abandonCurrentAction();
                     this.abandonPlan("the bot stopped to do something else");
-                    LOG.info("FARMDEBUG bot={} cleared by interrupt_tool", this.bot.getName().getString());
                     this.miningGoal = null;
                     this.farmGoal = null;
                     if (this.farmBuildJob != null) {

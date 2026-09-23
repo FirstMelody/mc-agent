@@ -83,6 +83,8 @@ public final class BranchMineSmokeTest implements TestHook {
     private int peakOre;
     private int peakIron;
     private int peakBridges;
+    private int peakMainSecondTrip;
+    private int requestsAtReentry = -1;
     private final List<String> failures = new java.util.ArrayList<>();
 
     private BranchMineSmokeTest(MinecraftServer server) {
@@ -132,6 +134,7 @@ public final class BranchMineSmokeTest implements TestHook {
             case 0 -> this.phaseStartTrip(handle);
             case 1 -> this.phasePatternRuns(handle);
             case 2 -> this.phaseEscalate(handle);
+            case 3 -> this.phaseReentry(handle);
             default -> this.finish(null);
         }
     }
@@ -283,6 +286,41 @@ public final class BranchMineSmokeTest implements TestHook {
         this.nextPhase("done");
     }
 
+    /**
+     * Phase 3: the trip the fallback turn started is a re-entry. The bot is deep in its own corridor,
+     * with a working face behind it and a saved route on disk - the route production has watched drag
+     * the bot back to a broken face at 861,26,418 and then home. This runner never consults it: it opens
+     * a new path from where the bot stands. Asserted both ways: new main blocks, and no planning call.
+     */
+    private void phaseReentry(BotManager.BotHandle handle) {
+        if (!this.phaseStarted) {
+            this.phaseStarted = true;
+            this.requestsAtReentry = this.model.requestCount();
+            LOG.info("BRANCHTEST re-entry   : second trip requested at {}", 
+                    handle.player().blockPosition().toShortString());
+            return;
+        }
+        Map<String, Object> state = this.state();
+        if (Boolean.TRUE.equals(state.get("branchMining"))) {
+            this.peakMainSecondTrip = Math.max(this.peakMainSecondTrip,
+                    number(state.get("branchMainBlocks")));
+        }
+        if (this.peakMainSecondTrip >= 1) {
+            int extra = this.model.requestCount() - this.requestsAtReentry;
+            LOG.info("BRANCHTEST re-entry   : second trip dug {} main block(s) from where it stood, "
+                    + "extraRequests={}", this.peakMainSecondTrip, extra);
+            if (extra != 0) {
+                this.fail("re-entering the same corridor bought " + extra + " planning turn(s)");
+            }
+            this.nextPhase("done");
+            return;
+        }
+        if (this.ticks - this.phaseTick > 1500) {
+            this.fail("the second trip never dug from the old corridor: " + state);
+            this.nextPhase("done");
+        }
+    }
+
     private int requestsBefore;
 
     private void begin() {
@@ -330,12 +368,18 @@ public final class BranchMineSmokeTest implements TestHook {
         try {
             AtomicInteger turns = new AtomicInteger();
             int targetY = this.origin.getY();
-            this.model = new ScriptedLlmServer(body -> turns.getAndIncrement() == 0
-                    ? ScriptedLlmServer.toolCall("branch_start", "start_mining",
-                            "{\"mode\":\"branch\",\"y\":" + targetY + ",\"direction\":\"east\","
-                                    + "\"primary\":\"iron_ore\",\"branch_spacing\":3,"
-                                    + "\"branch_length\":4,\"max_branches\":12,\"amount\":0}")
-                    : ScriptedLlmServer.silent());
+                        String startTrip = "{\"mode\":\"branch\",\"y\":" + targetY + ",\"direction\":\"east\","
+                    + "\"primary\":\"iron_ore\",\"branch_spacing\":3,"
+                    + "\"branch_length\":4,\"max_branches\":12,\"amount\":0}";
+            // Turn 0 starts the trip. Turn 1 is the fallback the escalation phase triggers: a model with
+            // the report in front of it would re-issue the trip, and that second trip is the re-entry
+            // case - the bot is already deep inside its own corridor, with a working face behind it and a
+            // route on disk that production has watched drag it back to a broken one. The runner must
+            // open a new path from where it stands, and spend no planning call doing it.
+            this.model = new ScriptedLlmServer(body -> switch (turns.getAndIncrement()) {
+                case 0, 1 -> ScriptedLlmServer.toolCall("branch_trip", "start_mining", startTrip);
+                default -> ScriptedLlmServer.silent();
+            });
             this.savedLlmSettings = ScriptedLlmServer.settings();
             this.model.pointModAtThisServer();
             this.jev = new StubSystemOne();
