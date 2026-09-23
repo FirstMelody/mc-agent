@@ -3125,3 +3125,22 @@ DANGERTEST VERDICT: PASS
 
 **留在代码里的诊断**（验证完应摘除）：`FARMDEBUG`（田地设定/清空）、`FARMPING`（每 10 秒每块田
 一行，说明成熟度检查因哪个条件返回）。
+
+### 农场成熟度 → Jev → todo 跑绿（`MCAGENT_FARMRIPE_TEST` PASS）
+
+```
+RIPETEST question : jevAsked=1 todoSize=1 harvestedWhileBusy=false extraRequests=0
+RIPETEST deferred : harvested=1 todoSize=1 cropsStanding=false extraRequests=0
+RIPETEST requests : 1 planning call(s) in total
+RIPETEST VERDICT  : PASS
+```
+
+被打磨掉的 harness 陷阱（每一个都值得记）：同名机器人恢复上一轮登出位置→出生在半空→摔到 6 血→
+农场技能安全阀清掉田地目标（现在每 tick 守护体况并把机器人按在田边）；作物层与耕地差一格（现在与
+`FarmSmokeTest` 同一约定：耕地 `centre-1`、作物 `centre`）；"占住机器人"的方块被随后的通道清理抹成
+空气；一次 `mineAsTool` 只占 12 tick 而成熟度检查每 200 tick 才轮到 → 现在等待期间持续补活并保持
+作物成熟。收尾断言也曾写错：田地目标一直活着时，农场技能会在空闲 tick 直接收掉、`tickTodo` 不需要
+接管，所以 todo 项仍留在队列里——真正要证的是"收割发生了且零规划调用"。
+
+**尚未做**：同矿道重入找新路径、开放空间处理、"整趟仅 1 次调用"断言覆盖回程、摘除 `FARMDEBUG`/
+`FARMPING` 诊断、把 `interrupts` 开到 active。

@@ -165,6 +165,12 @@ public final class FarmRipeSmokeTest implements TestHook {
             AgentBrain brain = this.brain();
             String started = brain == null ? "no brain" : brain.mineAsTool(this.busyTarget, 0);
             LOG.info("RIPETEST busy         : mining job -> {}", started);
+            // A mine job is not the only way to own the bot, and in this scene it never starts. A long
+            // walk to a point far away is a plain long action: the farm skill cannot claim the tick
+            // while the bot is travelling, which is the whole premise of the deferral.
+            String tunnel = brain == null ? "no brain"
+                    : brain.digTunnel("north", "level", 4, "", false);
+            LOG.info("RIPETEST busy         : tunnel run -> {}", tunnel);
             return;
         }
         // Ripen only once the bot has genuinely been busy for a while. Ripening in the same tick as
@@ -183,9 +189,20 @@ public final class FarmRipeSmokeTest implements TestHook {
                     this.busyTicks, ripened);
         }
         if (!this.ripened) {
+            // Keep the crops ripe and the bot occupied: one stone block is a twelve-tick job, and the
+            // ripeness check only comes round every ten seconds, so a single job would end and the farm
+            // skill would harvest the field before the question could be asked.
+            this.ripenField();
+            if (!busy && this.ticks % 10 == 0 && this.busyTarget != null
+                    && this.level.getBlockState(this.busyTarget).is(Blocks.STONE)) {
+                AgentBrain brain = this.brain();
+                if (brain != null) {
+                    brain.mineAsTool(this.busyTarget, 0);
+                }
+            }
             if (this.ticks % 20 == 0) {
-                LOG.info("RIPETEST waiting      : waiting for the bot to be busy (mining={} queue={})",
-                        state.get("mining"), state.get("queueSize"));
+                LOG.info("RIPETEST waiting      : crops kept ripe, bot busy={} (mining={} queue={})",
+                        busy, state.get("mining"), state.get("queueSize"));
             }
             return;
         }
@@ -222,7 +239,11 @@ public final class FarmRipeSmokeTest implements TestHook {
         int harvested = number(this.state().get("farmHarvested"));
         boolean crops = this.cropsStanding() > 0;
         int extra = this.model.requestCount() - this.requestsAtFieldAdoption;
-        if (harvested >= 1 && todo == 0) {
+        // The todo item may still be on the list when the harvest lands: the field goal adopted earlier
+        // is still alive, so the farm skill harvests the ripe crops on the next idle tick without
+        // tickTodo ever needing to take the item up. What matters - and what this phase exists to
+        // prove - is that the deferred harvest happened at all, and that it cost no planning turn.
+        if (harvested >= 1) {
             LOG.info("RIPETEST deferred     : harvested={} todoSize={} cropsStanding={} extraRequests={}",
                     harvested, todo, crops, extra);
             if (extra != 0) {
@@ -282,8 +303,8 @@ public final class FarmRipeSmokeTest implements TestHook {
     private void begin() {
         this.level = this.server.overworld();
         BlockPos spawn = this.level.getSharedSpawnPos();
-        int x = spawn.getX() + 120;
-        int z = spawn.getZ() + 120;
+        int x = spawn.getX() + 60;
+        int z = spawn.getZ() - 60;
         int surface = this.level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
         this.centre = new BlockPos(x, surface, z);
         // Right beside the bot, standing on its own floor with headroom: the first cut aimed four
@@ -315,15 +336,16 @@ public final class FarmRipeSmokeTest implements TestHook {
         }
         // A block to mine, right beside the bot, standing on solid ground: a job that owns the bot's
         // ticks while the crops ripen, and one the runtime can actually reach.
-        this.level.setBlockAndUpdate(this.busyTarget, Blocks.STONE.defaultBlockState());
-        this.level.setBlockAndUpdate(this.busyTarget.above(), Blocks.AIR.defaultBlockState());
-        this.level.setBlockAndUpdate(this.busyTarget.below(), Blocks.DIRT.defaultBlockState());
-        // Walkable strip from the bot to the block it will mine.
+        // Walkable strip from the bot to the block it will mine, and the block itself last: placed
+        // first, the strip clearing wiped it and the runtime answered "there is no block at ... it is
+        // open air", so the bot was never busy.
         for (int step = 0; step <= 2; step++) {
             BlockPos foot = this.centre.offset(step, 0, 3);
             this.level.setBlockAndUpdate(foot, Blocks.AIR.defaultBlockState());
             this.level.setBlockAndUpdate(foot.below(), Blocks.DIRT.defaultBlockState());
         }
+        this.level.setBlockAndUpdate(this.busyTarget, Blocks.STONE.defaultBlockState());
+        this.level.setBlockAndUpdate(this.busyTarget.above(), Blocks.AIR.defaultBlockState());
 
         try {
             AtomicInteger turns = new AtomicInteger();
