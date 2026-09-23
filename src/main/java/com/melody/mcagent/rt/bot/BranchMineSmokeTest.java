@@ -77,6 +77,11 @@ public final class BranchMineSmokeTest implements TestHook {
     private boolean phaseStarted;
     private int ticks;
     private int requestsAtMiningStart = -1;
+    /** Peaks seen while the trip ran: its counters are gone once it finishes. */
+    private int peakBranches;
+    private int peakMain;
+    private int peakOre;
+    private int peakIron;
     private final List<String> failures = new java.util.ArrayList<>();
 
     private BranchMineSmokeTest(MinecraftServer server) {
@@ -179,12 +184,23 @@ public final class BranchMineSmokeTest implements TestHook {
         int ore = number(state.get("branchOreJobs"));
         int iron = handle.player().getInventory().countItem(Items.RAW_IRON)
                 + handle.player().getInventory().countItem(Items.IRON_ORE);
+        // Sample while the trip is alive: branchBranchesDug and its neighbours disappear with the job,
+        // so reading them after the trip has returned home reports a trip that dug nothing.
+        this.peakBranches = Math.max(this.peakBranches, branches);
+        this.peakMain = Math.max(this.peakMain, main);
+        this.peakOre = Math.max(this.peakOre, ore);
+        this.peakIron = Math.max(this.peakIron, iron);
         if (!this.phaseStarted) {
             this.phaseStarted = true;
             LOG.info("BRANCHTEST pattern    : waiting for branches/ore; buried ore at {}",
                     this.buriedOre.toShortString());
         }
-        if (branches >= 1 && main >= 2 && ore >= 1 && iron >= 1) {
+        if (this.peakBranches >= 1 && this.peakMain >= 2 && this.peakOre >= 1
+                && this.peakIron >= 1) {
+            branches = this.peakBranches;
+            main = this.peakMain;
+            ore = this.peakOre;
+            iron = this.peakIron;
             int requests = this.model.requestCount() - this.requestsAtMiningStart;
             int asked = number(state.get("branchInterruptsAsked"));
             int applied = number(state.get("branchInterruptsApplied"));
@@ -202,8 +218,9 @@ public final class BranchMineSmokeTest implements TestHook {
             return;
         }
         if (this.ticks - this.phaseTick > 3000) {
-            this.fail("the pattern made no progress: branches=" + branches + " mainBlocks=" + main
-                    + " oreJobs=" + ore + " iron=" + iron);
+            this.fail("the pattern made no progress: peak branches=" + this.peakBranches
+                    + " mainBlocks=" + this.peakMain + " oreJobs=" + this.peakOre
+                    + " iron=" + this.peakIron);
             this.nextPhase("done");
         }
     }
@@ -214,8 +231,30 @@ public final class BranchMineSmokeTest implements TestHook {
             this.phaseStarted = true;
             this.jev.answer("mining_interrupt", "ESCALATE_LLM", 0.90D);
             this.requestsBefore = this.model.requestCount();
-            LOG.info("BRANCHTEST escalate   : stub now answers ESCALATE_LLM");
+            // Wear the tools again: the first worn pickaxe has long since broken, and for the
+            // escalation to be reached there has to be something for Jev to be asked about.
+            int worn = 0;
+            for (int slot = 0; slot < handle.player().getInventory().getContainerSize(); slot++) {
+                ItemStack stack = handle.player().getInventory().getItem(slot);
+                if (!stack.isEmpty() && stack.isDamageableItem()
+                        && stack.is(net.minecraft.tags.ItemTags.PICKAXES)) {
+                    stack.setDamageValue(Math.max(0, stack.getMaxDamage() - 15));
+                    worn++;
+                }
+            }
+            LOG.info("BRANCHTEST escalate   : stub now answers ESCALATE_LLM, {} pickaxe(s) worn "
+                    + "again", worn);
             return;
+        }
+        // Keep every pickaxe worn while this phase runs. A 15-use pickaxe breaks after a run or two,
+        // and with it goes the interruption this phase is waiting for - the quiet period after Jev's
+        // first answer is thirty seconds, which is longer than a pickaxe lasts.
+        for (int slot = 0; slot < handle.player().getInventory().getContainerSize(); slot++) {
+            ItemStack stack = handle.player().getInventory().getItem(slot);
+            if (!stack.isEmpty() && stack.isDamageableItem()
+                    && stack.is(net.minecraft.tags.ItemTags.PICKAXES)) {
+                stack.setDamageValue(Math.max(0, stack.getMaxDamage() - 15));
+            }
         }
         // The quiet period after Jev's first answer has to expire before it is asked again; the
         // harness waits for the request rather than shortening production's behaviour for a test.

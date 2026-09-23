@@ -21,10 +21,21 @@ and applied 1`，**全程规划调用 1 次**（开局那次；埋在两格石�
 空闲时段由 `tickTodo()` 以**零规划调用**接管（农场技能自己收割、自己补种）。这条问句故意没有
 ESCALATE：排程问题的合法答案永远包含"以后再说"，没有哪一点值得买一轮 13k token 的规划。
 
-**当前状态（未部署）**：功能实现、`build` 与 `checkRuntimeBoundary` 通过、生产仍是上一版。
-`MCAGENT_BRANCHMINE_TEST` 仍报 FAIL，失败在 harness 自己：它在行程结束后才去读
-`branchBranchesDug` 等键，而那时 job 已清空；`branchOreJobs` 计数器此前从未自增（已修）。
-下一轮：把 harness 改成记录行程中的峰值并让它绿，再补农场 Jev/todo 的 harness，然后热部署。
+**隔离服验证（`MCAGENT_BRANCHMINE_TEST` PASS）**：
+
+```
+BRANCHTEST pattern    : branches=1 mainBlocks=3 oreJobs=1 iron=1 extraRequests=0 jevAsked=1 jevApplied=1
+BRANCHTEST escalate   : extraRequests=1 handedBack=true
+BRANCHTEST requests   : 2 planning call(s) in total (1 to start, 1 fallback)
+```
+
+一次规划调用开局 → 主巷道+分支、透视找到两格石头后的铁矿并采掘、耐久低问 Jev 一次且 KEEP_MINING
+生效，**全程 0 次规划调用**；Jev 答 ESCALATE_LLM 时**恰好 1 次**回退给规划模型并把行程交回。
+harness 自身也踩了两个坑，都值得记：行程结束后 job 已清空，读 `branchBranchesDug` 只会得到 0，
+必须记峰值；15 耐久的镐在一两趟内就断，要触发第二次中断就得持续保持"磨损"状态。
+
+**当前状态（未部署）**：`build` + `checkRuntimeBoundary` 通过，生产仍是上一版。
+下一轮：补农场成熟度/todo 的 harness（`FARMRIPE_TEST`），然后热部署 + 报数字。
 
 ## 2026-09-23（中午四）：无解就取消并告知，不再一直 run
 
