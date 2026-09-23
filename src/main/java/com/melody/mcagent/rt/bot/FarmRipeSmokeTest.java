@@ -126,6 +126,11 @@ public final class FarmRipeSmokeTest implements TestHook {
             this.phaseStarted = true;
             return;
         }
+        // Keep the body sound while the field is adopted: the join can still apply damage for a tick
+        // or two after spawn (fall, suffocation in the restored position), and health <= 6 is what
+        // silently drops the field goal.
+        handle.player().setHealth(20.0F);
+        handle.player().resetFallDistance();
         if (this.model.requestCount() < 1) {
             return;
         }
@@ -340,6 +345,18 @@ public final class FarmRipeSmokeTest implements TestHook {
         // interrupt tool), so the harness measured a bot with no field and nothing to defer. This
         // test is about the ripeness question, not about surviving the night.
         this.level.setDayTime(6000L);
+        // The bot's name is reused between runs, and persistence is the default: the second run of this
+        // harness restored the previous run's health - 6.0, the farm skill's own safety valve - and the
+        // field goal was dropped by it within four seconds of being adopted. FARMDEBUG named it:
+        // "field set at 120,-64,120" then "cleared by low_health=6.0". Reset the body, do not inherit it.
+        handle.player().setHealth(20.0F);
+        handle.player().getFoodData().setFoodLevel(20);
+        // Land it: a reused bot name restores the position it logged out at, which is the previous
+        // run's scene - by then deleted - so it arrives in mid-air and takes fall damage down to 6.0,
+        // the farm skill's own safety valve. Put it on the ground and clear the fall.
+        handle.player().teleportTo(this.centre.getX() + 0.5D, this.centre.getY(),
+                this.centre.getZ() + 3.5D);
+        handle.player().resetFallDistance();
         handle.player().getAbilities().invulnerable = true;
         handle.player().onUpdateAbilities();
         handle.player().getInventory().clearContent();
