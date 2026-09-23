@@ -57,6 +57,7 @@ public final class FarmSmokeTest implements TestHook {
     private String[] savedSettings;
     private boolean started;
     private boolean finished;
+    private boolean nudged;
     private int ticks;
     private int requestsAfterFarmCall = -1;
 
@@ -91,6 +92,18 @@ public final class FarmSmokeTest implements TestHook {
 
         if (this.model == null) {
             return;
+        }
+
+        // Production waits for a task or an event when a bot has no standing goal, so a harness bot
+        // spawned bare never asks its scripted model at all. Give it the operator's own bypass
+        // (/mcagent think) once, then the turn's tool calls keep it deciding on its own.
+        if (!this.nudged && this.ticks > 20) {
+            this.nudged = true;
+            BotManager.BotHandle handle = Agent.botManager() == null
+                    ? null : Agent.botManager().get(BOT);
+            if (handle != null) {
+                TestHook.nudge(handle.player());
+            }
         }
         // The scripted model answers `silent()` to everything after the one farm call, so any extra
         // request is a planning turn the harvest did not need.

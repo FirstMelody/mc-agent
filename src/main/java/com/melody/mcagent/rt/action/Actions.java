@@ -592,9 +592,44 @@ public final class Actions {
         // answer (Equipable.getEquipmentSlot), so modded armour lands correctly too.
         net.minecraft.world.entity.EquipmentSlot bodySlot = bodySlotFor(itemId);
         if (bodySlot != null) {
-            return equipInto(bot, itemQuery, itemId, bodySlot);
+            Result worn = equipInto(bot, itemQuery, itemId, bodySlot);
+            if (worn.success()) {
+                return worn;
+            }
+            // The piece may be in the backpack rather than the 36 ordinary slots. Production: the bot
+            // reported its own diamond helmet sitting in the Curios back-slot backpack, and "hold the
+            // diamond helmet" answered "you are not carrying any 'diamond helmet'" - a true statement
+            // about the wrong inventory, and the reason a hat it owned was never worn.
+            if (takeFromBackpack(bot, itemId, itemQuery) == null) {
+                return worn;
+            }
+            Result retry = equipInto(bot, itemQuery, itemId, bodySlot);
+            return retry.success()
+                    ? Result.ok(retry.message() + " (taken out of your backpack)")
+                    : retry;
         }
 
+        Result inHand = holdInHand(bot, itemQuery, itemId);
+        if (inHand != null) {
+            return inHand;
+        }
+        if (takeFromBackpack(bot, itemId, itemQuery) != null) {
+            Result retry = holdInHand(bot, itemQuery, itemId);
+            if (retry != null) {
+                return Result.ok(retry.message() + " (taken out of your backpack)");
+            }
+        }
+        return Result.fail("you are not carrying any '" + itemQuery + "'");
+    }
+
+    /**
+     * Put a carried item into the hand, or {@code null} when the ordinary inventory does not have it.
+     *
+     * <p>Split out of {@link #holdItem} so the backpack fallback can run the same search again after
+     * taking the item out, instead of duplicating the slot rules.
+     */
+    @Nullable
+    private static Result holdInHand(ServerPlayer bot, String itemQuery, String itemId) {
         var inventory = bot.getInventory();
         String wanted = itemId.toLowerCase(java.util.Locale.ROOT);
 
@@ -623,7 +658,41 @@ public final class Actions {
             return Result.ok("took " + stack.getHoverName().getString()
                     + " out of your pack and are now holding it");
         }
-        return Result.fail("you are not carrying any '" + itemQuery + "'");
+        return null;
+    }
+
+    /**
+     * Take one of an item out of the equipped backpack and into the ordinary inventory.
+     *
+     * <p>The backpack is not part of {@code player.getInventory()}: it lives in Curios' back slot and
+     * keeps its contents in the item itself, so everything the bot owns but stores there is invisible
+     * to a search of the 36 ordinary slots. Tools that ask "do you carry X" call this before saying
+     * no, because "you are not carrying any" about an item the bot can read in its own backpack is
+     * both wrong and unactionable - the model has no way to guess that a separate take step exists.
+     *
+     * <p>One item, never a stack: the callers wear, hold or hand over exactly one.
+     *
+     * @return the item id that was taken out, or null when the backpack has nothing matching
+     */
+    @Nullable
+    static String takeFromBackpack(ServerPlayer bot, @Nullable String itemId, String rawQuery) {
+        ItemStack backpack = Backpacks.equipped(bot);
+        if (backpack == null) {
+            return null;
+        }
+        String wanted = itemId == null ? rawQuery.trim().toLowerCase(java.util.Locale.ROOT) : itemId;
+        for (ItemStack stack : Backpacks.contents(bot)) {
+            if (!matchesItem(stack, wanted, rawQuery)) {
+                continue;
+            }
+            String id = net.minecraft.core.registries.BuiltInRegistries.ITEM
+                    .getKey(stack.getItem()).toString();
+            String moved = Backpacks.move(bot, backpack, false, id, 1);
+            if (!moved.startsWith("failed")) {
+                return id;
+            }
+        }
+        return null;
     }
 
     /**

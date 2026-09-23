@@ -63,8 +63,8 @@ public final class JevMiningRecoverySmokeTest implements TestHook {
     private int ticks;
     private boolean staleWorkQueued;
     private volatile long modelDelayMillis;
-    private int raceArmedAt;
     private boolean raceFired;
+    private int raceFiredAt;
     private int raceSkippedBefore;
     private int staleQueuedAt;
     private int jevCallsBeforePhase;
@@ -122,6 +122,10 @@ public final class JevMiningRecoverySmokeTest implements TestHook {
             case 12 -> this.checkStaleAdviceDiscarded();
             case 13 -> this.startRaceWithPlanningTurn();
             case 14 -> this.checkRecoveryBeatTheTurn();
+            case 15 -> this.startRepeatedFailure();
+            case 16 -> this.secondRepeatedFailure();
+            case 17 -> this.thirdRepeatedFailure();
+            case 18 -> this.checkRepeatedFailureSkipped();
             default -> this.finish(null);
         }
     }
@@ -193,21 +197,23 @@ public final class JevMiningRecoverySmokeTest implements TestHook {
             this.fail("the walled-in target was mined, so the cap scenario did not run");
         }
         this.jevCallsBeforePhase = this.jev.calls();
+        Object skipped = this.brain().debugState().get("jevSkippedMiningTargets");
+        this.raceSkippedBefore = skipped instanceof Integer count ? count : 0;
         this.failTarget();
-        this.nextPhase("the second failure of that target must not be offered a retry");
+        this.nextPhase("the third failure of that target skips locally");
     }
 
     private void checkRetryCapOffered() {
-        if (this.jev.calls() <= this.jevCallsBeforePhase || this.ticks - this.phaseTick < 60) {
+        if (this.ticks - this.phaseTick < 60) {
             return;
         }
-        // Assert on the candidates, not on the raw body: the instruction text names every option, so
-        // a substring search over the whole request always finds RETRY and proves nothing.
-        boolean retryOffered = this.jev.lastOfferedCandidates().contains("RETRY_DIFFERENT_ACCESS");
-        LOG.info("JEVMINETEST retry cap   : retryStillOffered={} (one automatic retry per exact target)",
-                retryOffered);
-        if (retryOffered) {
-            this.fail("RETRY was still offered for a target that already spent its retry");
+        Object after = this.brain().debugState().get("jevSkippedMiningTargets");
+        boolean skipped = after instanceof Integer count && count > this.raceSkippedBefore;
+        int extraCalls = this.jev.calls() - this.jevCallsBeforePhase;
+        LOG.info("JEVMINETEST retry cap   : extraJevCalls={} locallySkipped={}",
+                extraCalls, skipped);
+        if (extraCalls != 0 || !skipped) {
+            this.fail("third failure bought Jev instead of skipping a target that spent its retry");
         }
         this.nextPhase("next case");
     }
@@ -265,6 +271,49 @@ public final class JevMiningRecoverySmokeTest implements TestHook {
             this.fail("stale advice was applied over newer work");
         }
         this.jev.delayMillis = 0L;
+        this.nextPhase("a recovery must still land while a planning turn is running");
+    }
+
+    private void startRepeatedFailure() {
+        this.script("ESCALATE_LLM", 0.90D);
+        this.target = this.target.offset(1, 0, 0);
+        this.level.setBlockAndUpdate(this.target, Blocks.STONE.defaultBlockState());
+        this.jevCallsBeforePhase = this.jev.calls();
+        this.failTarget();
+        this.nextPhase("first failure was evaluated");
+    }
+
+    private void secondRepeatedFailure() {
+        if (this.jev.calls() <= this.jevCallsBeforePhase || this.ticks - this.phaseTick < 20) {
+            return;
+        }
+        this.jevCallsBeforePhase = this.jev.calls();
+        this.failTarget();
+        this.nextPhase("second failure was evaluated");
+    }
+
+    private void thirdRepeatedFailure() {
+        if (this.jev.calls() <= this.jevCallsBeforePhase || this.ticks - this.phaseTick < 20) {
+            return;
+        }
+        this.jevCallsBeforePhase = this.jev.calls();
+        Object before = this.brain().debugState().get("jevSkippedMiningTargets");
+        this.raceSkippedBefore = before instanceof Integer count ? count : 0;
+        this.failTarget();
+        this.nextPhase("third failure must skip locally");
+    }
+
+    private void checkRepeatedFailureSkipped() {
+        if (this.ticks - this.phaseTick < 20) {
+            return;
+        }
+        Object after = this.brain().debugState().get("jevSkippedMiningTargets");
+        boolean skipped = after instanceof Integer count && count > this.raceSkippedBefore;
+        int extraCalls = this.jev.calls() - this.jevCallsBeforePhase;
+        LOG.info("JEVMINETEST repeated   : extraJevCalls={} locallySkipped={}", extraCalls, skipped);
+        if (extraCalls != 0 || !skipped) {
+            this.fail("third failure bought another Jev call instead of skipping the target");
+        }
         this.nextPhase("done");
     }
 
@@ -288,7 +337,6 @@ public final class JevMiningRecoverySmokeTest implements TestHook {
         this.level.setBlockAndUpdate(this.target, Blocks.STONE.defaultBlockState());
         this.jevCallsBeforePhase = this.jev.calls();
         // Let the bot start planning first, then report the failure underneath it.
-        this.raceArmedAt = this.ticks;
         this.nextPhase("a recovery must still land while a planning turn is running");
     }
 
@@ -306,6 +354,7 @@ public final class JevMiningRecoverySmokeTest implements TestHook {
         }
         if (!this.raceFired) {
             this.raceFired = true;
+            this.raceFiredAt = this.ticks;
             // Count from here: SKIP_TARGET is a selector-state change, deliberately not a physical
             // applied=true action. The marker itself is the evidence that the recovery landed.
             Object before = this.brain().debugState().get("jevSkippedMiningTargets");
@@ -313,7 +362,7 @@ public final class JevMiningRecoverySmokeTest implements TestHook {
             this.failTarget();
             return;
         }
-        if (this.ticks - this.raceArmedAt < 200) {
+        if (this.ticks - this.raceFiredAt < 200) {
             return;
         }
         Object after = this.brain().debugState().get("jevSkippedMiningTargets");
@@ -327,7 +376,7 @@ public final class JevMiningRecoverySmokeTest implements TestHook {
         }
         this.modelDelayMillis = 0L;
         this.jev.delayMillis = 0L;
-        this.nextPhase("done");
+        this.nextPhase("repeated failure should stop buying Jev evaluations");
     }
 
     private void script(String choice, double confidence) {
@@ -425,6 +474,10 @@ public final class JevMiningRecoverySmokeTest implements TestHook {
         handle.player().getInventory().add(new ItemStack(Items.DIAMOND_PICKAXE));
         if (!Agent.attachBrain(handle.player())) {
             this.finish("could not attach brain");
+        } else {
+            // The race case intentionally needs an idle planning turn. A goal distinguishes it
+            // from an unassigned bot, which now waits for an external event by default.
+            this.brain().setStandingGoal("校验恢复流程");
         }
         this.phaseTick = this.ticks;
     }
@@ -482,6 +535,10 @@ public final class JevMiningRecoverySmokeTest implements TestHook {
         LOG.info("JEVMINETEST VERDICT     : {}", pass ? "PASS" : "FAIL");
 
         if (Agent.botManager() != null) {
+            AgentBrain brain = this.brain();
+            if (brain != null) {
+                brain.setStandingGoal(null);
+            }
             Agent.botManager().remove(BOT);
             Agent.botManager().wipeSavedData(BOT);
         }

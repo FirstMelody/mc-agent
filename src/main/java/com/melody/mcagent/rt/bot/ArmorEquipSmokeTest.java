@@ -45,6 +45,7 @@ public final class ArmorEquipSmokeTest implements TestHook {
     private String[] savedSettings;
     private boolean started;
     private boolean finished;
+    private boolean nudged;
     private int ticks;
 
     private ArmorEquipSmokeTest(MinecraftServer server) {
@@ -77,6 +78,18 @@ public final class ArmorEquipSmokeTest implements TestHook {
         this.ticks++;
         if (this.model == null) {
             return;
+        }
+
+        // Production waits for a task or an event when a bot has no standing goal, so a harness bot
+        // spawned bare never asks its scripted model at all. Give it the operator's own bypass
+        // (/mcagent think) once, then the turn's tool calls keep it deciding on its own.
+        if (!this.nudged && this.ticks > 20) {
+            this.nudged = true;
+            BotManager.BotHandle handle = Agent.botManager() == null
+                    ? null : Agent.botManager().get(BOT);
+            if (handle != null) {
+                TestHook.nudge(handle.player());
+            }
         }
         if (this.model.requestCount() >= TURNS) {
             this.verify();

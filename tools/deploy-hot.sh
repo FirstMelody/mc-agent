@@ -46,13 +46,15 @@ echo "== deployed $LOCAL (backup .bak.$TS)"
 
 send() { docker exec "$DAEMON" sh -lc "cd '$TOOLS' && /j25/bin/java -cp . Attach $PID '$TOOLS/console-agent.jar' '$1' 2>&1 | tail -1"; }
 
+BEFORE_LOAD=$(wc -l < "$SERVER/logs/mcagent.log")
 send "mcagent reload"
 sleep 8
 # `mcagent reload` can be missing from the live dispatcher (the core registers it, so a runtime that
 # replaced the whole /mcagent node removes it). The verification below would then read the *previous*
 # load line and report success for a reload that never happened, so compare it explicitly.
-LOADED=$(grep -E "MC Agent runtime loaded from" "$SERVER/logs/latest.log" | tail -1 \
-    | grep -o "sha256=[0-9a-f]\{16\}")
+LOADED=$(tail -n +"$((BEFORE_LOAD + 1))" "$SERVER/logs/mcagent.log" \
+    | grep -E "MC Agent runtime loaded from" | tail -1 \
+    | grep -o "sha256=[0-9a-f]\{16\}" || true)
 if [ "$LOADED" != "sha256=$LOCAL" ]; then
     echo "!! the reload did not take effect: the loaded jar reports ${LOADED:-nothing}, not $LOCAL" >&2
     echo "   If /mcagent reload is missing from the dispatcher, run tools/restore-core-commands.sh" >&2
@@ -61,6 +63,7 @@ for bot in "${BOTS[@]}"; do send "mcagent spawn $bot"; sleep 3; done
 sleep 3
 
 echo "== verification (server log)"
-grep -E "MC Agent runtime loaded from" "$SERVER/logs/latest.log" | tail -1 | grep -o "sha256=[0-9a-f]\{16\}" || true
-grep -E "Jev settings applied" "$SERVER/logs/latest.log" | tail -1 | sed 's/.*Jev settings applied: //' | cut -c1-140 || true
+grep -E "MC Agent runtime loaded from" "$SERVER/logs/mcagent.log" | tail -1 | grep -o "sha256=[0-9a-f]\{16\}" || true
+grep -E "Jev settings applied" "$SERVER/logs/mcagent.log" | tail -1 | sed 's/.*Jev settings applied: //' | cut -c1-140 || true
 grep -E "Spawned bot" "$SERVER/logs/latest.log" | tail -1 | cut -c60-160 || true
+if [ "$LOADED" != "sha256=$LOCAL" ]; then exit 1; fi

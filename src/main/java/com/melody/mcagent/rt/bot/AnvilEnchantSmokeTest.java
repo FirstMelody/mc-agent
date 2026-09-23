@@ -63,6 +63,9 @@ public final class AnvilEnchantSmokeTest implements TestHook {
     private String[] savedSettings;
     private boolean started;
     private boolean finished;
+    private boolean nudged;
+    private int lastRequests = -1;
+    private int lastRequestTick;
     private int ticks;
     private int levelsBefore;
     /** What the bot actually starts with: an earlier run can leave items lying on the plot. */
@@ -100,9 +103,37 @@ public final class AnvilEnchantSmokeTest implements TestHook {
         if (this.model == null) {
             return;
         }
+
+        // Production waits for a task or an event when a bot has no standing goal, so a harness bot
+        // spawned bare never asks its scripted model at all. Give it the operator's own bypass
+        // (/mcagent think) once, then the turn's tool calls keep it deciding on its own.
+        if (!this.nudged && this.ticks > 20) {
+            this.nudged = true;
+            BotManager.BotHandle handle = Agent.botManager() == null
+                    ? null : Agent.botManager().get(BOT);
+            if (handle != null) {
+                TestHook.nudge(handle.player());
+            }
+        }
         if (this.model.requestCount() >= TURNS) {
             this.verify();
             return;
+        }
+        // This sequence is deliberately full of refused turns - open_container on an anvil, a bare
+        // use, a stick that cannot be repaired - and the runtime now backs off after two turns that
+        // achieved nothing. What the test measures is whether those refusals are honest, so keep the
+        // scripted sequence moving the way an operator would: ask for a decision again once the bot
+        // has been idle for a while. (The backoff itself is ROUTINGTEST phase 17's subject.)
+        if (this.model.requestCount() != this.lastRequests) {
+            this.lastRequests = this.model.requestCount();
+            this.lastRequestTick = this.ticks;
+        } else if (this.ticks - this.lastRequestTick > 100) {
+            this.lastRequestTick = this.ticks;
+            BotManager.BotHandle handle = Agent.botManager() == null
+                    ? null : Agent.botManager().get(BOT);
+            if (handle != null) {
+                TestHook.nudge(handle.player());
+            }
         }
         if (this.ticks > SEQUENCE_TIMEOUT_TICKS) {
             LOG.error("ANVILTEST VERDICT: FAIL - the scripted sequence stalled after {} request(s)",

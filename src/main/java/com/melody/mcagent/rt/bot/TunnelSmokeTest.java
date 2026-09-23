@@ -31,6 +31,7 @@ public final class TunnelSmokeTest implements TestHook {
     private BlockPos origin;
     private boolean started;
     private boolean finished;
+    private boolean nudged;
     private int ticks;
 
     private TunnelSmokeTest(MinecraftServer server) {
@@ -67,6 +68,13 @@ public final class TunnelSmokeTest implements TestHook {
             return;
         }
         BlockPos at = handle.player().blockPosition();
+        // Production waits for a task or an event when a bot has no standing goal, so a harness bot
+        // spawned bare never asks its scripted model at all. Give it the operator's own bypass
+        // (/mcagent think) once, then the turn's tool calls keep it deciding on its own.
+        if (!this.nudged && this.ticks > 20) {
+            this.nudged = true;
+            TestHook.nudge(handle.player());
+        }
         boolean descended = this.origin != null
                 && at.getX() >= this.origin.getX() + 16
                 && at.getY() <= this.origin.getY() - 7;
@@ -96,15 +104,29 @@ public final class TunnelSmokeTest implements TestHook {
                     : brain.mineAsTool(protectedSurface, 0);
             boolean surfaceIntact = surfaceMine.contains("surface")
                     && level(handle).getBlockState(protectedSurface).is(Blocks.STONE);
+            // The rule protects the ground, not what grows on it. A log standing at the same protected
+            // height must be accepted: refusing it put every tree within 96 blocks of home off limits,
+            // so `mine_resource(oak_wood)` failed on the spot, the plan aborted, the queue drained and
+            // the model was asked again two seconds later - production spent 25 planning turns and 71
+            // refusals in eight minutes moving a few blocks and changing nothing. Stone at that height
+            // stays refused, which is what `surfaceIntact` above asserts.
+            BlockPos harvestable = this.origin.offset(2, 3, 2);
+            level(handle).setBlockAndUpdate(harvestable, Blocks.OAK_LOG.defaultBlockState());
+            String logMine = brain == null ? "no brain" : brain.mineAsTool(harvestable, 0);
+            boolean vegetationHarvestable = !logMine.contains("surface")
+                    && !logMine.startsWith("failed");
             boolean economical = !stonePick.isEmpty() && stonePick.getDamageValue() > 0
                     && !diamondPick.isEmpty() && diamondPick.getDamageValue() == 0;
-            this.finish(drops >= 36 && schema && reused && oneEntrance && surfaceIntact && economical,
+            this.finish(drops >= 36 && schema && reused && oneEntrance && surfaceIntact
+                            && vegetationHarvestable && economical,
                     "moved from " + this.origin.toShortString() + " to " + at.toShortString()
                     + ", cobblestone=" + drops + ", schema=" + schema
                     + ", reused=" + reused + ", oneEntrance=" + oneEntrance
-                    + ", surfaceIntact=" + surfaceIntact + ", economicalTools=" + economical
+                    + ", surfaceIntact=" + surfaceIntact
+                    + ", vegetationHarvestable=" + vegetationHarvestable
+                    + ", economicalTools=" + economical
                     + ", resume='" + resume + "', second='" + secondEntrance
-                    + "', surfaceMine='" + surfaceMine + "'");
+                    + "', surfaceMine='" + surfaceMine + "', logMine='" + logMine + "'");
         } else if (this.ticks > 1600) {
             this.finish(false, "still at " + at.toShortString() + " after 1600 ticks");
         }

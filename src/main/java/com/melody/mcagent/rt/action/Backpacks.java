@@ -1,6 +1,8 @@
 package com.melody.mcagent.rt.action;
 
 import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 
 import net.minecraft.server.level.ServerPlayer;
@@ -255,6 +257,32 @@ public final class Backpacks {
             LOG.debug("BackpackWrapper.fromStack failed: {}", t.toString());
             return null;
         }
+    }
+
+    /**
+     * What the equipped backpack is carrying, as stacks, or an empty list.
+     *
+     * <p>For tools that have to decide about an item the bot owns: the backpack is not part of the
+     * ordinary inventory, so a helmet, a pickaxe or an anvil stored in it is invisible to anything
+     * that only walks {@code player.getInventory()}. Production had exactly that - a diamond helmet
+     * and a spare diamond pickaxe in the Curios back slot, reported by the bot itself, and "you are
+     * not carrying any 'diamond helmet'" from every tool that looked.
+     */
+    public static List<ItemStack> contents(ServerPlayer player) {
+        ItemStack backpack = equipped(player);
+        Object wrapper = backpack == null ? null : wrapper(backpack);
+        IItemHandler contents = wrapper == null ? null : handler(wrapper, "getInventoryHandler");
+        if (contents == null) {
+            return List.of();
+        }
+        List<ItemStack> out = new ArrayList<>();
+        for (int slot = 0; slot < contents.getSlots(); slot++) {
+            ItemStack stack = contents.getStackInSlot(slot);
+            if (!stack.isEmpty()) {
+                out.add(stack);
+            }
+        }
+        return out;
     }
 
     /** Contents and upgrade slots, as text the model can act on. */

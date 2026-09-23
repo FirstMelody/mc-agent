@@ -1,5 +1,240 @@
 # MC Agent — 进度与验证记录
 
+## 2026-09-23（中午四）：无解就取消并告知，不再一直 run
+
+要求：目标做不下去时应当**直接取消执行并告知**，而不是永远重试。现在是两条路。
+
+1. **模型可以主动放弃**：新增 `abandon_goal(reason)` 工具（只在存在持久目标时下发，没有目标时
+   不占 schema token）。固定目标提示里也写清楚了："做不到——缺材料、缺工具，或者世界反复拒绝——
+   就说缺什么并调用 `abandon_goal`，不要再试同一次；诚实放弃好过循环。"
+2. **运行时兜底**：阶梯爬过 60、200 两档（约 13 秒、约 6 个回合）仍然零进展 →
+   `abandonStuckGoal()`：取消计划与当前动作 → 清除持久目标（内存字段与记忆里的
+   `standing_goal_v1` 一起清）→ **给玩家一条不会被节流吞掉的话**（`announceBlocker` 绕开
+   "重复/已发言/叙述/冷却"四道闸，因为"悄悄停下"比多说一句更糟）→ 进入事件等待。
+   聊天、命令、任何可见变化照样唤醒它，目标也可以重新下达。
+   给玩家的话会引用真实失败原因（`no minecraft:diamond in that container`）；运行时内部短语
+   （`the turn asked for work and changed nothing`）换成"连着几次都没有任何进展"，不把内部措辞
+   念给玩家听。
+
+验证：`ROUTINGTEST` phase 18 现在断言三件事——目标被清除（内存与记忆都为空）、**玩家确实收到告知**
+（自己的聊天记录里出现"做不下去"）、调用次数有界。原来还断言"等待档位要爬升"，但放弃本身会把档位
+清零，所以改成"必须给过几次机会才放弃"（≥4 次、≤8 次）。`ROUTINGTEST VERDICT: PASS`。
+生产实测（热部署 `8f07cadf0a031a07` 后）：玩家 12:20 下的"先去 913,63,361 取一颗钻石再修镐"被它
+自己在 12:31:12 放弃并报告，**同一情形部署后只花了 6 次调用就停下**（修复前是 231 次）。
+
+## 2026-09-23（中午三）：卡死的目标一直买轮次 —— 退避阶梯被普通回合重置（我的 bug）
+
+现场验证时我用 `/mcagent goal Agent` 发了一条三步目标（戴头盔 / 放铁砧 / 修好钻石镐），
+最后一步需要钻石而机器人身上没有，于是它卡住了。代价：**25 分钟 231 次调用、306 万 input token**
+（`usage since attach: calls=231 input=3065178 output=16185 cache=73.5%`）。
+
+根因是上午那版退避里的一个洞：等待档位用的是 `noActionStreak`，而它同时是"无动作阶梯"的档位、
+并且**被每一轮普通决策重置**（`handleCompletion` 里
+`if (!redundantIdleStop && !idleReadCandidate) this.noActionStreak = 0;`）。于是 23 次
+`2 plans refused in a row` 每次等到的都是**第 0 档 60 tick = 3 秒**——退避等于没写。
+
+现在退避有自己的状态：
+- `noProgressStreak`：连续"零进展"决策数。零进展 = 整轮调用全被拒，**或**整轮全是干活调用却把
+  可见世界原封不动留着（位置/携带物/背包装备指纹没变、没有队列、没有长动作）。后半条是必须的：
+  生产里卡住的维修是"失败的计划"和"成功的 observe"交替出现，只数彻底失败就永远数不到。
+- `noProgressRung`：等待档位，**只在真的有事发生或出现新输入时清零**（指纹变化、队列/长动作、
+  聊天、命令、目标变更、恢复运行）。
+- 等待按 60/200/600/1200/3600/6000 tick 爬；爬完仍然卡住 → **完全停止**买轮次，改为等聊天/
+  命令/可见变化，并给模型留一句"如果缺东西就说出来然后停下"。
+- 无目标的机器人零进展时直接进入事件等待，不再按秒重试。
+- `sleepUntilSomethingChanges()` 同时武装 `noActionStreak` 与指纹：少了前者，"玩家把缺的钻石
+  塞给它"就再也不会把它叫醒，等于废掉"背包变化即时唤醒"。
+
+验证：`ROUTINGTEST` 新增 **phase 18** —— 站立目标 + 持续被拒的计划，200 tick 内只买 4 次、
+`noProgressRung=2`（修复前这个档位永远是 0，这正是该 phase 的断言）；phase 17（无目标被拒 →
+事件等待，2 次）、phase 10/16（背包变化唤醒，30/35 tick 内 1 次）等全部仍 PASS。
+`build` + `checkRuntimeBoundary` + `deploySmokeServer` 通过，生产热部署 `0ddd7c1464ac60a0`，
+部署后 0 次调用。
+
+纪律：**退避必须有自己的档位状态，任何"普通回合顺手清零"的计数器都不能当梯子用**；另外，
+验证用的目标要么可完成，要么必须自带止损——这次是我发的目标本身不可完成。
+
+## 2026-09-23（中午二）：生产现场又揪出两个 bug —— 计划白名单漏了背包工具、热更新丢目标
+
+第一版修复（`43174e6e`）11:45 热部署后，用 `/mcagent goal Agent` 发了一条把三件事串起来的
+指令现场验证，机器人的行为立刻暴露出两个比原判断更靠前的拦路虎：
+
+1. **`backpack_take` 不在 `PLANNABLE_TOOLS` 里**。模型对"戴上背包里的头盔"给出的是最自然的
+   两步计划 `plan([backpack_take(diamond_helmet), hold(diamond_helmet)])`，而计划校验把它整条
+   拒掉：`plan step 1 uses unsupported action 'backpack_take'` —— 8 分钟内重试了 4 次，帽子
+   一动不动。缺的是全部 6 个背包工具（`backpack`/`_take`/`_put`/`_wear`/`_sort`/`_upgrade`），
+   已补齐（`09be81af`），并加了"模型能调用但计划装不下"的一次性告警，
+   把"两份清单不一致"这种静默错误变成日志里看得见的一行（`plan`/`interrupt`/`complete_goal`/
+   `start_mining` 是四个有意的例外）。
+2. **热更新后持久目标会被事件等待守卫丢掉**。守卫只看内存里的 `standingGoal`，而目标恰恰是
+   为了活过热更新才写进记忆的：重载后机器人 `history=0`、冷却 21 亿 tick、记忆里躺着目标却
+   永远不动。现在守卫先读回 `standing_goal_v1` 再决定是否休眠（`16e8fd6b`），日志原文：
+   `Bot Agent picked its standing goal back up after a reload: 把钻石背包里的钻石头盔戴上…`。
+
+### 生产实测（三个哈希依次 43174e6e → 09be81af → 16e8fd6b，均热更新，未重启服务端）
+
+- `place` 的新报错按设计生效，而且模型立刻纠正了自己：
+  `place(x=895,y=63,z=366,face=up) -> failed: you are holding Diamond Pickaxe, which cannot be
+  placed; name the block you mean with item= (for example item=minecraft:anvil)`，下一轮就改成了
+  `place(…,item=minecraft:anvil)`。旧版这一句是 "nothing happened"，正是它让模型写下"基地内
+  不允许放置方块"并把铁砧塞回背包。
+- `hold(item="minecraft:diamond_pickaxe") -> took Diamond Pickaxe out of your pack and are now
+  holding it`；随后 `repair(x=894,y=63,z=369,item="diamond_pickaxe")` 报的是
+  **"you have nothing to repair Diamond Pickaxe with"** —— `Stations.repair` 先检查该坐标是不是
+  铁砧方块，能走到"缺材料"这一步就说明**铁砧已经落地、可达、镐在手**，整条链路只剩材料。
+- 10 分钟窗口：84 次规划请求、**23 次被拒退避生效**（每次都是"同一件被拒的事又试了一遍"）、
+  **0 条 `refused surface excavation`**（修复前是 8 分钟 71 条）。
+- 存档核对（权威，不是模型自述）：`playerdata` 显示机器人**头上戴着钻石头盔**（Slot 103），
+  随身带铁砧 1、备用钻石头盔 1（耐久 40/363）、附魔钻石镐 1（剩 1232）等；它**身上没有钻石**，
+  所以 `repair` 缺材料是真实情况而非 bug。背包内容存在 `world/data/sophisticatedbackpacks.dat`
+  （物品 component 里只有 `storage_uuid`），该文件里确有一顶保护IV/水下呼吸III/耐久III 的
+  钻石头盔和几把附魔钻石镐，但它是全世界的背包存储，无法确定归属。
+
+### 待确认
+
+- "背包里的帽子"是否就是那顶保护IV 头盔、以及它属于谁的背包：需要人在游戏里打开机器人的
+  钻石背包看一眼。`backpack_take(diamond_helmet)` 报"nothing to take out matching"，而它与
+  `backpack()` 读的是同一个 handler，所以更可能是这件东西不在机器人背的那只包里。
+- 7 耐久的钻石镐在随身物品和背包存储里都没找到（随身那把剩 1232），需要指出它在哪个箱子。
+
+## 2026-09-23（中午）：地表保护放行植被、被拒工作退避、背包里的装备可见
+
+生产 10:42 热部署后仍然"连着好几次 LLM call、只走几步路"。10:42:37–10:50:37 的窗口里
+**25 次规划请求、71 条 refused**，14 次 `plan` 全是 `goto` + `mine_resource`，4 次真正执行的
+`mine_resource` 全被拒。根因是基地地表硬保护**只看 Y、不看方块是什么**：家在 893,64,365，
+96 格内每一棵树原木都落在"表面及其下 4 层"里，于是 `mine_resource(oak_wood/spruce_log)`
+必然失败 → plan 当场中止 → 队列清空 → 空闲路径 2.5 秒后再买一轮。同一条规则还在打机器人
+自己的农场：地块在 906,63,380（离家 20 格），`advanceFarmGoal` 每 tick 重试收割，**一秒 21 条
+拒绝**，同时每 2.5 秒把模型叫醒一次。
+
+### 改了什么
+
+1. **植被不是地面**：`isProtectedHomeSurface` 现在放行原木/树叶/作物/树苗/花/竹/甘蔗/仙人掌/
+   藤/海带/可可（tag 优先，模组方块跟着走）。泥土、石头、耕地照旧保护——规则保护的是地形，
+   而砍一棵树不会让地面留下坑。
+2. **被拒工作算无进展**：新增 `refusedWorkStreak`。一轮里"所有已答调用都被拒，且至少一个是
+   干活工具"记一次；**连续两次**就按无动作阶梯退避（第一次被拒仍给新决策）。两个坑都踩过：
+   判定必须放在 `handleCompletion` 里 cooldown 赋值**之后**（放前面会被普通 cooldown 覆盖，
+   harness 实测被拒计划照样每秒重来一次）；`plan` 工具的结果是
+   "plan stopped at step 1: failed: …"，不以 `failed:` 开头，所以 `isFailure` 看不到它。
+   只读工具（observe/backpack/find_*/recall…）的失败不算被拒——"本服没有 Sophisticated
+   Backpacks 模组"是关于世界的诚实回答，不是世界拒绝了工作。
+3. **背包可见性**：`hold`（盔甲与手持）、`repair`、`enchant` 在玩家 36 格找不到时，从 Curios
+   背槽的背包里取 1 个（`Backpacks.contents` + `Actions.takeFromBackpack`，复用已测过的
+   `Backpacks.move`）。生产里钻石头盔、备用钻石镐、铁砧全在背包内部，而
+   "you are not carrying any 'diamond helmet'" 是一句关于**错误背包**的真话。
+4. **`place` 说人话**：手里拿的不是可放置方块时，不再只回
+   "nothing happened (the block did not accept that item)"，而是说明手里是什么、要用
+   `item=` 指定（并说明背包里的方块会被自动取出）。生产就是这一句让模型写下"基地内不允许
+   放置方块"的笔记，把刚造好的铁砧塞回背包——从此世界上没有铁砧，7 耐久的钻石镐也就无从修。
+5. **收割被拒退避 200 tick 并只报告一次**（原来是每 tick 重试）。
+
+### 验证（隔离服）
+
+- `TUNNELTEST` PASS，新增反向+正向断言 `vegetationHarvestable`：**同一受保护高度上石头仍被拒**
+  （`surfaceIntact=true`），**原木被接受**（`logMine='target 72,-37,72 was perceived through
+  solid terrain; clearing the real approach…'`）。
+- `ROUTINGTEST` PASS，新增 phase 17：被拒计划只买 **2** 轮、随后 `cooldown=2147483529`（事件
+  等待哨兵）。同一阶段在退避失效时实测 **7** 轮——这就是它的阳性对照。
+- `FARMTEST` PASS（6/6 收割、4/4 未熟不动、耕地完好、全程 1 次规划请求）；
+  `ARMORTEST` PASS（整套铁甲穿上、盾在副手、主手空）；`ANVILTEST` PASS（修到满耐久、
+  附魔成功、两条拒绝都诚实）；`STRUCTTEST` PASS（房子一块没少、三条拒绝都在、控制组隧道照挖）。
+- 背包自动取物**未能在隔离服验证**：开发服没有 Sophisticated Backpacks / Curios，`Backpacks`
+  的反射入口返回空，那条分支是 no-op。它只保证"没有背包模组时行为不变"（四个 harness 都过），
+  真正的取物路径需要在有模组的生产服上验证。
+
+### 顺带发现：10:42 的事件等待让 harness 集体空转
+
+"无目标、无事件就不买 LLM/JEV"这条策略（`startDecision` 里的 `unassignedWorkActive` 守卫）
+让所有依赖"机器人自己先做一次决策"的 harness 失效：`TUNNELTEST` 报
+`still at 70,-40,70 after 1600 ticks`，期间**一次模型请求都没有**。新增 `TestHook.nudge`
+（等价 `/mcagent think`，即 COMMAND 触发器这条已文档化的旁路），在 `TUNNELTEST`/`FARMTEST`/
+`ARMORTEST`/`ANVILTEST` 各给一次决策，四个 harness 随即恢复。`ANVILTEST` 与 `STRUCTTEST`
+另需"序列被退避停住时再 nudge 一次"——它们的脚本序列本身就是连着的拒绝（铁砧上的
+open_container、裸 use、修木棍、砸玩家墙），被拒退避会把序列停在第 5 个请求上；这两个测试
+要测的是拒绝话术是否诚实，不是退避策略（那是 ROUTINGTEST phase 17 的题目）。其余 harness
+未逐个复核。
+
+## 2026-09-23：完成目标即清除；空闲事件唤醒；重复挖矿失败本地处理
+
+生产的钻石背包目标已经完成且机器人已向玩家汇报，但 `standing_goal_v1` 仍保留，热更新后又
+重新加载；已用 `/mcagent goal Agent clear` 清除这个旧目标。此前稳定空闲仍每五分钟花 1 次
+约 13.3k prompt token 的规划请求（JEV 为 0），因为定时器会重问相同状态。
+
+现在有两条无需额外模型轮次的目标完成路径：最终汇报可用 `say(goal_complete=true)`，
+无需汇报则用 `complete_goal`。二者都核对当前目标仍是本轮模型看到的版本、没有正在进行的
+工作，成功后删除内存中的 `standing_goal_v1` 和提示词固定目标。只有存在持久目标时才把
+这些额外工具字段发给 LLM；完成后不再增加工具 schema token。目标刚完成就进入事件等待。
+按用户确认，无持久目标、无玩家触发任务时，现在从初始空闲起就等待事件，不买 LLM/JEV；
+聊天、显式命令、位置或携带物品变化仍能唤醒。事件触发的多步任务允许续跑，向玩家报告
+或模型无动作后再等待。安全反射照常运行。队列预取门槛从 6 步降到 1 步：现有步骤继续执行，到最后一个物理动作时再考虑
+下一轮规划，减少执行短队列期间的 JEV/LLM 请求。
+
+挖矿恢复方面，生产历史曾在同一方块失败循环中产生约 118 次 JEV/五分钟。现在同一原点
+第三次失败直接标记为暂时不可达，并跳过 JEV；有恢复请求在飞时不再发重叠请求。标记过期
+或方块改变会清除失败次数，避免永久封锁。隔离服 `JEVMINETEST` 验证第三次失败额外
+JEV 调用 0、目标被标记，首次重试、低置信度及异步竞态仍 PASS。
+
+隔离服 `ROUTINGTEST` 验证最终汇报和静默完成都各只用 1 次 LLM，目标随即为 null，
+完成后冷却进入事件等待（`2147483609` tick 的哨兵值）；完整回归 PASS。
+`CHATINVOKETEST` PASS：玩家聊天仍可立即唤醒。`build`、`deploySmokeServer` PASS。
+
+第一次生产热更新在 10:29 加载 `f2e6f82874118916`，确认旧钻石背包目标未恢复；但空目标
+机器人仍从记忆自行开始砍木头，约半分钟产生多轮规划，说明“多次无动作后休眠”仍不够。
+10:30 暂停生产 bot，随后加入上述无目标初始事件等待。新版 `ROUTINGTEST` 验证无目标
+80 tick 内 0 次请求、放入物品后 35 tick 内恰好 1 次请求；`CHATINVOKETEST` 直接从
+事件等待状态发聊天，验证消息仍触发模型。`JEVMINETEST` 在新事件等待策略下仍 PASS。
+
+最终 runtime 于 10:42:37 热部署，SHA-256
+`21ddf0a3fce1a4c071a655dc35aebb005ad69ae3dc99d8350429a0c41b0a1fac`，本地构建
+与生产 jar 一致。Agent 在原地重新上线、无持久目标；10:43:29 `mcagent status` 显示
+`thinking=false`、事件等待冷却约 21 亿 tick，**重载后 LLM 调用 0、JEV 调用 0**。
+服务端未重启，热部署脚本保留上一 runtime 备份。
+
+## 2026-09-23：生产热部署与空闲调用复核
+
+生产 runtime 已通过 `tools/deploy-hot.sh --no-build Agent` 热更新，运行中加载的
+`mcagent-runtime.jar` SHA-256 为 `cadcd73560a53d486c698aea8f5502b837b3fac22c8bc8ee67484bf9e0aec7ee`，
+与本地构建产物一致；Agent 随后在原位置重新上线，无需重启服务端。部署脚本现从
+`logs/mcagent.log` 检查新加载的哈希（日志此前已从 `latest.log` 独立出去）。第一次
+热更新时脚本仍读旧日志，因此在 reload 成功后提前退出；当时已手动重新 spawn，
+修正脚本后又用它完成最终部署。
+
+生产中无动作退避确实生效：09:59:48 连续 2 次无动作后等待 200 tick，10:00:00
+连续 3 次后等待 600 tick，10:00:32 连续 4 次后等待 1200 tick。重载初期仍恢复了
+“换上钻石背包并报告内容”的持久目标，产生若干不同工具调用；这段时间不代表稳定空闲
+降幅。新增的单独 `stop()` 无事可停、同状态同结果的重复背包/知识读取也会进入退避。
+隔离服 `ROUTINGTEST` 覆盖两类循环并通过，`build`、`deploySmokeServer` 通过。
+
+## 2026-09-23（续）：长期空闲少问模型，背包变化即时唤醒
+
+在无动作退避验证通过后，后续间隔由最高 1200 tick 扩到 3600、6000 tick；长期
+无动作时最多每五分钟重问一次。这个上限仍保证环境变化最终会被发现。bot 的维度、方块位置
+或背包物品/数量/耐久变化会在下一次每秒检查时结束等待；玩家聊天、显式决策、目标变更仍沿
+原来的即时入口。这样对“玩家把需要的物品给了 bot”不会等待五分钟。
+
+隔离服 `ROUTINGTEST` 新增背包唤醒阶段：空闲期间放入绿宝石，30 tick 内出现 1 次规划
+请求；无变化的 140 tick 窗口仍只有 2 次规划请求，显式决策仍在 20 tick 内触发。
+`ROUTINGTEST VERDICT: PASS`，`build` 和 `deploySmokeServer` 通过。长期实际降幅仍需
+同口径生产窗口验证。
+
+## 2026-09-23：空闲无动作退避与挖矿恢复过期守卫
+
+生产 08:41 的五分钟窗口有 61 次规划调用，61 次都没有工具动作；09:21 的窗口有
+72 次规划调用、0 次 JEV 请求，全部落在 `no_work_to_continue`。空闲无动作回复原来只等
+60 tick 就以近乎相同的状态重问，还没有重置决策看门狗，导致正常的空闲等待被报成 `STUCK`。
+
+现在无动作的空闲轮按 60/200/600/1200 tick 退避；聊天、显式 `/mcagent think`、目标变更和
+恢复运行仍可立即触发，工作进行中的无动作回复不累积空闲退避。看门狗只在决策仍在飞时判超时，
+无动作回复也记录为一次已完成的决策。`ROUTINGTEST` 新增阶段验证：140 tick 内只有 2 次
+无动作规划请求，随后显式决策在 20 tick 内再发起 1 次请求。完整 `ROUTINGTEST` PASS。
+
+挖矿恢复的 `newer_work` 守卫从“存在任何 mineJob”改成“存在与失败 job 不同的 mineJob”，
+防止仍在收尾的原 job 被误判成新工作；`JEVMINETEST` PASS（包括过期建议、重试上限、
+低置信度与并发落地）。邻近回归 `CHATINVOKETEST` PASS：聊天在自治冷却期间 2 tick 内触发，
+看门狗轮仍保留消息，远处唯一 bot 也能收到语言请求。隔离服 `build`、`deploySmokeServer`
+通过；未部署生产。
+
 ## 2026-09-22（晚上）：把"降低 LLM 调用"从口号变成可测量的数字
 
 ### 先量化：到底降没降

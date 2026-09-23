@@ -85,7 +85,10 @@ public final class ChatInvokeSmokeTest implements TestHook {
             this.checkForcedTurn(brain);
             return;
         }
-        if (!this.asked && this.model != null && this.model.requestCount() >= 1 && brain != null
+        Object cooldown = brain == null ? null : brain.debugState().get("cooldownTicks");
+        boolean eventWait = cooldown instanceof Integer ticks && ticks > 1_000_000;
+        if (!this.asked && this.model != null
+                && (this.model.requestCount() >= 1 || eventWait) && brain != null
                 && !Boolean.TRUE.equals(brain.debugState().get("thinking"))) {
             this.asked = true;
             this.requestCountBeforeChat = this.model.requestCount();
@@ -94,7 +97,7 @@ public final class ChatInvokeSmokeTest implements TestHook {
             NeoForge.EVENT_BUS.post(new ServerChatEvent(
                     speaker.player(), MESSAGE, Component.literal(MESSAGE)));
             LOG.info("CHATINVOKETEST posted an unnamed chat line from the only other player, inside "
-                    + "an autonomous cooldown");
+                    + (eventWait ? "event-only idle" : "an autonomous cooldown"));
             return;
         }
 

@@ -75,6 +75,11 @@ public final class Stations {
         }
 
         int slot = findSlot(bot, itemQuery);
+        if (slot < 0 && Actions.takeFromBackpack(bot, resolveId(itemQuery), itemQuery) != null) {
+            // A stored tool is still a tool the bot owns. Production had the worn diamond pickaxe in
+            // the Curios back-slot backpack while repair answered "you are not carrying any".
+            slot = findSlot(bot, itemQuery);
+        }
         if (slot < 0) {
             return Actions.Result.fail("you are not carrying any '" + itemQuery + "'");
         }
@@ -92,6 +97,10 @@ public final class Stations {
         ItemStack addition;
         if (materialQuery != null && !materialQuery.isBlank()) {
             int materialSlot = findSlot(bot, materialQuery);
+            if (materialSlot < 0 && Actions.takeFromBackpack(bot, resolveId(materialQuery),
+                    materialQuery) != null) {
+                materialSlot = findSlot(bot, materialQuery);
+            }
             if (materialSlot < 0) {
                 return Actions.Result.fail("you are not carrying any '" + materialQuery + "'");
             }
@@ -106,6 +115,9 @@ public final class Stations {
             bot.getInventory().setItem(materialSlot, ItemStack.EMPTY);
         } else {
             int additionSlot = findAddition(bot, tool, slot);
+            if (additionSlot < 0) {
+                additionSlot = pullAdditionFromBackpack(bot, tool, slot);
+            }
             if (additionSlot < 0) {
                 return Actions.Result.fail("you have nothing to repair " + name + " with: carry a "
                         + "second one, or the material it is made of (a diamond repairs diamond "
@@ -194,6 +206,9 @@ public final class Stations {
         int wanted = offer <= 0 ? 1 : Math.min(offer, MAX_OFFERS);
 
         int slot = findSlot(bot, itemQuery);
+        if (slot < 0 && Actions.takeFromBackpack(bot, resolveId(itemQuery), itemQuery) != null) {
+            slot = findSlot(bot, itemQuery);
+        }
         if (slot < 0) {
             return Actions.Result.fail("you are not carrying any '" + itemQuery + "'");
         }
@@ -350,11 +365,47 @@ public final class Stations {
         return duplicate;
     }
 
-    /** The first inventory slot holding something that answers to this id or name, or -1. */
-    private static int findSlot(ServerPlayer bot, String itemQuery) {
+    /** The registry id a name resolves to, or the raw query when the index does not know it. */
+    private static String resolveId(String itemQuery) {
         var index = com.melody.mcagent.rt.knowledge.KnowledgeManager.get();
         String itemId = index != null ? index.resolveItem(itemQuery) : itemQuery;
-        String wanted = itemId == null ? itemQuery : itemId;
+        return itemId == null ? itemQuery : itemId;
+    }
+
+    /**
+     * Take a repair material - or a duplicate of the tool - out of the equipped backpack.
+     *
+     * <p>Vanilla's own rule decides which it is ({@code Item.isValidRepairItem}), exactly as the
+     * anvil does, and one item is taken because one unit is what a repair consumes. The tool, the
+     * material and the anvil all living in the backpack is the production case.
+     *
+     * @return the ordinary inventory slot the addition landed in, or -1
+     */
+    private static int pullAdditionFromBackpack(ServerPlayer bot, ItemStack tool, int skipSlot) {
+        for (ItemStack candidate : Backpacks.contents(bot)) {
+            if (candidate.isEmpty()) {
+                continue;
+            }
+            if (!tool.getItem().isValidRepairItem(tool, candidate)
+                    && !ItemStack.isSameItemSameComponents(candidate, tool)) {
+                continue;
+            }
+            String id = net.minecraft.core.registries.BuiltInRegistries.ITEM
+                    .getKey(candidate.getItem()).toString();
+            if (Actions.takeFromBackpack(bot, id, id) == null) {
+                continue;
+            }
+            int slot = findAddition(bot, tool, skipSlot);
+            if (slot >= 0) {
+                return slot;
+            }
+        }
+        return -1;
+    }
+
+    /** The first inventory slot holding something that answers to this id or name, or -1. */
+    private static int findSlot(ServerPlayer bot, String itemQuery) {
+        String wanted = resolveId(itemQuery);
         for (int i = 0; i < bot.getInventory().getContainerSize(); i++) {
             if (Actions.matchesItem(bot.getInventory().getItem(i), wanted.toLowerCase(java.util.Locale.ROOT),
                     itemQuery)) {

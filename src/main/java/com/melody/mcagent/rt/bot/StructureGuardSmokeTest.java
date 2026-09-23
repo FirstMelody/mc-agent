@@ -64,6 +64,8 @@ public final class StructureGuardSmokeTest implements TestHook {
     private int houseBlocksBefore;
     private boolean started;
     private boolean finished;
+    private int lastRequests = -1;
+    private int lastRequestTick;
     private boolean phaseTwoStarted;
     private int phaseTwoAtTick = -1;
     private int ticks;
@@ -124,6 +126,16 @@ public final class StructureGuardSmokeTest implements TestHook {
         }
         // Four requests means the model has been shown the result of all three tool calls.
         if (this.model.requestCount() < 4) {
+            // All three of those calls are refused on purpose, and the runtime now backs off after
+            // two turns that achieved nothing. Keep the scripted sequence moving the way an operator
+            // would (/mcagent think) instead of letting the guard under test look like a stall.
+            if (this.model.requestCount() != this.lastRequests) {
+                this.lastRequests = this.model.requestCount();
+                this.lastRequestTick = this.ticks;
+            } else if (this.ticks - this.lastRequestTick > 100) {
+                this.lastRequestTick = this.ticks;
+                TestHook.nudge(handle.player());
+            }
             if (this.ticks > 1200) {
                 this.finish(false, "the scripted model was only asked "
                         + this.model.requestCount() + " times in 1200 ticks");

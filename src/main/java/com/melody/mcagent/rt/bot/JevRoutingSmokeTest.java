@@ -23,6 +23,8 @@ import com.sun.net.httpserver.HttpServer;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.phys.Vec3;
 import org.slf4j.Logger;
@@ -48,6 +50,15 @@ import org.slf4j.LoggerFactory;
  *   5 RESUME with nothing to continue  : plans without asking
  *   6 routing=off positive control     : repeated planning calls return
  *   7 zero-yield standing goal         : one re-plan, then bounded local backoff
+ *   8 repeated idle no-action turns    : back off without consulting Jev
+ *   9 explicit operator decision       : bypass the no-action cooldown immediately
+ *  10 inventory change                 : wake an idle bot before its scheduled retry
+ *  11 redundant stop                   : a tool call that changes nothing also backs off
+ *  12 repeated read                    : an identical query result also backs off
+ *  13 completed goal report             : say clears the pinned and persisted objective in one turn
+ *  14 silent goal completion            : complete_goal clears it without an extra planning turn
+ *  15 no standing goal                  : no autonomous model request while idle
+ *  16 inventory change                  : wakes that event-only wait for one turn
  * </pre>
  * The stub answers by question id, because the speech gate, the mining recovery and the routing layer
  * share one endpoint and a stub that answered whatever arrived first would mis-answer silently.
@@ -67,6 +78,11 @@ public final class JevRoutingSmokeTest implements TestHook {
 
     private final MinecraftServer server;
     private ScriptedLlmServer model;
+    private volatile boolean returnStop;
+    private volatile boolean returnRefusedPlan;
+    private volatile boolean returnBackpack;
+    private volatile boolean returnGoalReport;
+    private volatile boolean returnGoalDone;
     private StubSystemOne jev;
     private String[] savedLlmSettings;
     private Path configPath;
@@ -145,6 +161,17 @@ public final class JevRoutingSmokeTest implements TestHook {
             case 5 -> this.phaseResume();
             case 6 -> this.phaseRoutingOffControl();
             case 7 -> this.phaseZeroYieldBackoff();
+            case 8 -> this.phaseNoActionBackoff();
+            case 9 -> this.phaseCommandDuringBackoff();
+            case 10 -> this.phaseInventoryWake();
+            case 11 -> this.phaseRedundantStopBackoff();
+            case 12 -> this.phaseRepeatedReadBackoff();
+            case 13 -> this.phaseGoalReportCompletion();
+            case 14 -> this.phaseSilentGoalCompletion();
+            case 15 -> this.phaseNoGoalEventWait();
+            case 16 -> this.phaseNoGoalInventoryWake();
+            case 17 -> this.phaseRefusedWorkBackoff();
+            case 18 -> this.phaseNoProgressLadder();
             default -> this.finish(null);
         }
     }
@@ -434,6 +461,317 @@ public final class JevRoutingSmokeTest implements TestHook {
         if (!(avoided instanceof Integer count) || count < 1) {
             this.fail("zero-yield backoff did not record an avoided repeated planning turn");
         }
+        this.nextPhase("repeated idle no-action turns back off");
+    }
+
+    /** The scripted model emits no tools; the third identical idle turn must be delayed. */
+    private void phaseNoActionBackoff() {
+        if (!this.phaseStarted) {
+            this.phaseStarted = true;
+            AgentBrain brain = this.brain();
+            brain.setPaused(true, "routing no-action test");
+            brain.setStandingGoal("无动作退避测试");
+            this.before = this.snapshot();
+            brain.setPaused(false, "routing no-action test");
+            return;
+        }
+        if (this.ticks - this.phaseTick < SETTLE_TICKS) {
+            return;
+        }
+        int turns = this.snapshot().llmCalls() - this.before.llmCalls();
+        Object streak = brainState("noActionStreak");
+        LOG.info("ROUTINGTEST no-action  : modelRequests={} streak={} over {} ticks",
+                turns, streak, SETTLE_TICKS);
+        if (turns != 2 || !(streak instanceof Integer count) || count < 2) {
+            this.fail("repeated no-action idle turns were not delayed after the second request");
+        }
+        this.nextPhase("operator decision bypasses idle backoff");
+    }
+
+    /** A person asking for a decision must not wait out the idle retry timer. */
+    private void phaseCommandDuringBackoff() {
+        if (!this.phaseStarted) {
+            this.phaseStarted = true;
+            this.before = this.snapshot();
+            this.brain().requestDecisionNow();
+            return;
+        }
+        if (this.ticks - this.phaseTick < 20) {
+            return;
+        }
+        int turns = this.snapshot().llmCalls() - this.before.llmCalls();
+        LOG.info("ROUTINGTEST idle command: modelRequests={} within {} ticks",
+                turns, this.ticks - this.phaseTick);
+        if (turns < 1) {
+            this.fail("explicit operator decision waited for the no-action cooldown");
+        }
+        this.nextPhase("inventory change wakes an idle bot");
+    }
+
+    /** A new item can unblock a task; waiting minutes to notice it would defeat the saving. */
+    private void phaseInventoryWake() {
+        if (!this.phaseStarted) {
+            this.phaseStarted = true;
+            this.before = this.snapshot();
+            this.brain().bot().getInventory().add(new ItemStack(Items.EMERALD));
+            return;
+        }
+        if (this.ticks - this.phaseTick < 30) {
+            return;
+        }
+        int turns = this.snapshot().llmCalls() - this.before.llmCalls();
+        LOG.info("ROUTINGTEST idle wake   : modelRequests={} within {} ticks",
+                turns, this.ticks - this.phaseTick);
+        if (turns < 1) {
+            this.fail("inventory changed but idle planning waited for the old cooldown");
+        }
+        this.nextPhase("redundant stop tool calls back off");
+    }
+
+    /** A model can loop on a no-op tool even when it never emits a truly empty turn. */
+    private void phaseRedundantStopBackoff() {
+        if (!this.phaseStarted) {
+            this.phaseStarted = true;
+            AgentBrain brain = this.brain();
+            brain.setPaused(true, "routing redundant-stop test");
+            brain.setStandingGoal("无事可停测试");
+            this.returnStop = true;
+            this.before = this.snapshot();
+            brain.setPaused(false, "routing redundant-stop test");
+            return;
+        }
+        if (this.ticks - this.phaseTick < SETTLE_TICKS) {
+            return;
+        }
+        int turns = this.snapshot().llmCalls() - this.before.llmCalls();
+        Object streak = brainState("noActionStreak");
+        LOG.info("ROUTINGTEST idle stop   : modelRequests={} streak={} over {} ticks",
+                turns, streak, SETTLE_TICKS);
+        if (turns != 2 || !(streak instanceof Integer count) || count < 2) {
+            this.fail("redundant stop calls bypassed the actionless idle backoff");
+        }
+        this.nextPhase("repeated read-only tool result backs off");
+    }
+
+    /** The model can ask the same question again instead of emitting an empty completion. */
+    private void phaseRepeatedReadBackoff() {
+        if (!this.phaseStarted) {
+            this.phaseStarted = true;
+            AgentBrain brain = this.brain();
+            brain.setPaused(true, "routing repeated-read test");
+            brain.setStandingGoal("重复查询测试");
+            this.returnStop = false;
+            this.returnBackpack = true;
+            this.before = this.snapshot();
+            brain.setPaused(false, "routing repeated-read test");
+            return;
+        }
+        if (this.ticks - this.phaseTick < SETTLE_TICKS) {
+            return;
+        }
+        int turns = this.snapshot().llmCalls() - this.before.llmCalls();
+        Object streak = brainState("noActionStreak");
+        LOG.info("ROUTINGTEST idle read   : modelRequests={} streak={} over {} ticks",
+                turns, streak, SETTLE_TICKS);
+        if (turns != 3 || !(streak instanceof Integer count) || count < 2) {
+            this.fail("identical read-only results kept buying planning turns");
+        }
+        this.nextPhase("final report clears the standing goal");
+    }
+
+    private void phaseGoalReportCompletion() {
+        if (!this.phaseStarted) {
+            this.phaseStarted = true;
+            this.returnBackpack = false;
+            this.returnGoalReport = true;
+            this.brain().setStandingGoal("报告测试目标已完成");
+            this.before = this.snapshot();
+            return;
+        }
+        if (this.ticks - this.phaseTick < 40) {
+            return;
+        }
+        int requests = this.snapshot().llmCalls() - this.before.llmCalls();
+        Object streak = brainState("noActionStreak");
+        Object cooldown = brainState("cooldownTicks");
+        String savedGoal = com.melody.mcagent.rt.memory.BotMemory.of(this.server, BOT)
+                .systemValue("standing_goal_v1");
+        LOG.info("ROUTINGTEST goal report: requests={} goal={} streak={} cooldown={}",
+                requests, this.brain().standingGoal(), streak, cooldown);
+        if (requests != 1 || this.brain().standingGoal() != null
+                || savedGoal != null
+                || !(streak instanceof Integer count) || count < 5
+                || !(cooldown instanceof Integer wait) || wait < 1_000_000) {
+            this.fail("final say(goal_complete=true) did not clear the goal and enter idle backoff");
+        }
+        this.nextPhase("silent completion clears the standing goal");
+    }
+
+    private void phaseSilentGoalCompletion() {
+        if (!this.phaseStarted) {
+            this.phaseStarted = true;
+            this.returnGoalReport = false;
+            this.returnGoalDone = true;
+            this.brain().setStandingGoal("静默完成测试目标");
+            this.before = this.snapshot();
+            return;
+        }
+        if (this.ticks - this.phaseTick < 40) {
+            return;
+        }
+        int requests = this.snapshot().llmCalls() - this.before.llmCalls();
+        String savedGoal = com.melody.mcagent.rt.memory.BotMemory.of(this.server, BOT)
+                .systemValue("standing_goal_v1");
+        LOG.info("ROUTINGTEST goal silent: requests={} goal={}",
+                requests, this.brain().standingGoal());
+        if (requests != 1 || this.brain().standingGoal() != null || savedGoal != null) {
+            this.fail("complete_goal did not clear the objective in one planning turn");
+        }
+        this.nextPhase("no standing goal waits for an event");
+    }
+
+    private void phaseNoGoalEventWait() {
+        if (!this.phaseStarted) {
+            this.phaseStarted = true;
+            this.returnGoalDone = false;
+            this.before = this.snapshot();
+            return;
+        }
+        if (this.ticks - this.phaseTick < 80) {
+            return;
+        }
+        int requests = this.snapshot().llmCalls() - this.before.llmCalls();
+        if (requests != 0) {
+            this.fail("no-goal idle bot bought a planning turn without an event");
+        }
+        this.nextPhase("inventory change wakes event-only idle");
+    }
+
+    private void phaseNoGoalInventoryWake() {
+        if (!this.phaseStarted) {
+            this.phaseStarted = true;
+            this.before = this.snapshot();
+            this.brain().bot().getInventory().add(new ItemStack(Items.DIAMOND));
+            return;
+        }
+        if (this.ticks - this.phaseTick < 35) {
+            return;
+        }
+        int requests = this.snapshot().llmCalls() - this.before.llmCalls();
+        LOG.info("ROUTINGTEST no-goal wake: modelRequests={} within {} ticks",
+                requests, this.ticks - this.phaseTick);
+        if (requests != 1) {
+            this.fail("inventory change did not wake exactly one no-goal planning turn");
+        }
+        this.nextPhase("done");
+    }
+
+    /**
+     * Phase 17: a plan the world refuses is not progress, even though the turn had tool calls.
+     *
+     * <p>Production, 10:42-10:50: twenty-five planning turns and seventy-one refusals in eight
+     * minutes, every one a `goto` plus a `mine_resource` whose break was refused by the home rule.
+     * The walk succeeded, the break failed, the plan aborted, the queue drained, and the model was
+     * asked again two seconds later. Neither existing guard can see that: the turn has tool calls, so
+     * it is not "no action", and the plan's first step worked, so nothing looks broken. The refusal
+     * streak is what has to stop it, and this phase is the control that says it does: without the
+     * backoff the same refused plan is re-derived every couple of seconds and this counts three or
+     * four turns instead of two.
+     */
+    private void phaseRefusedWorkBackoff() {
+        if (!this.phaseStarted) {
+            this.phaseStarted = true;
+            this.returnRefusedPlan = true;
+            this.before = this.snapshot();
+            // The operator's own bypass: this phase measures what a refused plan costs, not what
+            // wakes the bot. Every later turn in it is the bot's own decision.
+            this.brain().requestDecisionNow();
+            return;
+        }
+        if (this.ticks - this.phaseTick < SETTLE_TICKS) {
+            return;
+        }
+        Snapshot now = this.snapshot();
+        int turns = now.llmCalls() - this.before.llmCalls();
+        Object cooldown = brainState("cooldownTicks");
+        LOG.info("ROUTINGTEST refused    : modelRequests={} cooldown={} over {} ticks "
+                        + "(one refused plan gets a fresh decision; the second must wait)",
+                turns, cooldown, SETTLE_TICKS);
+        if (turns != 2) {
+            this.fail("refused plans bought " + turns + " planning turn(s); the second refusal must "
+                    + "wait out the backoff instead of planning the same refusal again");
+        }
+        this.returnRefusedPlan = false;
+        this.nextPhase("done");
+    }
+
+    /**
+     * A plan whose first step the world refuses, the deterministic form of production's refusal.
+     *
+     * <p>Mining air is refused with "there is no block at ... - it is open air", which aborts the
+     * plan exactly as the home rule's refusal did, without depending on terrain, a bed or a guard.
+     */
+    private String refusedPlanAnswer() {
+        BlockPos air = this.base.offset(0, 4, 0);
+        return ScriptedLlmServer.toolCall("refused_plan", "plan",
+                "{\"steps\":[{\"tool\":\"mine\",\"arguments\":{\"x\":" + air.getX()
+                        + ",\"y\":" + air.getY() + ",\"z\":" + air.getZ() + "}},"
+                        + "{\"tool\":\"observe\",\"arguments\":{}}]}");
+    }
+
+    /**
+     * Phase 18: a standing goal that cannot be finished is cancelled and reported, not retried forever.
+     *
+     * <p>This is the burn the ladder's own reset caused: production, 11:48-12:11, a goal whose last
+     * step needed a diamond the bot did not have. The refusal backoff fired twenty-three times, every
+     * wait was the first rung, and the bot spent 231 model calls and 3.06M prompt tokens in
+     * twenty-five minutes re-deriving a plan it could not carry out. Waiting longer is the right
+     * answer to a hiccup; the only honest answer to a task with no solution is to stop, say what is
+     * missing, and let a person decide.
+     */
+    private void phaseNoProgressLadder() {
+        if (!this.phaseStarted) {
+            this.phaseStarted = true;
+            this.returnRefusedPlan = true;
+            AgentBrain brain = this.brain();
+            brain.setPaused(true, "no-progress ladder test");
+            brain.setStandingGoal("不可能完成的维修测试");
+            this.before = this.snapshot();
+            brain.setPaused(false, "no-progress ladder test");
+            return;
+        }
+        if (this.ticks - this.phaseTick < 360) {
+            return;
+        }
+        Snapshot now = this.snapshot();
+        int turns = now.llmCalls() - this.before.llmCalls();
+        Object rung = brainState("noProgressRung");
+        String goal = this.brain() == null ? null : this.brain().standingGoal();
+        String savedGoal = com.melody.mcagent.rt.memory.BotMemory.of(this.server, BOT)
+                .systemValue("standing_goal_v1");
+        String said = com.melody.mcagent.rt.perception.ChatLog
+                .recentOwn(this.brain().bot(), 6).stream()
+                .map(com.melody.mcagent.rt.perception.ChatLog.Said::text)
+                .reduce("", (a, b) -> a + " | " + b);
+        LOG.info("ROUTINGTEST stuck goal : modelRequests={} rung={} goal={} said={}",
+                turns, rung, goal, said);
+        if (goal != null || savedGoal != null) {
+            this.fail("a goal that cannot make progress was never abandoned (goal=" + goal
+                    + ", saved=" + savedGoal + ")");
+        }
+        if (!said.contains("做不下去")) {
+            this.fail("the bot abandoned its objective without telling the player why (said='" + said
+                    + "')");
+        }
+        if (turns > 8) {
+            this.fail("a stuck goal bought " + turns + " planning turns before giving up");
+        }
+        if (turns < 4) {
+            this.fail("the objective was abandoned after only " + turns + " turn(s); it must be given "
+                    + "a couple of chances with longer waits first (rung now " + rung + ", which the "
+                    + "abandon itself resets)");
+        }
+        this.returnRefusedPlan = false;
         this.nextPhase("done");
     }
 
@@ -480,7 +818,18 @@ public final class JevRoutingSmokeTest implements TestHook {
         try {
             // A scripted planning model that only counts requests, and a stub System One endpoint
             // whose answer the test chooses. Nothing else stands between a trigger and the model.
-            this.model = new ScriptedLlmServer(body -> ScriptedLlmServer.silent());
+            this.model = new ScriptedLlmServer(body -> this.returnGoalReport
+                    ? ScriptedLlmServer.toolCall("goal_report", "say",
+                            "{\"message\":\"测试目标已完成\",\"goal_complete\":true}")
+                    : this.returnGoalDone
+                            ? ScriptedLlmServer.toolCall("goal_done", "complete_goal", "{}")
+                    : this.returnBackpack
+                            ? ScriptedLlmServer.toolCall("idle_backpack", "backpack", "{}")
+                    : this.returnStop
+                            ? ScriptedLlmServer.toolCall("idle_stop", "stop", "{}")
+                    : this.returnRefusedPlan
+                            ? this.refusedPlanAnswer()
+                            : ScriptedLlmServer.silent());
             this.savedLlmSettings = ScriptedLlmServer.settings();
             this.model.pointModAtThisServer();
             this.jev = new StubSystemOne();
@@ -505,7 +854,7 @@ public final class JevRoutingSmokeTest implements TestHook {
         AgentBrain attached = this.brain();
         if (attached != null) {
             // A previous harness run may have persisted phase 7's standing goal by bot name.
-            attached.setStandingGoal(null);
+            attached.setStandingGoal("测试中的待办目标");
         }
         LOG.info("ROUTINGTEST: {} spawned at {} beside a dirt face and a stone floor at {}", BOT,
                 bot.player().blockPosition(), this.base);

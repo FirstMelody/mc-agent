@@ -33,6 +33,7 @@ import com.melody.mcagent.rt.perception.PlayerStructure;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.tags.BlockTags;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.level.block.FallingBlock;
@@ -118,8 +119,8 @@ public final class AgentBrain {
     private static final int MAX_PLAN_STEPS = 24;
     /** Bound speculative work so a confused model cannot fill an unbounded queue. */
     private static final int MAX_QUEUED_ACTIONS = 32;
-    /** Start asking for the next batch while this many or fewer steps remain. */
-    private static final int PLAN_LOW_WATERMARK = 6;
+    /** Prefetch only while the final physical step runs and nothing remains queued. */
+    private static final int PLAN_LOW_WATERMARK = 1;
     /**
      * Give physical work time to change the world before prefetching another plan.
      *
@@ -129,15 +130,57 @@ public final class AgentBrain {
      * mining controller into an API-call loop.
      */
     private static final int PLAN_PREFETCH_DELAY_TICKS = 40;
+    /** Repeated actionless idle turns retry less often before waiting for an external change. */
+    private static final int[] NO_ACTION_RETRY_TICKS = {60, 200, 600, 1200, 3600, 6000};
+    /**
+     * How many consecutive decisions may achieve nothing before the bot starts waiting.
+     *
+     * <p>One is normal - the model tried something the world said no to, and it deserves a fresh look
+     * at the new state. Two in a row means it is re-deriving work that already failed, which is what a
+     * planning loop looks like from the provider's invoice.
+     */
+    private static final int NO_PROGRESS_BACKOFF_STREAK = 2;
+    /**
+     * Rungs of that ladder after which an objective the bot cannot move is dropped and reported.
+     *
+     * <p>Waiting longer is the right answer to a hiccup and the wrong answer to a task that has no
+     * solution: production spent 231 model calls and 3.06M prompt tokens in twenty-five minutes
+     * retrying a repair that needed a diamond the bot did not have. After waits of 60 and 200 ticks
+     * (thirteen seconds) across half a dozen turns with nothing whatsoever to show, the bot cancels
+     * the work and tells the player what blocked it. New input, or anything it can see changing,
+     * still brings it back - and being told beats being billed.
+     */
+    private static final int NO_PROGRESS_GIVE_UP_RUNG = 2;
+    /** A refused harvest is not a race: the crop is still there, so come back rather than spin. */
+    private static final int FARM_HARVEST_BACKOFF_TICKS = 200;
     /** Tools that make sense as deterministic steps inside a server-side plan. */
     private static final List<String> PLANNABLE_TOOLS = List.of(
             "observe", "goto", "look_at", "say", "eat", "stop", "mine", "hold", "discard", "pickup",
             "sleep", "wake", "place", "use", "open_container", "withdraw", "deposit",
             "craft", "craftable_now", "attack", "chat_command", "find_item", "find_uses",
             "remember", "recall", "forget", "find_resource", "mine_resource", "dig_tunnel",
-            "escape_up", "return_to_spawn", "repair", "enchant", "farm", "build_farm");
+            "escape_up", "return_to_spawn", "repair", "enchant", "farm", "build_farm",
+            // The backpack tools belong here and were simply missing. Production, 11:48: the model
+            // answered "wear the helmet in my backpack, then place the anvil and repair the pickaxe"
+            // with plan([backpack_take(diamond_helmet), hold(diamond_helmet)]) - the natural two-step
+            // sequence - and got "plan step 1 uses unsupported action 'backpack_take'" every time, so
+            // the hat stayed in the pack and the whole plan was refused before anything ran. Taking
+            // something out and putting something in are instant local moves, which is exactly what a
+            // plan step is for; the read-only "backpack" is already treated as a look by isConcurrent.
+            "backpack", "backpack_take", "backpack_put", "backpack_wear", "backpack_sort",
+            "backpack_upgrade");
     /** One escape call stays small enough to fit beside other queued work. */
     private static final int MAX_ESCAPE_STEPS = 8;
+    /**
+     * Tools the model is offered but a plan may not contain, on purpose.
+     *
+     * <p>{@code plan} cannot nest, {@code interrupt} exists to stop the action a plan is running,
+     * {@code complete_goal} ends the task the plan belongs to, and {@code start_mining} hands the bot
+     * to the runtime-owned skill. Everything else the model can call must be either plannable or
+     * listed here - see {@link #warnAboutUnplannableTools}.
+     */
+    private static final List<String> PLANNING_EXCLUSIONS =
+            List.of("plan", "interrupt", "complete_goal", "abandon_goal", "start_mining");
     /** One local tunnel macro covers useful ground while remaining bounded and interruptible. */
     private static final int MAX_TUNNEL_LENGTH = 24;
     /** Radius used when scanning for visible blocks. Scanning is O(r^3), so keep it tight. */
@@ -460,6 +503,43 @@ public final class AgentBrain {
     private int statsPlannerSucceeded;
     private int statsPlannerFailed;
     private int statsPlannerNoAction;
+    private int noActionStreak;
+    private long noActionWakeFingerprint;
+    /**
+     * Consecutive decisions that achieved nothing, and how far up the wait ladder that has climbed.
+     *
+     * <p>Separate from {@link #noActionStreak}, which only sees turns that returned no tool call at
+     * all: a turn that plans a walk and a break does have tool calls, so a bot whose every plan died
+     * on the same refusal kept its streak at zero and bought a fresh 13k-token turn every few seconds.
+     *
+     * <p>The rung is deliberately its own counter. Production, 11:48-12:11: a standing goal that
+     * could not be finished (the repair needed a diamond the bot did not have) fired the backoff
+     * twenty-three times and burned 231 model calls and 3.06M prompt tokens in twenty-five minutes,
+     * because every ordinary turn reset the ladder index in {@link #handleCompletion} - so every one
+     * of those twenty-three waits was the first rung, sixty ticks, three seconds.
+     */
+    private int noProgressStreak;
+    private int noProgressRung;
+    /** The visible state (dimension, position, carried items, backpack) when this decision started. */
+    private long progressFingerprint;
+    /**
+     * Whether the turn just run asked for work and had every answered call refused.
+     *
+     * <p>Recorded inside {@link #runTurn} because the result array it is read from is cleared by
+     * {@link #flushResults} before the caller gets control back - reading it afterwards threw
+     * NullPointerException inside handleCompletion, which the catch there turned into a 100-tick
+     * cooldown and a log line the harness saw as "Error handling LLM completion".
+     */
+    private boolean turnEntirelyRefused;
+    /** The first refusal of the turn, so an abandoned objective can name what actually failed. */
+    private String turnRefusalDetail = "";
+    /** One-shot guard for the offered-vs-plannable consistency warning. */
+    private boolean unplannableToolsChecked;
+    /** A chat, explicit think or physical state change may start work without a standing goal. */
+    private boolean unassignedWorkActive;
+    /** Read-only answers already returned in the same idle state, even if other queries interleave. */
+    private final java.util.Set<String> idleReadSignatures = new java.util.HashSet<>();
+    private long idleReadStateFingerprint;
     private int statsJevRequests;
     private int statsIntercepted;
     private int statsSpeechAvoided;
@@ -625,6 +705,8 @@ public final class AgentBrain {
         @Nullable BlockPos pendingReplant;
         String pendingSeed = "";
         boolean idleReported;
+        /** Tick before which a refused harvest is not retried. */
+        long harvestBlockedUntil;
 
         FarmGoal(BlockPos centre, int radius, int ripeWhenStarted, long startedAt) {
             this.centre = centre.immutable();
@@ -747,6 +829,10 @@ public final class AgentBrain {
     /** A standing objective that is pinned in the prompt and survives compaction. */
     @Nullable
     private String standingGoal;
+    /** Reject an in-flight model answer that tries to finish a newer operator goal. */
+    private long standingGoalVersion;
+    private long decisionGoalVersion;
+    private boolean goalCompletedThisTurn;
 
     /**
      * When paused, this brain makes no decisions and performs no actions.
@@ -1487,6 +1573,9 @@ public final class AgentBrain {
         if (this.mineJob != null || this.isMoving()) {
             return true;
         }
+        if (this.bot.level().getGameTime() < field.harvestBlockedUntil) {
+            return false;
+        }
 
         // Put back what was just harvested. This is a separate tick from the harvest because the
         // block only becomes plantable once the crop is actually gone.
@@ -1533,7 +1622,14 @@ public final class AgentBrain {
         if (started.startsWith("failed")) {
             field.pendingReplant = null;
             field.pendingSeed = "";
+            // A refused crop is not a race: it is still there on the next tick, and retrying it every
+            // tick produced twenty-one identical refusals a second in production (the field sits
+            // twenty blocks from the bed the home rule protects) while the model was woken behind it.
+            // Report it once, wait, and let the refusal streak stop the turn-buying if it persists.
+            field.harvestBlockedUntil =
+                    this.bot.level().getGameTime() + FARM_HARVEST_BACKOFF_TICKS;
             this.actionReports.addLast("farm: " + started);
+            this.noteNoProgress("farm harvest refused");
             return false;
         }
         field.harvested++;
@@ -1865,6 +1961,8 @@ public final class AgentBrain {
      */
     public void primeGoal(String goal) {
         this.history.add(LlmClient.Message.user("YOUR TASK: " + goal));
+        this.noActionStreak = 0;
+        this.clearNoProgress();
         this.cooldownTicks = 0;
     }
 
@@ -1878,6 +1976,11 @@ public final class AgentBrain {
      */
     public void setStandingGoal(@Nullable String goal) {
         this.standingGoal = goal;
+        this.standingGoalVersion++;
+        this.unassignedWorkActive = false;
+        this.cachedToolSchemaTokens = -1;
+        this.noActionStreak = 0;
+        this.clearNoProgress();
         // A changed operator objective is new information: an old empty mining trip and an old
         // CONTINUE answer must not suppress the first decision about it.
         this.lastMiningGoalGained = -1;
@@ -1893,13 +1996,27 @@ public final class AgentBrain {
             this.memory().putSystemValue(STANDING_GOAL_STATE, goal);
         }
 
+        // The identity and ability pins are installed on the first model turn. If a command sets
+        // the goal before then, leave the transcript empty; beginDecision restores this saved value
+        // after creating those two pins, in the correct order and without a duplicate goal.
+        if (!this.initialised) {
+            this.cooldownTicks = 0;
+            return;
+        }
+
         // Rebuild the pinned prefix: identity, abilities, then the goal if one is set.
         while (this.history.size() > 2 && this.pinnedCount > 2) {
             this.history.remove(this.pinnedCount - 1);
             this.pinnedCount--;
         }
         if (goal != null && !goal.isBlank()) {
-            this.history.add(LlmClient.Message.system("YOUR STANDING OBJECTIVE: " + goal));
+            this.history.add(LlmClient.Message.system("YOUR STANDING OBJECTIVE: " + goal
+                    + "\nWhen this objective is actually finished, clear it in the same decision: "
+                    + "use say(goal_complete=true) with your final report, or complete_goal if "
+                    + "no report is needed. Do not keep working on an already completed objective."
+                    + "\nIf it cannot be done - the material or tool it needs is not there, or the "
+                    + "world keeps refusing it - say what is missing and call abandon_goal instead of "
+                    + "trying the same thing again. Giving up honestly is better than looping."));
             this.pinnedCount = 3;
         } else {
             this.pinnedCount = 2;
@@ -1910,6 +2027,37 @@ public final class AgentBrain {
     @Nullable
     public String standingGoal() {
         return this.standingGoal;
+    }
+
+    /** Accept a completion declaration only for the goal this model turn actually saw. */
+    private String completeStandingGoal() {
+        String goal = this.standingGoal;
+        if (goal == null || goal.isBlank()) {
+            return "failed: there is no standing objective to complete";
+        }
+        if (this.decisionGoalVersion != this.standingGoalVersion) {
+            return "failed: the standing objective changed while this decision was in flight";
+        }
+        if (this.isLongActionRunning() || !this.queue.isEmpty() || this.miningGoal != null) {
+            return "failed: work is still running; complete the standing objective after it finishes";
+        }
+        if (this.turnCalls != null && this.executingCallIndex >= 0) {
+            for (int i = this.executingCallIndex + 1; i < this.turnCalls.size(); i++) {
+                String later = this.turnCalls.get(i).name();
+                if (!"remember".equals(later) && !"recall".equals(later)
+                        && !"forget".equals(later)) {
+                    return "failed: finish the remaining actions before declaring the standing "
+                            + "objective complete";
+                }
+            }
+        }
+        this.setStandingGoal(null);
+        this.goalCompletedThisTurn = true;
+        this.actionReports.addLast("the previous standing objective was completed and cleared; "
+                + "do not resume it unless a player assigns it again");
+        LOG.info("Bot {} completed and cleared standing goal: {}",
+                this.bot.getName().getString(), goal);
+        return "standing objective completed and cleared";
     }
 
     public boolean isThinking() {
@@ -1960,6 +2108,8 @@ public final class AgentBrain {
             this.abandonCurrentAction();
         } else {
             // Decide promptly on resume rather than waiting out a stale cooldown.
+            this.noActionStreak = 0;
+            this.clearNoProgress();
             this.cooldownTicks = 0;
             // Unpausing is a trigger in its own right: the bot has to work out what, if anything, it
             // still has to carry on with. Only when it really was paused, so a redundant
@@ -2675,6 +2825,8 @@ public final class AgentBrain {
             return;
         }
 
+        this.noActionStreak = 0;
+        this.clearNoProgress();
         this.cooldownTicks = 0;
         // An operator asking for a decision by name is the one input the cheap layer must never
         // argue with; the trigger travels with the decision so startDecision can say so in the log.
@@ -2727,6 +2879,19 @@ public final class AgentBrain {
         this.tickPendingSleep();
         busy = busy || this.isMoving();
 
+        // Long idle waits are interrupted when the bot moves or receives an item. Neither change
+        // needs a model to detect, and both can make a previously impossible standing goal possible.
+        if (this.noActionStreak > 0 && !busy && this.queue.isEmpty()
+                && !this.thinking.get() && this.cooldownTicks > 0
+                && this.bot.level().getGameTime() % 20L == 0L
+                && this.idleWakeFingerprint() != this.noActionWakeFingerprint) {
+            LOG.info("Bot {} idle wait ended because position or inventory changed",
+                    this.bot.getName().getString());
+            this.noActionStreak = 0;
+            this.cooldownTicks = 0;
+            this.unassignedWorkActive = true;
+        }
+
         // Notice standing still. A bot that cannot move cannot tell anyone by moving, so it has to
         // be told: without this the model sees identical observations, no error from any tool, and
         // has no way to work out that it is wedged rather than waiting.
@@ -2755,7 +2920,9 @@ public final class AgentBrain {
             this.ticksSinceDecision = 0;
         }
         this.ticksSinceDecision++;
-        if (this.ticksSinceDecision > DECISION_WATCHDOG_TICKS) {
+        // A deliberate idle cooldown is not a hung decision. Only an in-flight model call can
+        // time out here; movement and jobs have their own progress checks.
+        if (this.thinking.get() && this.ticksSinceDecision > DECISION_WATCHDOG_TICKS) {
             LOG.warn("Bot {} has not completed a decision in {} ticks (state: {}, paused: {}); forcing one",
                     this.bot.getName().getString(), this.ticksSinceDecision,
                     this.describeCurrentAction(), this.paused);
@@ -3146,6 +3313,33 @@ public final class AgentBrain {
         if (this.paused) {
             return;
         }
+        Trigger requested = this.pendingTrigger;
+        if ((requested == Trigger.IDLE || requested == Trigger.RESUME)
+                && (this.standingGoal == null || this.standingGoal.isBlank())
+                && !this.unassignedWorkActive && this.queue.isEmpty()
+                && !this.isLongActionRunning()
+                && !com.melody.mcagent.rt.perception.ChatLog.shouldRespondPromptly(this.bot)) {
+            // The brain is new after a reload; the memory is not, and a goal is remembered precisely
+            // so it survives one. Parking without reading it back is how that silently stopped
+            // working: production came back from a hot deploy with the goal in memory, history=0, no
+            // decision, and the event-wait cooldown - a bot that had been given a task and would
+            // never do it. Adopting it here also means the guard only ever parks a bot with no task
+            // anywhere, which is what it was written for.
+            String rememberedGoal = this.memory().systemValue(STANDING_GOAL_STATE);
+            if (rememberedGoal != null && !rememberedGoal.isBlank()) {
+                this.setStandingGoal(rememberedGoal);
+                this.cooldownTicks = 0;
+                LOG.info("Bot {} picked its standing goal back up after a reload: {}",
+                        this.bot.getName().getString(), rememberedGoal);
+            } else {
+                // No task and no new event: there is no decision for either model to make. Arm the
+                // existing inventory/position wake path and keep all survival reflexes ticking.
+                this.cooldownTicks = Integer.MAX_VALUE;
+                this.noActionStreak = Math.max(1, this.noActionStreak);
+                this.noActionWakeFingerprint = this.idleWakeFingerprint();
+                return;
+            }
+        }
         if (!this.thinking.compareAndSet(false, true)) {
             return;
         }
@@ -3154,6 +3348,15 @@ public final class AgentBrain {
         Trigger trigger = this.pendingTrigger;
         this.pendingTrigger = Trigger.IDLE;
         this.currentTrigger = trigger;
+        if (trigger == Trigger.CHAT || trigger == Trigger.COMMAND) {
+            this.unassignedWorkActive = true;
+        }
+        if (trigger == Trigger.CHAT || trigger == Trigger.COMMAND) {
+            // New input is new information: a refusal streak from before it says nothing about now.
+            this.noActionStreak = 0;
+            this.clearNoProgress();
+        }
+        this.ticksSinceDecision = 0;
 
         // A mining recovery is in flight: hold the ordinary decision for the fraction of a second it
         // needs, so the cheap answer is not overtaken by the very planning turn it exists to save.
@@ -3222,6 +3425,8 @@ public final class AgentBrain {
      * The caller must already hold that latch.
      */
     private void beginDecision() {
+        // What the bot can see right now, so the next decision can tell progress from churn.
+        this.progressFingerprint = this.idleWakeFingerprint();
         // Snapshot the world state on the server thread; the model only ever sees this snapshot.
         String observation;
         try {
@@ -3288,6 +3493,8 @@ public final class AgentBrain {
         }
         this.history.add(LlmClient.Message.user(observation));
         this.compact();
+        this.decisionGoalVersion = this.standingGoalVersion;
+        this.goalCompletedThisTurn = false;
 
         List<LlmClient.ToolSpec> tools = buildTools();
         List<LlmClient.Message> snapshot = List.copyOf(this.history);
@@ -4073,6 +4280,12 @@ public final class AgentBrain {
 
             if (!completion.hasToolCalls()) {
                 this.statsPlannerNoAction++;
+                if (this.standingGoal == null && !this.isLongActionRunning()
+                        && this.queue.isEmpty()) {
+                    this.unassignedWorkActive = false;
+                }
+                this.ticksSinceDecision = 0;
+                this.lastCompletedTurnTick = this.bot.level().getGameTime();
                 // Prose is private thought, including on chat-triggered turns. A player message must
                 // invoke the model immediately, but it must not force a public answer; speaking is
                 // an explicit say tool call so the model can deliberately stay silent.
@@ -4087,10 +4300,7 @@ public final class AgentBrain {
                                 this.bot.getName().getString(), firstLine(completion.content()));
                     }
                 }
-                // Give it a moment before asking again.
-                this.cooldownTicks = this.respondPromptly ? 8 : 60;
-                this.respondPromptly = false;
-                this.directlyAddressed = false;
+                this.scheduleActionlessRetry("no tool calls");
                 return;
             }
 
@@ -4103,7 +4313,45 @@ public final class AgentBrain {
                         this.bot.getName().getString(), completion.toolCalls().size());
             }
 
+            // A stop while nothing is moving does not change the world. Production had the model
+            // emit that one tool every few seconds, bypassing the no-tool backoff indefinitely.
+            boolean redundantIdleStop = (this.currentTrigger == Trigger.IDLE
+                            || this.currentTrigger == Trigger.RESUME)
+                    && completion.toolCalls().size() == 1
+                    && "stop".equals(completion.toolCalls().get(0).name())
+                    && !this.isLongActionRunning() && this.queue.isEmpty();
+            boolean idleReadCandidate = !redundantIdleStop
+                    && (this.currentTrigger == Trigger.IDLE
+                            || this.currentTrigger == Trigger.RESUME)
+                    && completion.toolCalls().size() == 1
+                    && isRepeatableIdleRead(completion.toolCalls().get(0).name())
+                    && !this.isLongActionRunning() && this.queue.isEmpty();
+            long stateBeforeRead = idleReadCandidate ? this.idleReadStateFingerprint() : 0L;
             this.runTurn(completion.toolCalls());
+            boolean refusedTurn = this.turnEntirelyRefused;
+            boolean repeatedIdleRead = false;
+            if (idleReadCandidate && !this.isLongActionRunning() && this.queue.isEmpty()
+                    && !this.history.isEmpty()) {
+                String result = this.history.get(this.history.size() - 1).content();
+                long stateAfterRead = this.idleReadStateFingerprint();
+                if (result != null && stateBeforeRead == stateAfterRead) {
+                    if (this.idleReadStateFingerprint != stateAfterRead) {
+                        this.idleReadSignatures.clear();
+                        this.idleReadStateFingerprint = stateAfterRead;
+                        this.noActionStreak = 0;
+                    }
+                    LlmClient.ToolCall call = completion.toolCalls().get(0);
+                    repeatedIdleRead = !this.idleReadSignatures.add(
+                            call.name() + '\n' + call.arguments() + '\n' + result);
+                } else {
+                    this.idleReadSignatures.clear();
+                    this.noActionStreak = 0;
+                }
+            }
+            if (!redundantIdleStop && !idleReadCandidate) {
+                this.noActionStreak = 0;
+                this.idleReadSignatures.clear();
+            }
 
             this.turnsCompleted.incrementAndGet();
             this.ticksSinceDecision = 0;
@@ -4123,6 +4371,53 @@ public final class AgentBrain {
                             ? (this.queue.size() < PLAN_LOW_WATERMARK
                                     ? PLAN_PREFETCH_DELAY_TICKS : BUSY_COOLDOWN_TICKS)
                             : 20);
+            // After the cooldown above, not before it: noteNoProgress is what sets a wait, and
+            // assigning the ordinary cooldown afterwards silently discarded it. Measured in the
+            // harness: the refused plan was re-derived every second as if the streak did not exist.
+            boolean workInFlight = this.isLongActionRunning() || !this.queue.isEmpty();
+            if (refusedTurn) {
+                this.noteNoProgress(this.turnRefusalDetail.isEmpty()
+                        ? "every action in the turn was refused" : this.turnRefusalDetail);
+            } else if (!workInFlight && turnAskedForWork(completion.toolCalls())
+                    && this.idleWakeFingerprint() == this.progressFingerprint) {
+                // Calls that "succeeded" and left the world exactly as it was are the other half of
+                // the same problem: production's stuck repair alternated failing plans with
+                // successful observes, so a rule that only counted outright refusals kept resetting.
+                this.noteNoProgress("the turn asked for work and changed nothing");
+            } else {
+                this.clearNoProgress();
+            }
+            if (this.goalCompletedThisTurn && !this.isLongActionRunning() && this.queue.isEmpty()) {
+                // The task is done. A fresh chat, command or inventory change still wakes the bot;
+                // a timer alone should not immediately buy another 12k-token planning turn.
+                this.noActionStreak = NO_ACTION_RETRY_TICKS.length - 1;
+                this.respondPromptly = false;
+                this.scheduleActionlessRetry("standing goal completed");
+                return;
+            }
+            boolean onlyReported = completion.toolCalls().stream().anyMatch(
+                    call -> "say".equals(call.name()))
+                    && completion.toolCalls().stream().allMatch(call -> switch (call.name()) {
+                        case "say", "remember", "recall", "forget" -> true;
+                        default -> false;
+                    });
+            if (this.standingGoal == null && !onlyReported) {
+                this.unassignedWorkActive = true;
+            }
+            if (this.standingGoal == null && onlyReported
+                    && !this.isLongActionRunning() && this.queue.isEmpty()) {
+                this.unassignedWorkActive = false;
+                this.respondPromptly = false;
+                this.scheduleActionlessRetry("finished responding without a standing goal");
+                return;
+            }
+            if ((redundantIdleStop || repeatedIdleRead)
+                    && !this.isLongActionRunning() && this.queue.isEmpty()) {
+                this.statsPlannerNoAction++;
+                this.scheduleActionlessRetry(redundantIdleStop
+                        ? "stop with no movement to stop" : "repeated read with the same result");
+                return;
+            }
             this.respondPromptly = false;
             this.directlyAddressed = false;
         } catch (Throwable t) {
@@ -4131,6 +4426,79 @@ public final class AgentBrain {
         } finally {
             this.thinking.set(false);
         }
+    }
+
+    private static boolean isRepeatableIdleRead(String tool) {
+        return switch (tool) {
+            case "backpack", "backpack_wear", "find_item", "find_uses", "craftable_now",
+                    "recall", "remember" -> true;
+            default -> false;
+        };
+    }
+
+    /** Inventory, position and pinned memory: changes here make a previous read result stale. */
+    private long idleReadStateFingerprint() {
+        long fingerprint = this.idleWakeFingerprint();
+        if (!this.history.isEmpty() && this.history.get(0).content() != null) {
+            fingerprint = 31L * fingerprint + this.history.get(0).content().hashCode();
+        }
+        return fingerprint;
+    }
+
+    /** A completed turn that changed nothing should not buy another identical turn immediately. */
+    private void scheduleActionlessRetry(String reason) {
+        if ((this.standingGoal == null || this.standingGoal.isBlank())
+                && !this.isLongActionRunning() && this.queue.isEmpty()) {
+            this.unassignedWorkActive = false;
+            this.respondPromptly = false;
+            this.cooldownTicks = Integer.MAX_VALUE;
+            this.noActionWakeFingerprint = this.idleWakeFingerprint();
+            this.noActionStreak = Math.max(1, this.noActionStreak + 1);
+            LOG.info("Bot {} idle planner is waiting for chat, command or state change ({})",
+                    this.bot.getName().getString(), reason);
+            return;
+        }
+        // Chat can be intentionally silent; do not let it increase the idle retry delay.
+        // A job still running gets a fast follow-up when it finishes.
+        if (this.respondPromptly) {
+            this.cooldownTicks = 8;
+        } else if (this.isLongActionRunning() || !this.queue.isEmpty()) {
+            this.noActionStreak = 0;
+            this.cooldownTicks = PLAN_PREFETCH_DELAY_TICKS;
+        } else {
+            int index = Math.min(this.noActionStreak, NO_ACTION_RETRY_TICKS.length - 1);
+            this.noActionWakeFingerprint = this.idleWakeFingerprint();
+            this.cooldownTicks = NO_ACTION_RETRY_TICKS[index];
+            this.noActionStreak++;
+            if (this.noActionStreak >= 2) {
+                LOG.info("Bot {} idle planner made no progress {} times ({}); next retry in {} ticks",
+                        this.bot.getName().getString(), this.noActionStreak, reason,
+                        this.cooldownTicks);
+            }
+        }
+        this.respondPromptly = false;
+        this.directlyAddressed = false;
+    }
+
+    /** Cheap changes that can make an actionless observation worth planning from again. */
+    private long idleWakeFingerprint() {
+        long hash = 31L * this.bot.level().dimension().location().hashCode()
+                + this.bot.blockPosition().hashCode();
+        var inventory = this.bot.getInventory();
+        for (int slot = 0; slot < inventory.getContainerSize(); slot++) {
+            var stack = inventory.getItem(slot);
+            hash = 31L * hash + net.minecraft.world.item.ItemStack.hashItemAndComponents(stack);
+            hash = 31L * hash + stack.getCount();
+            hash = 31L * hash + stack.getDamageValue();
+        }
+        // Curios' back slot is outside the ordinary player inventory. Include the equipped
+        // backpack's item/components so a newly worn or upgraded pack wakes an idle bot too.
+        var backpack = com.melody.mcagent.rt.action.Backpacks.equipped(this.bot);
+        if (backpack != null) {
+            hash = 31L * hash + net.minecraft.world.item.ItemStack.hashItemAndComponents(backpack);
+            hash = 31L * hash + backpack.getCount();
+        }
+        return hash;
     }
 
     /**
@@ -4199,8 +4567,76 @@ public final class AgentBrain {
             }
         }
 
+        this.turnEntirelyRefused = this.turnWasEntirelyRefused(calls);
         this.turnAbandoned = false;
         this.flushResults();
+    }
+
+    /**
+     * True when every tool call this turn answered with a failure and at least one asked for work.
+     *
+     * <p>Read-only calls are excluded on purpose. "This server does not have the Sophisticated
+     * Backpacks mod" and "no perceived block matches 'iron_ore'" are honest answers about the world,
+     * not the world refusing work, and counting them made a bot that was merely asking questions look
+     * like one whose plans kept dying - which the routing harness caught: its repeated-read phase
+     * bought two turns instead of three, and the phase after it saw no decisions at all.
+     */
+    private boolean turnWasEntirelyRefused(List<LlmClient.ToolCall> calls) {
+        boolean askedForWork = false;
+        int answered = 0;
+        String detail = "";
+        for (int i = 0; i < this.turnResults.length; i++) {
+            String result = this.turnResults[i];
+            if (result == null || result.startsWith("queued:")) {
+                continue;
+            }
+            answered++;
+            if (!isRefusedResult(result)) {
+                return false;
+            }
+            if (detail.isEmpty()) {
+                detail = i < calls.size() ? calls.get(i).name() + ": " + firstLine(result)
+                        : firstLine(result);
+            }
+            if (i < calls.size() && !isReadOnlyTool(calls.get(i).name())) {
+                askedForWork = true;
+            }
+        }
+        this.turnRefusalDetail = detail;
+        return answered > 0 && askedForWork;
+    }
+
+    /**
+     * Whether a tool result means the world refused the work.
+     *
+     * <p>{@code isFailure} is not enough on its own: the {@code plan} tool runs its steps inside the
+     * call and reports "plan stopped at step 1: failed: ...", which does not start with "failed" and
+     * so slipped past the first version of this check - the harness showed the same refused plan
+     * being re-derived every second with the streak still at zero.
+     */
+    private static boolean isRefusedResult(String result) {
+        return result != null && (result.startsWith("failed")
+                || result.startsWith("plan stopped at step"));
+    }
+
+    /** Whether any call this turn was something other than a look at the world. */
+    private static boolean turnAskedForWork(List<LlmClient.ToolCall> calls) {
+        for (LlmClient.ToolCall call : calls) {
+            if (!isReadOnlyTool(call.name())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Tools that only look at the world, so a failure from one is not the world refusing work. */
+    private static boolean isReadOnlyTool(String tool) {
+        return switch (tool) {
+            case "observe", "look_at", "say", "remember", "recall", "forget", "find_item",
+                    "find_uses", "find_resource", "craftable_now", "backpack", "backpack_wear",
+                    "backpack_sort", "stop", "interrupt", "complete_goal", "chat_command" -> true;
+            default -> false;
+        };
     }
 
     /**
@@ -4210,8 +4646,11 @@ public final class AgentBrain {
      * moment one of them starts something long, the loop stops and the rest wait for it.
      */
     private void runQueued() {
+        boolean ranSomething = false;
+        boolean refusedThisDrain = false;
         while (!this.queue.isEmpty() && !this.isLongActionRunning()) {
             QueuedCall next = this.queue.pollFirst();
+            ranSomething = true;
             String result = next.call.id().startsWith("plan_step_")
                     ? this.executePlanStep(next.call)
                     : this.execute(next.call);
@@ -4234,12 +4673,141 @@ public final class AgentBrain {
                         + " failed; discarded " + discarded
                         + " dependent step(s) and requested a fresh decision");
                 this.cooldownTicks = 0;
+                refusedThisDrain = true;
+                this.noteNoProgress(next.call.name() + ": " + firstLine(result));
                 break;
             }
         }
         if (this.queue.isEmpty()) {
             this.authorisedTunnelClearance.clear();
+            if (ranSomething && !refusedThisDrain
+                    && this.idleWakeFingerprint() != this.progressFingerprint) {
+                // The plan ran to its end and the bot can see that something changed. A plan that
+                // completed without changing anything is still a plan that achieved nothing.
+                this.clearNoProgress();
+            }
         }
+    }
+
+    /**
+     * Record a decision that achieved nothing, and wait longer each time it happens again.
+     *
+     * <p>Production, 10:42-10:50: twenty-five planning turns and seventy-one refusals in eight
+     * minutes, every plan a `goto` plus a `mine_resource` whose break was refused - the bot walked a
+     * few blocks, changed nothing, and bought another 13k-token turn two seconds later. None of the
+     * existing guards could see it: the turns had tool calls, so they were not "no action", and the
+     * first step of each plan succeeded, so nothing was obviously broken.
+     *
+     * <p>The first no gets its fresh decision - the world may have changed, and the model may well
+     * choose differently. From the second on, the wait climbs 60/200/600/1200/3600/6000 ticks, and
+     * once that ladder is spent the bot stops buying turns at all until something it can see changes
+     * or a person says something. A bot that keeps spending 13k-token turns on work it cannot do is
+     * worse for everybody than one that stops and asks.
+     */
+    private void noteNoProgress(String what) {
+        this.noProgressStreak++;
+        if (this.noProgressStreak < NO_PROGRESS_BACKOFF_STREAK) {
+            return;
+        }
+        this.noProgressStreak = 0;
+        this.respondPromptly = false;
+        this.directlyAddressed = false;
+        String why = firstLine(what);
+        boolean hasGoal = this.standingGoal != null && !this.standingGoal.isBlank();
+        if (!hasGoal) {
+            // Nothing to work on anyway: wait for an event rather than for a timer.
+            this.unassignedWorkActive = false;
+            this.sleepUntilSomethingChanges();
+            LOG.info("Bot {} is getting nowhere ({}); waiting for chat, a command or a change",
+                    this.bot.getName().getString(), why);
+            return;
+        }
+        if (this.noProgressRung >= NO_PROGRESS_GIVE_UP_RUNG) {
+            this.abandonStuckGoal(why);
+            return;
+        }
+        int wait = NO_ACTION_RETRY_TICKS[this.noProgressRung];
+        this.noProgressRung++;
+        this.cooldownTicks = wait;
+        LOG.info("Bot {} made no progress ({}, rung {}/{}); next attempt in {} ticks",
+                this.bot.getName().getString(), why, this.noProgressRung,
+                NO_ACTION_RETRY_TICKS.length, wait);
+    }
+
+    /**
+     * Stop buying turns until the bot can see a change, or a person says something.
+     *
+     * <p>{@code noActionStreak} has to be armed as well as the fingerprint: the tick that ends a long
+     * idle wait is gated on {@code noActionStreak > 0 && fingerprint != noActionWakeFingerprint}, so
+     * parking without it would be a bot that never notices the diamond it asked for being handed to
+     * it - the exact opposite of the "inventory change wakes an idle bot" rule.
+     */
+    private void sleepUntilSomethingChanges() {
+        this.cooldownTicks = Integer.MAX_VALUE;
+        this.noActionStreak = Math.max(1, this.noActionStreak + 1);
+        this.noActionWakeFingerprint = this.idleWakeFingerprint();
+    }
+
+    /**
+     * Give up on a standing objective that will not move, cancel its work, and say why.
+     *
+     * <p>The alternative - which production lived through - is a bot that keeps buying 13k-token
+     * turns for a task it cannot do. Dropping the goal is honest and reversible: the objective is
+     * gone from memory, the queue and the current action are cancelled, the player is told what was
+     * missing, and chat, a command or anything the bot can see changing wakes it again.
+     *
+     * @param reason what the last attempt failed with, or the model's own explanation
+     */
+    private String abandonStuckGoal(String reason) {
+        String goal = this.standingGoal;
+        if (goal == null || goal.isBlank()) {
+            return "failed: there is no standing objective to abandon";
+        }
+        String why = firstLine(reason == null || reason.isBlank() ? "no progress" : reason);
+        this.abandonPlan("the standing objective was abandoned as blocked");
+        this.abandonCurrentAction();
+        this.setStandingGoal(null);
+        this.unassignedWorkActive = false;
+        this.sleepUntilSomethingChanges();
+        this.actionReports.addLast("you gave up on the objective (" + why + ") and told the player; "
+                + "do not resume it unless somebody asks");
+        LOG.warn("Bot {} abandoned its standing objective after no progress ({}): {}",
+                this.bot.getName().getString(), why, goal);
+        // A real tool failure is worth quoting verbatim - "no minecraft:diamond in that container"
+        // tells the player exactly what to hand over. The runtime's own phrases ("the turn asked for
+        // work and changed nothing") are internal wording and read like a bug report in chat.
+        String forPlayer = why.contains("failed") ? why : "连着几次都没有任何进展";
+        this.announceBlocker("这个目标我做不下去了：" + goal + "（卡在：" + forPlayer
+                + "）。我先停下，需要你给材料或者换个说法。");
+        return "objective abandoned and the blocker reported to the player";
+    }
+
+    /**
+     * Say something the player has to know, even when the chat throttles would hold it back.
+     *
+     * <p>The throttles exist to stop the model narrating its own plans. A bot that has just given up
+     * is the one case where silence is worse than an extra line: the player would be left with a bot
+     * that stopped for no visible reason.
+     */
+    private void announceBlocker(String message) {
+        String line = tidySpoken(message);
+        if (line.isEmpty()) {
+            return;
+        }
+        Actions.Result sent = Actions.chat(this.bot, line);
+        if (sent.success()) {
+            this.recordSpoken(line, this.bot.level().getGameTime());
+            LOG.info("Bot {} said (blocker): {}", this.bot.getName().getString(), line);
+        } else {
+            LOG.warn("Bot {} could not report a blocker: {}", this.bot.getName().getString(),
+                    sent.message());
+        }
+    }
+
+    /** Something changed, or new input arrived: the no-progress ladder starts over. */
+    private void clearNoProgress() {
+        this.noProgressStreak = 0;
+        this.noProgressRung = 0;
     }
 
     /**
@@ -4664,8 +5232,33 @@ public final class AgentBrain {
 
     // --- tool definitions -----------------------------------------------------------------------
 
+    /**
+     * Say once, loudly, when a tool the model is offered cannot appear in a plan.
+     *
+     * <p>This is the exact shape of a bug that cost hours in production: the backpack tools were
+     * offered but absent from {@link #PLANNABLE_TOOLS}, so the model's natural two-step answer to
+     * "wear the helmet in your backpack" - take it out, then wear it - was rejected whole with "plan
+     * step 1 uses unsupported action 'backpack_take'", and the hat sat in the pack while the bot
+     * re-planned the same refused sequence. A silent inconsistency between two lists is what made it
+     * invisible, so the inconsistency itself is now reported.
+     */
+    private void warnAboutUnplannableTools(List<LlmClient.ToolSpec> tools) {
+        if (this.unplannableToolsChecked) {
+            return;
+        }
+        this.unplannableToolsChecked = true;
+        for (LlmClient.ToolSpec tool : tools) {
+            if (!PLANNABLE_TOOLS.contains(tool.name())
+                    && !PLANNING_EXCLUSIONS.contains(tool.name())) {
+                LOG.warn("Tool '{}' is offered to the model but a plan cannot contain it; add it to "
+                        + "PLANNABLE_TOOLS or to PLANNING_EXCLUSIONS", tool.name());
+            }
+        }
+    }
+
     private List<LlmClient.ToolSpec> buildTools() {
         List<LlmClient.ToolSpec> tools = new ArrayList<>();
+        boolean hasStandingGoal = this.standingGoal != null && !this.standingGoal.isBlank();
 
         tools.add(new LlmClient.ToolSpec("plan",
                 "Preferred for every task with two or more known actions. Submit one compact, "
@@ -4705,8 +5298,32 @@ public final class AgentBrain {
                 "Speak in chat. Other players will see this message. Speak only to answer a player, "
                 + "to report a task you have finished, or to report a blocker you cannot solve. Never "
                 + "narrate progress you are already making, and never announce that you will report "
-                + "something later - a promise to speak again is not information.",
-                LlmClient.schema(LlmClient.params("message", "string: what to say"), List.of("message"))));
+                + "something later - a promise to speak again is not information."
+                + (hasStandingGoal ? " If this is the final report for your standing objective, "
+                        + "set goal_complete=true in this same call so it is removed without "
+                        + "another model turn." : ""),
+                hasStandingGoal
+                        ? LlmClient.schema(LlmClient.params(
+                                "message", "string: what to say",
+                                "goal_complete", "boolean: true only when the standing objective is finished"),
+                                List.of("message"))
+                        : LlmClient.schema(LlmClient.params(
+                                "message", "string: what to say"), List.of("message"))));
+
+        if (hasStandingGoal) {
+            tools.add(new LlmClient.ToolSpec("complete_goal",
+                    "Clear your standing objective after verifying it is finished, if no final "
+                    + "chat report is needed. Use say(goal_complete=true) when reporting instead.",
+                    LlmClient.schema(LlmClient.params())));
+            tools.add(new LlmClient.ToolSpec("abandon_goal",
+                    "Give up on your standing objective and clear it, when it cannot be done: the "
+                    + "material or tool it needs is not available, or the world keeps refusing it. "
+                    + "Put what is missing in reason; the player is told and the work is cancelled. "
+                    + "Do not use this for a task that is merely slow - only for one that is stuck.",
+                    LlmClient.schema(LlmClient.params(
+                            "reason", "string: what is missing or blocking, for the player"),
+                            List.of("reason"))));
+        }
 
         tools.add(new LlmClient.ToolSpec("eat",
                 "Eat food you are carrying to restore hunger. Eating takes a moment but does not stop "
@@ -5012,6 +5629,7 @@ public final class AgentBrain {
                 "Delete a saved note that is no longer true.",
                 LlmClient.schema(LlmClient.params("key", "string: the label to delete"), List.of("key"))));
 
+        this.warnAboutUnplannableTools(tools);
         return tools;
     }
 
@@ -5140,7 +5758,7 @@ public final class AgentBrain {
             // that is running, so queueing it behind that action makes it useless. Observed in
             // production as a bot that reported "still stuck in the mining task, interrupt is just
             // queued too" - it had diagnosed its own problem correctly and been ignored.
-            case "plan", "say", "look_at", "eat", "remember", "forget", "recall",
+            case "plan", "say", "complete_goal", "look_at", "eat", "remember", "forget", "recall",
                  "find_item", "find_uses", "craftable_now", "interrupt", "return_to_spawn",
                  "escape_up", "start_mining",
                  // Reading the backpack is a look, not a change: it must not wait behind a walk.
@@ -5703,7 +6321,26 @@ public final class AgentBrain {
                 oldest.remove();
             }
         }
+        boolean alreadySkipped = this.isJevSkippedTarget(job.origin);
         int failuresForTarget = this.mineFailureCounts.merge(job.origin, 1, Integer::sum);
+        // A third failure of the same unchanged block has already had two chances to recover.
+        // Production once bought 118 mining-recovery evaluations in five minutes, repeatedly for
+        // the same target. A short local skip is safer than asking Jev the identical question again.
+        if (failuresForTarget >= 3 || alreadySkipped) {
+            this.markJevSkippedTarget(job);
+            this.actionReports.addLast("repeated mining failure at " + job.origin.toShortString()
+                    + "; temporarily skipped this target and will try another candidate");
+            LOG.info("Bot {} skipped repeated mining failure at {} after {} attempt(s) without Jev",
+                    botName, job.origin.toShortString(), failuresForTarget);
+            return;
+        }
+        if (this.jevRecoveryRequestedAt >= 0) {
+            // The adviser is already deciding how to recover. An overlapping failure must not
+            // start another paid request before that answer has even arrived.
+            LOG.debug("Bot {} suppressed overlapping Jev mining recovery for {}",
+                    botName, job.origin.toShortString());
+            return;
+        }
         // Read the route once: it is world data on disk, and both the state and the candidate list
         // need to know whether BACKTRACK is legal here.
         MineRoute route = this.loadMineRoute();
@@ -5843,16 +6480,17 @@ public final class AgentBrain {
                 || !failedJob.dimension.equals(this.currentDimension())) {
             return;
         }
-        if (this.mineJob != null || this.combatJob != null || this.isMoving()
+        if ((this.mineJob != null && this.mineJob != failedJob)
+                || this.combatJob != null || this.isMoving()
                 || !this.queue.isEmpty() || this.thinking.get()) {
             // Say *which* of these superseded the advice. "not_applied=newer_work" alone cannot
             // distinguish "a player or the model already gave the bot work" from "the bot happens to
             // be thinking about its next step", and those two want opposite fixes: the first is the
             // guard working, the second would mean a recovery can never land.
             LOG.info("JEV ACTIVE bot={} event=MINING_RECOVERY not_applied=newer_work "
-                    + "mineJob={} combat={} moving={} queue={} thinking={} state={}",
-                    this.bot.getName().getString(), this.mineJob != null, this.combatJob != null,
-                    this.isMoving(), this.queue.size(), this.thinking.get(),
+                    + "newerMineJob={} combat={} moving={} queue={} thinking={} state={}",
+                    this.bot.getName().getString(), this.mineJob != null && this.mineJob != failedJob,
+                    this.combatJob != null, this.isMoving(), this.queue.size(), this.thinking.get(),
                     this.describeCurrentAction());
             return;
         }
@@ -6048,7 +6686,23 @@ public final class AgentBrain {
                                     clampCoordinate(arg(args, "z", 0)))));
 
                 case "say":
-                    return this.sayAsTool(string(args, "message", ""));
+                    String spoken = this.sayAsTool(string(args, "message", ""));
+                    if (args.has("goal_complete") && args.get("goal_complete").isJsonPrimitive()
+                            && args.get("goal_complete").getAsBoolean()
+                            && !spoken.startsWith("failed:")
+                            && (!spoken.startsWith("not sent:")
+                                    || spoken.startsWith("not sent: that is word for word"))
+                            && !call.id().startsWith("plan_step_")) {
+                        String completed = this.completeStandingGoal();
+                        return spoken + "; " + completed;
+                    }
+                    return spoken;
+
+                case "complete_goal":
+                    return this.completeStandingGoal();
+
+                case "abandon_goal":
+                    return this.abandonStuckGoal(string(args, "reason", ""));
 
                 case "eat":
                     return this.eat(string(args, "item", ""));
@@ -6295,6 +6949,19 @@ public final class AgentBrain {
                     }
                     if (this.bot.getMainHandItem().isEmpty()) {
                         return "failed: you are not holding anything to place";
+                    }
+                    var inHand = this.bot.getMainHandItem();
+                    if (!(inHand.getItem() instanceof net.minecraft.world.item.BlockItem)) {
+                        // Production: the model tried to place an anvil while holding a pickaxe, was
+                        // told only "nothing happened (the block did not accept that item)", and drew
+                        // the wrong conclusion - it wrote itself a note that placing blocks is not
+                        // allowed at home and put the anvil back in its backpack, where it still was
+                        // hours later, with the repair it was made for never done. Name the item in
+                        // the hand and the argument that fixes it.
+                        return "failed: you are holding " + inHand.getHoverName().getString()
+                                + ", which cannot be placed; name the block you mean with item= "
+                                + "(for example item=minecraft:anvil). A block stored in your backpack "
+                                + "is taken out for you";
                     }
                     Direction face = parseFace(string(args, "face", "up"));
                     return result(Actions.useOnBlock(this.bot, blockPos(args), face));
@@ -6798,9 +7465,46 @@ public final class AgentBrain {
         if (!this.isNearHome(pos)) {
             return false;
         }
+        // A tree, a crop or a tuft of grass is not the ground. Breaking one leaves the terrain exactly
+        // as it was, which is the thing this rule exists to protect - and refusing them was expensive.
+        // With a 96-block radius around home, every oak and spruce in sight was off limits, so
+        // `mine_resource(oak_wood)` failed on the spot, the plan aborted, the queue drained, and the
+        // planning model was asked again a couple of seconds later: production spent 25 planning turns
+        // and 71 refusals in eight minutes moving a few blocks and changing nothing. The same rule
+        // refused the harvest of the bot's own field twenty-one times a second, because that field is
+        // twenty blocks from the bed it calls home.
+        if (isHarvestableVegetation(this.bot.level().getBlockState(pos))) {
+            return false;
+        }
         int surface = this.bot.serverLevel().getHeight(
                 Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, pos.getX(), pos.getZ());
         return pos.getY() >= surface - HOME_SURFACE_DEPTH;
+    }
+
+    /**
+     * Whether breaking this block is harvesting rather than excavation.
+     *
+     * <p>Tags first, so modded logs, leaves, crops, saplings and flowers come along for free; the
+     * class checks then cover what vanilla has no tag for (bamboo, sugar cane, cactus, vines, kelp,
+     * cocoa, melon and pumpkin stems). Farmland, dirt and stone are deliberately not on this list:
+     * they are the ground, and the ground stays protected.
+     */
+    private static boolean isHarvestableVegetation(BlockState state) {
+        if (state.is(BlockTags.LOGS) || state.is(BlockTags.LEAVES) || state.is(BlockTags.CROPS)
+                || state.is(BlockTags.SAPLINGS) || state.is(BlockTags.FLOWERS)
+                || state.is(BlockTags.CAVE_VINES)) {
+            return true;
+        }
+        var block = state.getBlock();
+        return block instanceof net.minecraft.world.level.block.BushBlock
+                || block instanceof net.minecraft.world.level.block.LeavesBlock
+                || block instanceof net.minecraft.world.level.block.BambooStalkBlock
+                || block instanceof net.minecraft.world.level.block.BambooSaplingBlock
+                || block instanceof net.minecraft.world.level.block.SugarCaneBlock
+                || block instanceof net.minecraft.world.level.block.CactusBlock
+                || block instanceof net.minecraft.world.level.block.VineBlock
+                || block instanceof net.minecraft.world.level.block.GrowingPlantBlock
+                || block instanceof net.minecraft.world.level.block.CocoaBlock;
     }
 
     private String homeSurfaceProtectionReason(BlockPos pos) {
@@ -6830,6 +7534,8 @@ public final class AgentBrain {
         if (now >= skipped.expiresAt()
                 || this.bot.level().getBlockState(pos).getBlock() != skipped.block()) {
             this.jevSkippedTargets.remove(key);
+            this.mineFailureCounts.remove(pos);
+            this.jevRetriedTargets.remove(pos);
             return false;
         }
         return true;
@@ -7421,6 +8127,9 @@ public final class AgentBrain {
         out.put("routeLeaseActive", this.routeLeaseKey != null
                 && this.bot.level().getGameTime() < this.routeLeaseExpiresAt);
         out.put("statsPlannerRequests", this.statsPlannerRequests);
+        out.put("noActionStreak", this.noActionStreak);
+        out.put("noProgressStreak", this.noProgressStreak);
+        out.put("noProgressRung", this.noProgressRung);
         out.put("statsJevRequests", this.statsJevRequests);
         out.put("statsLeaseContinuations", this.statsLeaseContinuations);
         out.put("statsBackoffAvoided", this.statsBackoffAvoided);
