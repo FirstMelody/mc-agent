@@ -160,11 +160,15 @@ public final class FarmRipeSmokeTest implements TestHook {
         }
         if (this.ticks % 20 == 0) {
             Map<String, Object> seen = this.state();
+            Object reflex = seen.get("lastReflexReport");
             LOG.info("RIPETEST waiting      : jevAsked={} ripe={} crops={} farmGoal={} pingPending={} "
                             + "harvested={} todo={} cooldown={}",
                     this.jev.calls("farm_ripe"), this.ripeStanding(), this.cropsStanding(),
                     seen.get("farmLastHarvestTick") != null, seen.get("farmRipePingPending"),
                     seen.get("farmHarvested"), seen.get("todoSize"), seen.get("cooldownTicks"));
+            if (reflex != null) {
+                LOG.info("RIPETEST reflex       : {}", reflex);
+            }
         }
         if (this.jev.calls("farm_ripe") < 1) {
             return;
@@ -319,6 +323,14 @@ public final class FarmRipeSmokeTest implements TestHook {
             this.finish("could not attach a brain to the bot");
             return;
         }
+        // Daylight and invulnerability: the first cut left the bot standing at the surface, where the
+        // survival reflex took over - it broke off the mining job and the low-health path cleared the
+        // field goal (the only three places that clear it are death, health below six, and the
+        // interrupt tool), so the harness measured a bot with no field and nothing to defer. This
+        // test is about the ripeness question, not about surviving the night.
+        this.level.setDayTime(6000L);
+        handle.player().getAbilities().invulnerable = true;
+        handle.player().onUpdateAbilities();
         handle.player().getInventory().clearContent();
         handle.player().getInventory().add(new ItemStack(Items.DIAMOND_HOE));
         handle.player().getInventory().add(new ItemStack(Items.WHEAT_SEEDS, 16));
