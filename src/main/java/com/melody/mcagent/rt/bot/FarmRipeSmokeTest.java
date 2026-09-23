@@ -158,6 +158,14 @@ public final class FarmRipeSmokeTest implements TestHook {
             }
             return;
         }
+        if (this.ticks % 20 == 0) {
+            Map<String, Object> seen = this.state();
+            LOG.info("RIPETEST waiting      : jevAsked={} ripe={} crops={} farmGoal={} pingPending={} "
+                            + "harvested={} todo={} cooldown={}",
+                    this.jev.calls("farm_ripe"), this.ripeStanding(), this.cropsStanding(),
+                    seen.get("farmLastHarvestTick") != null, seen.get("farmRipePingPending"),
+                    seen.get("farmHarvested"), seen.get("todoSize"), seen.get("cooldownTicks"));
+        }
         if (this.jev.calls("farm_ripe") < 1) {
             return;
         }
@@ -208,6 +216,19 @@ public final class FarmRipeSmokeTest implements TestHook {
         }
     }
 
+    private int ripeStanding() {
+        int count = 0;
+        for (int dx = -FIELD_RADIUS; dx <= FIELD_RADIUS; dx++) {
+            for (int dz = -FIELD_RADIUS; dz <= FIELD_RADIUS; dz++) {
+                BlockState state = this.level.getBlockState(this.centre.offset(dx, 1, dz));
+                if (state.is(Blocks.WHEAT) && state.getValue(BlockStateProperties.AGE_7) >= 7) {
+                    count++;
+                }
+            }
+        }
+        return count;
+    }
+
     private int cropsStanding() {
         int count = 0;
         for (int dx = -FIELD_RADIUS; dx <= FIELD_RADIUS; dx++) {
@@ -244,8 +265,12 @@ public final class FarmRipeSmokeTest implements TestHook {
         int surface = this.level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
         this.centre = new BlockPos(x, surface, z);
         this.busyTarget = this.centre.offset(4, 0, 0);
-        for (int dx = -FIELD_RADIUS - 1; dx <= FIELD_RADIUS + 1; dx++) {
-            for (int dz = -FIELD_RADIUS - 1; dz <= FIELD_RADIUS + 1; dz++) {
+        // Everything the bot and its busy-work target need: floor, headroom, and no leftover surface
+        // blocks in the way. The first cut only cleared the field itself, so the mining job aimed at a
+        // block with no walkable floor under it and came back NO_SAFE_MINING_ACCESS - the bot was
+        // never busy, and the deferral this test is about had nothing to defer.
+        for (int dx = -FIELD_RADIUS - 1; dx <= FIELD_RADIUS + 6; dx++) {
+            for (int dz = -FIELD_RADIUS - 1; dz <= FIELD_RADIUS + 5; dz++) {
                 this.level.setBlockAndUpdate(this.centre.offset(dx, -1, dz),
                         Blocks.DIRT.defaultBlockState());
                 this.level.setBlockAndUpdate(this.centre.offset(dx, 0, dz),
@@ -262,8 +287,11 @@ public final class FarmRipeSmokeTest implements TestHook {
                         Blocks.WHEAT.defaultBlockState().setValue(BlockStateProperties.AGE_7, 0));
             }
         }
-        // A block to mine, so the bot has a job that owns its ticks while the crops ripen.
+        // A block to mine, right beside the bot, standing on solid ground: a job that owns the bot's
+        // ticks while the crops ripen, and one the runtime can actually reach.
         this.level.setBlockAndUpdate(this.busyTarget, Blocks.STONE.defaultBlockState());
+        this.level.setBlockAndUpdate(this.busyTarget.above(), Blocks.AIR.defaultBlockState());
+        this.level.setBlockAndUpdate(this.busyTarget.below(), Blocks.DIRT.defaultBlockState());
 
         try {
             AtomicInteger turns = new AtomicInteger();

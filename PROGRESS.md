@@ -50,6 +50,13 @@ harness 自身也踩了两个坑，都值得记：行程结束后 job 已清空�
 不是功能侧——但要证明功能，必须先把这三处修好并让它绿。功能本身已随 `23a01d7bc5636a72` 上线，
 且默认 `interrupts=shadow`（只记录不动手），所以生产行为与上一版等价。
 
+**第四轮诊断（决定性一行）**：相位 1 每秒打印的状态显示 `farmGoal=false` 从第一次采样起就是假——
+采用好的田地在下一相位已经**不在脑子里**了（`farmLastHarvestTick` 消失）。全项目清空 `farmGoal`
+只有三处：机器人死亡/被移除、血量 ≤6（都不成立），以及 `execute()` 里停下来去干别的那条路径
+（`sleep`/`return_to_spawn`/`headHome` 一族共用），并且那一处会**同时**清 `miningGoal` 与
+`farmGoal`。下一轮第一步：在那条路径上打一行说明是谁触发的（或在测试里断言
+`lastReflexReport`），把谁清掉的钉死——这很可能不是 harness 的问题，而是功能侧的真 bug。
+
 **修 bug 记录**：`roughlyReady` 的分母曾把成熟作物算两次（`ripe+crops` 里 ripe 已含在 crops 中），
 导致"整片田都熟了"被读成 50% 而永远不问——已改为以田地总作物数为分母。
 
