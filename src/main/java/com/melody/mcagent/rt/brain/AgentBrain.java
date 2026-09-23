@@ -1798,8 +1798,11 @@ public final class AgentBrain {
         List<Perception.SeenBlock> ripe = this.ripeCropsIn(field);
         int crops = this.cropsIn(field).size();
         boolean canSee = !ripe.isEmpty() || crops > 0;
+        // The denominator is every crop block in the field, ripe ones included - adding ripe to crops
+        // counts them twice, which made a field that was entirely ripe read as 50% ready and never
+        // ask. A field with nothing in sight falls back to the clock instead.
         boolean roughlyReady = canSee
-                ? ripe.size() >= Math.max(1, (int) Math.ceil((ripe.size() + crops) * FARM_RIPE_FRACTION))
+                ? ripe.size() >= Math.max(1, (int) Math.ceil(crops * FARM_RIPE_FRACTION))
                 : now - field.lastHarvestTick >= FARM_RIPE_ESTIMATE_TICKS;
         if (!roughlyReady) {
             return;

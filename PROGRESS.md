@@ -43,8 +43,15 @@ harness 自身也踩了两个坑，都值得记：行程结束后 job 已清空�
 （todo 只会由 ACTIVE 的答案产生，shadow 下永远是空队列）。要真正启用需把
 `config/mcagent-jev.properties` 里的 `interrupts` 改成 `active` 并 `/mcagent reloadconfig`。
 
-**下一轮**：写 `MCAGENT_FARMRIPE_TEST`（真田 + 成熟作物 + Jev stub，断言"问句→TODO_LATER→
-todo 队列→空闲时段零规划调用完成收割"），绿了以后再决定是否把 `interrupts` 开到 active。
+**下一轮**：`MCAGENT_FARMRIPE_TEST` 已写出（`FarmRipeSmokeTest`）但仍 **FAIL**，失败在 harness：
+① 田地只种活 1 株小麦（9 格放置循环有问题）；② 用来"占住机器人"的挖矿目标选到了没有安全通路的
+位置（`NO_SAFE_MINING_ACCESS`），于是机器人并不忙，"推迟收割"的前提不成立；③ 采用田地后那轮无动作
+把它送进事件等待（`cooldown=2147480764`），而作物成熟不在唤醒指纹里。三处都是 harness 侧的问题，
+不是功能侧——但要证明功能，必须先把这三处修好并让它绿。功能本身已随 `23a01d7bc5636a72` 上线，
+且默认 `interrupts=shadow`（只记录不动手），所以生产行为与上一版等价。
+
+**修 bug 记录**：`roughlyReady` 的分母曾把成熟作物算两次（`ripe+crops` 里 ripe 已含在 crops 中），
+导致"整片田都熟了"被读成 50% 而永远不问——已改为以田地总作物数为分母。
 
 ## 2026-09-23（中午四）：无解就取消并告知，不再一直 run
 
