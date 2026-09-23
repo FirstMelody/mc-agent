@@ -292,6 +292,11 @@ public final class BranchMineSmokeTest implements TestHook {
     private void phaseReentry(BotManager.BotHandle handle) {
         if (!this.phaseStarted) {
             this.phaseStarted = true;
+            // Put the stub back to KEEP_MINING. Phase two left it answering ESCALATE_LLM and kept every
+            // pickaxe worn, so the new trip was handed straight back to the model - "branch mining handed
+            // back to the model: Jev could not decide about a tool worn" - and never dug a block. That
+            // was the harness talking to itself, not the runner failing to re-enter its own corridor.
+            this.jev.answer("mining_interrupt", "KEEP_MINING", 0.95D);
             this.requestsAtReentry = this.model.requestCount();
             LOG.info("BRANCHTEST re-entry   : second trip requested at {}", 
                     handle.player().blockPosition().toShortString());
