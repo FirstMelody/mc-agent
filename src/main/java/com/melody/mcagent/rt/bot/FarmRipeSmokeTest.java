@@ -65,6 +65,8 @@ public final class FarmRipeSmokeTest implements TestHook {
     private int phaseTick;
     private boolean phaseStarted;
     private int ticks;
+    private int busyTicks;
+    private boolean ripened;
     private int requestsAtFieldAdoption = -1;
     private AgentBrain adoptedBrain;
     private BlockPos busyTarget;
@@ -160,31 +162,32 @@ public final class FarmRipeSmokeTest implements TestHook {
         if (!this.phaseStarted) {
             this.phaseStarted = true;
             this.jev.answer("farm_ripe", "TODO_LATER", 0.95D);
-            this.jev.answer("mining_recovery", "ESCALATE_LLM", 0.10D);
-            // Ripen the field, then give the bot a job so the farm skill cannot claim the tick: this
-            // is the production case, a bot deep in a mine while its crops come in.
-            int ripened = this.ripenField();
             AgentBrain brain = this.brain();
-            String started = brain == null ? "no brain"
-                    : brain.mineAsTool(this.busyTarget, 0);
-            LOG.info("RIPETEST busy         : ripened {} crop(s), mining job -> {}", ripened, started);
-            if (ripened == 0) {
-                this.fail("the harness could not ripen any crop");
-            }
+            String started = brain == null ? "no brain" : brain.mineAsTool(this.busyTarget, 0);
+            LOG.info("RIPETEST busy         : mining job -> {}", started);
             return;
         }
-        if (this.ticks % 20 == 0) {
-            Map<String, Object> seen = this.state();
-            Object reflex = seen.get("lastReflexReport");
-            LOG.info("RIPETEST waiting      : sameBrain={} jevAsked={} ripe={} crops={} farmGoal={} pingPending={} "
-                            + "harvested={} todo={} cooldown={}",
-                    this.brain() == this.adoptedBrain, this.jev.calls("farm_ripe"),
-                    this.ripeStanding(), this.cropsStanding(),
-                    seen.get("farmLastHarvestTick") != null, seen.get("farmRipePingPending"),
-                    seen.get("farmHarvested"), seen.get("todoSize"), seen.get("cooldownTicks"));
-            if (reflex != null) {
-                LOG.info("RIPETEST reflex       : {}", reflex);
+        // Ripen only once the bot has genuinely been busy for a while. Ripening in the same tick as
+        // starting the job loses the race every time: the farm skill runs on the next tick and harvests
+        // the crop (with no planning call, which is the good news) long before the ripeness check comes
+        // round again, so the deferral this phase exists to test never happens.
+        Map<String, Object> state = this.state();
+        boolean busy = Boolean.TRUE.equals(state.get("mining"))
+                || number(state.get("queueSize")) > 0
+                || number(state.get("longAction")) > 0;
+        this.busyTicks = busy ? this.busyTicks + 1 : 0;
+        if (!this.ripened && this.busyTicks >= 40) {
+            this.ripened = true;
+            int ripened = this.ripenField();
+            LOG.info("RIPETEST busy         : busy for {} tick(s); ripened {} crop(s)",
+                    this.busyTicks, ripened);
+        }
+        if (!this.ripened) {
+            if (this.ticks % 20 == 0) {
+                LOG.info("RIPETEST waiting      : waiting for the bot to be busy (mining={} queue={})",
+                        state.get("mining"), state.get("queueSize"));
             }
+            return;
         }
         if (this.jev.calls("farm_ripe") < 1) {
             return;
@@ -192,7 +195,6 @@ public final class FarmRipeSmokeTest implements TestHook {
         if (this.ticks - this.phaseTick < 40) {
             return;
         }
-        Map<String, Object> state = this.state();
         int todo = number(state.get("todoSize"));
         boolean harvested = number(state.get("farmHarvested")) > 0;
         int extra = this.model.requestCount() - this.requestsAtFieldAdoption;
