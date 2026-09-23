@@ -2292,17 +2292,18 @@ public final class AgentBrain {
                     + " and is carrying nothing to pave it with");
             return false;
         }
+        net.minecraft.server.level.ServerLevel world = this.bot.serverLevel();
         JsonObject place = new JsonObject();
         BlockPos below = hole.below();
-        if (!this.level.getBlockState(below).getCollisionShape(this.level, below).isEmpty()) {
+        if (!world.getBlockState(below).getCollisionShape(world, below).isEmpty()) {
             place.addProperty("x", below.getX());
             place.addProperty("y", below.getY());
             place.addProperty("z", below.getZ());
             place.addProperty("face", "up");
         } else {
             BlockPos behind = hole.relative(job.heading.getOpposite());
-            boolean solidBehind = !this.level.getBlockState(behind)
-                    .getCollisionShape(this.level, behind).isEmpty();
+            boolean solidBehind = !world.getBlockState(behind)
+                    .getCollisionShape(world, behind).isEmpty();
             BlockPos clicked = solidBehind ? behind : hole.relative(job.heading);
             place.addProperty("x", clicked.getX());
             place.addProperty("y", clicked.getY());
@@ -2327,7 +2328,7 @@ public final class AgentBrain {
     private String bridgeBlock() {
         var inventory = this.bot.getInventory();
         for (int slot = 0; slot < inventory.getContainerSize(); slot++) {
-            ItemStack stack = inventory.getItem(slot);
+            net.minecraft.world.item.ItemStack stack = inventory.getItem(slot);
             if (stack.isEmpty() || !(stack.getItem() instanceof net.minecraft.world.item.BlockItem)) {
                 continue;
             }
