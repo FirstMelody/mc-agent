@@ -103,6 +103,12 @@ public final class FarmRipeSmokeTest implements TestHook {
             this.finish("the bot disappeared");
             return;
         }
+        // Keep the body sound for the whole test, every tick. This measures a scheduling question, not
+        // survival, and the farm skill drops its field goal the moment health reaches six - which is
+        // exactly what kept happening while the harness only guarded the first phase.
+        handle.player().setHealth(20.0F);
+        handle.player().resetFallDistance();
+        handle.player().setInvulnerable(true);
         if (!this.nudged && this.ticks > 20 && this.brain() != null) {
             this.nudged = true;
             LOG.info("RIPETEST nudge        : brain present, asking for one decision");
@@ -126,11 +132,6 @@ public final class FarmRipeSmokeTest implements TestHook {
             this.phaseStarted = true;
             return;
         }
-        // Keep the body sound while the field is adopted: the join can still apply damage for a tick
-        // or two after spawn (fall, suffocation in the restored position), and health <= 6 is what
-        // silently drops the field goal.
-        handle.player().setHealth(20.0F);
-        handle.player().resetFallDistance();
         if (this.model.requestCount() < 1) {
             return;
         }
