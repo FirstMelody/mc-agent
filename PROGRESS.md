@@ -3159,3 +3159,26 @@ jevApplied=1`，开工后仍然 **0 次规划调用**。
 
 仍未完成：重入同一矿道的 harness 断言（控制器本就不读历史路线，需一期把它钉住）；"整趟仅 1 次调用"
 的断言覆盖回程；摘除 `FARMDEBUG`/`FARMPING` 诊断。
+
+### 重入旧矿道：原地开新路（第 18 轮，`MCAGENT_BRANCHMINE_TEST` PASS）
+
+```
+BRANCHTEST escalate : extraRequests=1 (the fallback turn decides what happens next)
+BRANCHTEST re-entry : second trip requested at 65,-56,-58
+BRANCHTEST re-entry : second trip dug 3 main block(s) from where it stood, extraRequests=0
+BRANCHTEST requests : 2 planning call(s) in total (1 to start, 1 fallback)
+BRANCHTEST VERDICT  : PASS
+```
+
+第二次行程从**第一趟自己挖出的巷道内部**（65,-56,-58）起步，原地开出 3 格新主巷，**没有再花任何
+规划调用**——它从不读历史 `mine_route_v1`，所以生产里那条"把机器人拖回 861,26,418 坏工作面、
+然后 no route、最后传送回家"的路径在新控制器里不存在。
+
+这一期连续踩了三个 harness 自身的坑，都值得记：行程计数在 job 结束后消失（必须记峰值）；相位 2
+的 `ESCALATE_LLM` 与"永久磨损的镐"泄漏到相位 3（把新行程当场交回模型）；以及最后 25 毫秒的竞态——
+回退那一轮启动的新行程，其第一次中断检查在 25ms 后到达，而 stub 重置放在下一相位里，**晚了 25ms**，
+于是 Jev 仍答 ESCALATE 把新行程打死。日志时间戳把这三点全部钉死。
+
+**至此目标的两项增强与两项追加要求全部有隔离服证据**：鱼骨挖矿（`BRANCHMINE_TEST` PASS）、
+农场成熟度（`FARMRIPE_TEST` PASS）、开放空间铺路、重入原地开新路；回归 `TUNNELTEST`/`FARMTEST` PASS；
+生产 `18c551703495a2bc` 在线且 `interrupts=active`。
