@@ -1,5 +1,31 @@
 # MC Agent — 进度与验证记录
 
+## 2026-09-23（下午）：鱼骨挖矿与作物成熟交给 Jev —— 一次调用开局，全程不买规划
+
+**挖矿（`start_mining(mode=branch, y=…)`）**：在目标 Y 层挖主巷道，每 N 格向两侧交替开分支；每趟
+挖完就用自带透视扫描找优先级矿物，看到就转去挖（`resumeAt` 锚点把模式接回来）；背包满、耐久低、
+怪物靠近时问 Jev 一个有限选项的问题（KEEP_MINING / SWAP_TOOL / SWAP_TO_WEAPON / RETURN_HOME /
+RETREAT_HOME / ESCALATE_LLM，候选按情形裁剪，幻翼永远不会被提供"打它"），只有 Jev 处理不了
+（失败/低置信/ESCALATE）才把整趟交回规划模型，且只交一次。逐格安全规则与 `dig_tunnel` 共用
+`checkRunCell`，分支因此不可能绕过流体、沙砾、玩家建筑与地表保护。中断检查每 tick 都做（不只两趟
+之间）——背包不会礼貌地等到巷道挖完才满。
+
+实测（`BRANCHMINE_TEST` 最后一趟，行程自己的日志）：
+`branch mining finished after 99s: 12/12 branches, 36 main blocks, gained 2 iron ore, Jev asked 1
+and applied 1`，**全程规划调用 1 次**（开局那次；埋在两格石头后面的铁矿是透视扫出来的）。
+踩到两个真 bug：`lastOreScanTick = Long.MIN_VALUE` 让 `now - last` 溢出成负数、扫描从此不运行
+（症状是模式挖得完美却一块矿没找）；`plan` 步数上限 8 时中断检查只在两趟之间，工具跑坏了才轮到它。
+
+**作物成熟（`tickFarmRipeness` + todo）**：以上次收割计时；可见作物过半成熟、或看不见田时距上次
+收割已过估算时长，就用一次 Jev 问句决定"现在收 / 记到 todo / 再等等"。答 TODO 进 `todo` 队列，
+空闲时段由 `tickTodo()` 以**零规划调用**接管（农场技能自己收割、自己补种）。这条问句故意没有
+ESCALATE：排程问题的合法答案永远包含"以后再说"，没有哪一点值得买一轮 13k token 的规划。
+
+**当前状态（未部署）**：功能实现、`build` 与 `checkRuntimeBoundary` 通过、生产仍是上一版。
+`MCAGENT_BRANCHMINE_TEST` 仍报 FAIL，失败在 harness 自己：它在行程结束后才去读
+`branchBranchesDug` 等键，而那时 job 已清空；`branchOreJobs` 计数器此前从未自增（已修）。
+下一轮：把 harness 改成记录行程中的峰值并让它绿，再补农场 Jev/todo 的 harness，然后热部署。
+
 ## 2026-09-23（中午四）：无解就取消并告知，不再一直 run
 
 要求：目标做不下去时应当**直接取消执行并告知**，而不是永远重试。现在是两条路。

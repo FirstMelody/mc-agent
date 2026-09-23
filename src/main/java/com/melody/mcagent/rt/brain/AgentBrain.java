@@ -151,6 +151,13 @@ public final class AgentBrain {
      * still brings it back - and being told beats being billed.
      */
     private static final int NO_PROGRESS_GIVE_UP_RUNG = 2;
+    /** How often the field's ripeness is considered at all, and how long between typed questions. */
+    private static final int FARM_RIPE_CHECK_INTERVAL_TICKS = 200;
+    private static final int FARM_RIPE_PING_COOLDOWN_TICKS = 2400;
+    /** With no crop in sight, this long since the last harvest means "they should be ripe by now". */
+    private static final int FARM_RIPE_ESTIMATE_TICKS = 7200;
+    /** Fraction of the visible field that counts as "roughly all ripe". */
+    private static final double FARM_RIPE_FRACTION = 0.6D;
     /** A refused harvest is not a race: the crop is still there, so come back rather than spin. */
     private static final int FARM_HARVEST_BACKOFF_TICKS = 200;
     /** Tools that make sense as deterministic steps inside a server-side plan. */
@@ -181,6 +188,24 @@ public final class AgentBrain {
      */
     private static final List<String> PLANNING_EXCLUSIONS =
             List.of("plan", "interrupt", "complete_goal", "abandon_goal", "start_mining");
+    /** Blocks queued per branch-mining run: long enough to make progress, short enough to interrupt. */
+    private static final int MAX_BRANCH_RUN_BLOCKS = 4;
+    /** Default main-corridor blocks between branches. The scan reaches a few blocks either side. */
+    private static final int BRANCH_DEFAULT_SPACING = 6;
+    /** Default length of one branch, and how many branches make a trip. */
+    private static final int BRANCH_DEFAULT_LENGTH = 16;
+    private static final int BRANCH_DEFAULT_MAX = 8;
+    /** How often the occlusion-tolerant scan looks for ore around the face, and how far. */
+    private static final int BRANCH_ORE_SCAN_TICKS = 20;
+    private static final int BRANCH_ORE_RADIUS = 12;
+    /** Vein radius used when the pattern diverts to an ore it can see through rock. */
+    private static final int BRANCH_ORE_VEIN_RADIUS = 6;
+    /** Remaining uses below which the tool counts as worn and Jev is asked about it. */
+    private static final int BRANCH_TOOL_DURABILITY_FLOOR = 20;
+    /** How close a monster has to be to interrupt the trip, and how far the bot can see one. */
+    private static final double BRANCH_THREAT_RADIUS = 8.0D;
+    /** After an answer, do not ask about the same kind of interruption again for a while. */
+    private static final int BRANCH_INTERRUPT_QUIET_TICKS = 600;
     /** One local tunnel macro covers useful ground while remaining bounded and interruptible. */
     private static final int MAX_TUNNEL_LENGTH = 24;
     /** Radius used when scanning for visible blocks. Scanning is O(r^3), so keep it tight. */
@@ -559,6 +584,13 @@ public final class AgentBrain {
     @Nullable
     private MineJob mineJob;
 
+    /** The branch-mining trip in progress, if any. Runtime-owned: it buys no planning turns. */
+    @Nullable
+    private BranchMineJob branchMine;
+    /** Where the last queued branch run ends, so the pattern can move its anchor. */
+    @Nullable
+    private BlockPos branchRunEnd;
+
     /**
      * Surface blocks which the deterministic tunnel macro, and only that macro, may remove.
      *
@@ -683,6 +715,80 @@ public final class AgentBrain {
     }
 
     /**
+     * A branch-mining trip: one main corridor at a fixed level, with perpendicular branches every
+     * few blocks.
+     *
+     * <p>The shape is the point. A single tunnel only sees the line it cuts; a corridor with branches
+     * sweeping off it covers a whole band of a level, and the bot's occlusion-tolerant scan reaches a
+     * few blocks through solid rock either side of every face - so ore between the tunnels is found
+     * rather than missed. The pattern is generated as it goes and anchored on {@link #resumeAt},
+     * which is also what brings the bot back after it walks off to an ore it spotted.
+     *
+     * <p>It buys no planning turns at all. Only two things can interrupt it: a bounded typed question
+     * to Jev when the trip is disturbed (a mob, a worn tool, a full pack), and - when even that
+     * cannot answer - handing the trip back to the model with the reason.
+     */
+    private static final class BranchMineJob {
+        final int targetY;
+        final Direction mainDirection;
+        final int branchSpacing;
+        final int branchLength;
+        final int maxBranches;
+        final String primary;
+        final List<String> priorities;
+        final int requestedAmount;
+        final int startingAmount;
+        final long startedAt;
+        /** Main-corridor blocks still to dig before the next branch. */
+        int nextBranchIn;
+        /** Progress in the branch being dug, and which side of the corridor it is on. */
+        int branchBlocksDug;
+        int branchSide = 1;
+        int branchesDug;
+        int mainBlocksDug;
+        int resourcesStarted;
+        /** The corridor heading, which can be turned once when the level blocks it. */
+        Direction heading;
+        int headingTurns;
+        boolean returning;
+        boolean returnScheduled;
+        /** The anchor: where the pattern expects the bot, and where it walks back to. */
+        @Nullable BlockPos resumeAt;
+        /** Where the branch being dug started, so the bot can return to its junction. */
+        @Nullable BlockPos branchJunction;
+        /** Interrupt bookkeeping: one question at a time, and a quiet period after an answer. */
+        boolean interruptPending;
+        long interruptQuietUntil;
+        /**
+         * When the scan last looked for ore. Zero, not {@code Long.MIN_VALUE}: {@code now - MIN_VALUE}
+         * overflows to a negative number, and the scan then never runs at all - which is exactly what
+         * the harness caught, a trip that dug its pattern perfectly and never looked for ore once.
+         */
+        long lastOreScanTick;
+        boolean scanReported;
+        int interruptsAsked;
+        int interruptsApplied;
+        String lastInterrupt = "";
+
+        BranchMineJob(int targetY, Direction mainDirection, int branchSpacing, int branchLength,
+                      int maxBranches, String primary, List<String> priorities, int requestedAmount,
+                      int startingAmount, long startedAt) {
+            this.targetY = targetY;
+            this.mainDirection = mainDirection;
+            this.branchSpacing = Math.max(2, branchSpacing);
+            this.branchLength = Math.max(2, branchLength);
+            this.maxBranches = Math.max(1, maxBranches);
+            this.primary = primary;
+            this.priorities = List.copyOf(priorities);
+            this.requestedAmount = requestedAmount;
+            this.startingAmount = startingAmount;
+            this.startedAt = startedAt;
+            this.heading = mainDirection;
+            this.nextBranchIn = this.branchSpacing;
+        }
+    }
+
+    /**
      * A field the bot keeps.
      *
      * <p>The opposite of {@link MiningGoal} in one respect: a mining trip is finished when the ore
@@ -707,12 +813,18 @@ public final class AgentBrain {
         boolean idleReported;
         /** Tick before which a refused harvest is not retried. */
         long harvestBlockedUntil;
+        /** When the last harvest started, and when Jev was last asked whether the field is ready. */
+        long lastHarvestTick;
+        long lastRipePingTick;
+        long lastRipeCheckTick;
+        boolean ripePingPending;
 
         FarmGoal(BlockPos centre, int radius, int ripeWhenStarted, long startedAt) {
             this.centre = centre.immutable();
             this.radius = radius;
             this.ripeWhenStarted = ripeWhenStarted;
             this.startedAt = startedAt;
+            this.lastHarvestTick = startedAt;
         }
 
         boolean contains(BlockPos pos) {
@@ -1131,6 +1243,9 @@ public final class AgentBrain {
             primary = priorities.get(0);
         }
         int amount = (int) Math.max(0, Math.min(4096, arg(args, "amount", 0)));
+        if ("branch".equals(string(args, "mode", "resource").trim().toLowerCase(java.util.Locale.ROOT))) {
+            return this.startBranchMineGoal(args, priorities, primary, amount);
+        }
         int maxChunks = (int) Math.max(1, Math.min(64, arg(args, "max_tunnel_chunks", 12)));
         this.miningGoal = new MiningGoal(priorities, primary, amount,
                 this.matchingResourceCount(primary), maxChunks, this.bot.level().getGameTime());
@@ -1143,6 +1258,53 @@ public final class AgentBrain {
                 + ", return after inventory pressure, danger, or " + maxChunks
                 + " tunnel chunk(s). The runtime now owns navigation, resource selection, mining "
                 + "and return; do not submit per-block mining plans.";
+    }
+
+    /**
+     * Start a branch-mining trip at a fixed level, owned end to end by the runtime.
+     *
+     * <p>The model's whole contribution is this call: where to dig and what to look for. From here
+     * the runner decides the pattern, spots ore through the rock, and only asks Jev - never the
+     * planner - when the trip is disturbed.
+     */
+    private String startBranchMineGoal(JsonObject args, List<String> priorities, String primary,
+                                       int amount) {
+        if (!this.policy.canBreakBlocks()) {
+            return "failed: you are not allowed to break blocks";
+        }
+        if (!miningSkillEnabled()) {
+            return "failed: the persistent mining skill is disabled on this server";
+        }
+        int minY = this.bot.level().getMinBuildHeight() + 1;
+        int targetY = (int) Math.max(minY,
+                Math.min(this.bot.blockPosition().getY(), arg(args, "y", this.bot.blockPosition().getY())));
+        Direction direction = parseHorizontalDirection(string(args, "direction", ""));
+        if (direction == null) {
+            direction = this.bot.getDirection();
+        }
+        int spacing = (int) Math.max(2, Math.min(32,
+                arg(args, "branch_spacing", BRANCH_DEFAULT_SPACING)));
+        int length = (int) Math.max(2, Math.min(MAX_TUNNEL_LENGTH,
+                arg(args, "branch_length", BRANCH_DEFAULT_LENGTH)));
+        int maxBranches = (int) Math.max(1, Math.min(64,
+                arg(args, "max_branches", BRANCH_DEFAULT_MAX)));
+        BranchMineJob job = new BranchMineJob(targetY, direction, spacing, length, maxBranches,
+                primary, priorities, amount, this.matchingResourceCount(primary),
+                this.bot.level().getGameTime());
+        job.resumeAt = this.bot.blockPosition();
+        this.branchMine = job;
+        this.miningGoal = null;
+        this.cooldownTicks = 0;
+        LOG.info("Bot {} started branch mining: y={} heading={} spacing={} branch_length={} "
+                        + "max_branches={} priorities={}",
+                this.bot.getName().getString(), targetY, direction.getName(), spacing, length,
+                maxBranches, priorities);
+        return "started branch mining at y=" + targetY + ", heading " + direction.getName()
+                + ": one main corridor with a " + length + "-block branch every " + spacing
+                + " blocks, up to " + maxBranches + " branches, diverting to any ore the scan sees "
+                + "through the rock. The runtime owns this trip end to end - do not plan or call "
+                + "mining tools for it, and expect no further planning turns until it returns home"
+                + (amount > 0 ? " or brings back " + amount + " matching item(s)" : "") + ".";
     }
 
     /**
@@ -1549,6 +1711,167 @@ public final class AgentBrain {
         return out;
     }
 
+    /** Every crop the bot can see inside the field, ripe or not. */
+    private List<Perception.SeenBlock> cropsIn(FarmGoal field) {
+        List<Perception.SeenBlock> out = new ArrayList<>();
+        for (Perception.SeenBlock seen : Perception.visibleBlocks(this.bot, field.radius + 4)) {
+            if (Crops.isCrop(seen.state()) && field.contains(seen.pos())) {
+                out.add(seen);
+            }
+        }
+        return out;
+    }
+
+    /** A small piece of work the bot owes itself: done in an idle moment, at no model cost. */
+    private record TodoItem(String kind, BlockPos at, int radius, String description) {
+    }
+
+    private final java.util.Deque<TodoItem> todo = new java.util.ArrayDeque<>();
+
+    /** Remember something for an idle moment, once per place and kind. */
+    private void addTodo(TodoItem item) {
+        for (TodoItem existing : this.todo) {
+            if (existing.kind().equals(item.kind()) && existing.at().equals(item.at())) {
+                return;
+            }
+        }
+        this.todo.addLast(item);
+        this.actionReports.addLast("on the todo list for an idle moment: " + item.description());
+        LOG.info("Bot {} todo + {}", this.bot.getName().getString(), item.description());
+    }
+
+    /**
+     * Do one thing the bot owes itself, when the moment is free.
+     *
+     * <p>No model is asked about it: the item was already decided, and asking again is how a "later"
+     * turns back into a planning call. The skill it starts carries the work out with no turns of its
+     * own - adopting the field is what makes a deferred harvest free.
+     *
+     * @return true when a todo item was taken up this tick
+     */
+    private boolean tickTodo() {
+        if (this.todo.isEmpty() || this.farmGoal != null || this.branchMine != null
+                || this.miningGoal != null || this.farmBuildJob != null
+                || this.isLongActionRunning() || !this.queue.isEmpty() || this.thinking.get()
+                || this.bot.isRemoved() || this.bot.isDeadOrDying() || this.paused
+                || this.bot.getHealth() <= 6.0F) {
+            return false;
+        }
+        TodoItem item = this.todo.pollFirst();
+        if (!"farm_harvest".equals(item.kind())) {
+            return false;
+        }
+        long now = this.bot.level().getGameTime();
+        int ripe = this.ripeCropsIn(new FarmGoal(item.at(), item.radius(), 0, now)).size();
+        this.farmGoal = new FarmGoal(item.at(), item.radius(), ripe, now);
+        this.cooldownTicks = 0;
+        LOG.info("Bot {} picked up a todo item: {} ({} ripe now)", this.bot.getName().getString(),
+                item.description(), ripe);
+        this.actionReports.addLast("idle moment: starting the deferred " + item.description()
+                + " (" + ripe + " ripe crop(s)) with no planning turn");
+        return true;
+    }
+
+    /**
+     * Periodically consider whether the field is ready, and let Jev decide when to go and harvest.
+     *
+     * <p>Timed from the last harvest rather than from a clock, because a field is "roughly ready"
+     * either when the crops the bot can see are mostly ripe, or when enough time has passed that they
+     * should be - which is the only signal there is when the bot is deep in a mine and cannot see the
+     * field at all. The answer is a scheduling decision: go now, keep it on the todo list, or wait.
+     * There is deliberately no ESCALATE_LLM among the candidates: "later" is always a legal answer to
+     * a scheduling question, so there is nothing here a planning turn could decide better.
+     */
+    private void tickFarmRipeness() {
+        FarmGoal field = this.farmGoal;
+        if (field == null || field.ripePingPending) {
+            return;
+        }
+        long now = this.bot.level().getGameTime();
+        if (now - field.lastRipeCheckTick < FARM_RIPE_CHECK_INTERVAL_TICKS) {
+            return;
+        }
+        field.lastRipeCheckTick = now;
+        if (now - field.lastRipePingTick < FARM_RIPE_PING_COOLDOWN_TICKS) {
+            return;
+        }
+        List<Perception.SeenBlock> ripe = this.ripeCropsIn(field);
+        int crops = this.cropsIn(field).size();
+        boolean canSee = !ripe.isEmpty() || crops > 0;
+        boolean roughlyReady = canSee
+                ? ripe.size() >= Math.max(1, (int) Math.ceil((ripe.size() + crops) * FARM_RIPE_FRACTION))
+                : now - field.lastHarvestTick >= FARM_RIPE_ESTIMATE_TICKS;
+        if (!roughlyReady) {
+            return;
+        }
+        String state = "Minecraft farm check. bot=" + this.bot.getName().getString()
+                + "; field=" + field.centre.toShortString() + " radius=" + field.radius
+                + "; ripe_now=" + ripe.size() + "; growing_now=" + crops
+                + "; seconds_since_last_harvest=" + ((now - field.lastHarvestTick) / 20L)
+                + "; harvested_so_far=" + field.harvested
+                + "; current_action=" + this.describeCurrentAction()
+                + "; busy_with=" + (this.branchMine != null ? "branch_mining"
+                        : this.miningGoal != null ? "mining"
+                        : this.isLongActionRunning() ? "long_action"
+                        : this.queue.isEmpty() ? "idle" : "queued_work");
+        Map<String, String> candidates = new LinkedHashMap<>();
+        candidates.put("HARVEST_NOW", "Go and harvest the field now; it is ready");
+        candidates.put("TODO_LATER", "Keep it for an idle moment; the bot has something better in hand");
+        candidates.put("WAIT", "Not ready yet; ask again later");
+
+        JevClient adviser = this.jevClient;
+        JevClient.GateMode mode = adviser == null ? JevClient.GateMode.OFF
+                : adviser.settings().interrupts();
+        if (adviser == null || !adviser.settings().isUsable() || mode == JevClient.GateMode.OFF) {
+            field.lastRipePingTick = now;
+            return;
+        }
+        field.ripePingPending = true;
+        field.lastRipePingTick = now;
+        this.statsJevRequests++;
+        CompletableFuture
+                .supplyAsync(() -> adviser.choose(state, "farm_ripe",
+                        com.melody.mcagent.rt.llm.JevPrompts.FARM_RIPE, candidates), executor())
+                .thenAccept(choice -> this.bot.server.execute(
+                        () -> this.applyFarmRipeAnswer(field, adviser, mode, choice)));
+    }
+
+    /** Apply a ripeness answer: harvest by doing nothing (the skill harvests when ripe), defer, wait. */
+    private void applyFarmRipeAnswer(FarmGoal field, JevClient adviser, JevClient.GateMode mode,
+                                     JevClient.Choice choice) {
+        if (this.farmGoal != field) {
+            return;
+        }
+        field.ripePingPending = false;
+        boolean failed = choice.failed();
+        boolean confident = !failed && choice.confidence() >= MIN_ACTIVE_JEV_CONFIDENCE;
+        LOG.info("JEV {} bot={} event=FARM_RIPE choice={} confidence={} applied={} error={} "
+                        + "field={} ripe_when_asked={}",
+                mode == JevClient.GateMode.ACTIVE ? "ACTIVE" : "SHADOW",
+                this.bot.getName().getString(), choice.choice(),
+                String.format(java.util.Locale.ROOT, "%.3f", choice.confidence()),
+                mode == JevClient.GateMode.ACTIVE && confident, failed ? firstLine(choice.error()) : "-",
+                field.centre.toShortString(), field.ripeWhenStarted);
+        if (failed || mode != JevClient.GateMode.ACTIVE) {
+            return;
+        }
+        if (!confident) {
+            return;
+        }
+        switch (choice.choice()) {
+            case "HARVEST_NOW" -> this.actionReports.addLast("Jev said the field is ready ("
+                    + String.format(java.util.Locale.ROOT, "%.2f", choice.confidence())
+                    + "); the next idle tick harvests it");
+            case "TODO_LATER" -> this.addTodo(new TodoItem("farm_harvest", field.centre, field.radius,
+                    "harvest the field at " + field.centre.toShortString() + " (radius "
+                            + field.radius + ") - Jev deferred it"));
+            case "WAIT" -> this.actionReports.addLast("Jev said the field is not ready yet; "
+                    + "checking again later");
+            default -> LOG.warn("JEV ACTIVE bot={} answered '{}' for farm ripeness, which was not "
+                    + "offered; ignoring it", this.bot.getName().getString(), choice.choice());
+        }
+    }
+
     /**
      * One tick of farm work: replant what was just taken, or start on the nearest ripe crop.
      *
@@ -1633,6 +1956,9 @@ public final class AgentBrain {
             return false;
         }
         field.harvested++;
+        // The ripeness timer starts here, not on a clock: "the field should be ready again" is
+        // measured from the harvest that emptied it.
+        field.lastHarvestTick = this.bot.level().getGameTime();
         LOG.info("Bot {} farm: harvesting {} at {} ({} harvested, {} replanted so far)",
                 this.bot.getName().getString(),
                 target.state().getBlock().getName().getString(), target.pos().toShortString(),
@@ -1756,6 +2082,440 @@ public final class AgentBrain {
         goal.tunnelChunks++;
         this.actionReports.addLast("mining skill found no priority ore; " + firstLine(tunnel));
         return true;
+    }
+
+    /**
+     * One tick of the branch-mining skill.
+     *
+     * <p>Everything the trip needs is decided here: the pattern, ore diversion, the return trip and
+     * the two ways it can be interrupted. The planning model is not consulted - a mining trip that
+     * costs a 13k-token turn every few seconds is the thing this skill exists to replace - and the
+     * only model of any kind it talks to is Jev, in one bounded typed question, when the trip is
+     * actually disturbed.
+     *
+     * @return true while the skill still owns the bot's decisions
+     */
+    private boolean advanceBranchMine() {
+        BranchMineJob job = this.branchMine;
+        if (job == null) {
+            return false;
+        }
+        if (this.bot.isRemoved() || this.bot.isDeadOrDying()) {
+            this.branchMine = null;
+            return false;
+        }
+        int gained = this.matchingResourceCount(job.primary) - job.startingAmount;
+
+        // A full pack and a worn tool are deliberately NOT in this list: those are exactly the cases
+        // Jev is asked about, and turning for home first would make the question pointless.
+        if (!job.returning && ((job.requestedAmount > 0 && gained >= job.requestedAmount)
+                || job.branchesDug >= job.maxBranches
+                || this.bot.getHealth() <= 6.0F || this.bot.getFoodData().getFoodLevel() <= 4)) {
+            job.returning = true;
+            String why = "branch mining is returning: gained=" + gained + ", branches="
+                    + job.branchesDug + "/" + job.maxBranches + ", empty_slots="
+                    + this.emptyInventorySlots() + ", health="
+                    + String.format(java.util.Locale.ROOT, "%.1f", this.bot.getHealth());
+            LOG.info("Bot {} {}", this.bot.getName().getString(), why);
+            this.actionReports.addLast(why);
+        }
+        if (job.returning) {
+            return this.returnFromBranchMine(job, gained);
+        }
+
+        // The interruption check runs from tick() on every tick of the trip, including while a run
+        // is still being dug - a pack does not wait politely for the end of a corridor leg, and a
+        // tool does not break at one either. Only the ore scan needs the pattern to be between runs.
+        if (job.interruptPending || this.mineJob != null || this.isMoving()
+                || !this.queue.isEmpty()) {
+            return true;
+        }
+
+        BlockPos here = this.bot.blockPosition();
+        // Back to the anchor: after an ore diversion, after a finished branch, or after a detour the
+        // terrain forced. The pattern is a plan about places, so it needs a place to stand.
+        if (job.resumeAt != null && here.distSqr(job.resumeAt) > 6.0D) {
+            JsonObject walk = new JsonObject();
+            walk.addProperty("x", job.resumeAt.getX());
+            walk.addProperty("y", job.resumeAt.getY());
+            walk.addProperty("z", job.resumeAt.getZ());
+            this.queue.addLast(new QueuedCall(new LlmClient.ToolCall(
+                    "branch_return", "goto", walk), -1, true));
+            this.actionReports.addLast("branch mining walking back to "
+                    + job.resumeAt.toShortString() + " to carry on the pattern");
+            return true;
+        }
+
+        // Ore first: finding what the tunnels would miss is the whole point of the shape.
+        long now = this.bot.level().getGameTime();
+        if (now - job.lastOreScanTick >= BRANCH_ORE_SCAN_TICKS) {
+            job.lastOreScanTick = now;
+            List<Perception.SeenBlock> visible = Perception.visibleBlocks(this.bot, BRANCH_ORE_RADIUS);
+            if (!job.scanReported) {
+                job.scanReported = true;
+                LOG.info("Bot {} branch mining scan: {} block(s) visible within {} of {}",
+                        this.bot.getName().getString(), visible.size(), BRANCH_ORE_RADIUS,
+                        here.toShortString());
+            }
+            for (String resource : job.priorities) {
+                List<Perception.SeenBlock> matches = this.matchesIn(visible, resource);
+                for (int i = 0; i < Math.min(2, matches.size()); i++) {
+                    Perception.SeenBlock target = matches.get(i);
+                    String result = this.startMine(target.pos(), BRANCH_ORE_VEIN_RADIUS, "", false);
+                    if (!isFailure(result)) {
+                        job.resourcesStarted++;
+                        this.actionReports.addLast("branch mining spotted " + resource + " at "
+                                + target.pos().toShortString() + " through the rock -> "
+                                + firstLine(result));
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // The pattern: descend to the level first, then a corridor with branches off it.
+        List<String> problem = new ArrayList<>();
+        boolean descending = here.getY() > job.targetY;
+        boolean branching = !descending && job.nextBranchIn <= 0
+                && job.branchesDug < job.maxBranches;
+        Direction runDirection;
+        int planned;
+        if (descending) {
+            runDirection = job.heading;
+            planned = this.queueBranchRun(runDirection, MAX_BRANCH_RUN_BLOCKS, true, problem);
+        } else if (branching) {
+            if (job.branchJunction == null) {
+                job.branchJunction = here.immutable();
+                job.branchBlocksDug = 0;
+            }
+            runDirection = job.branchSide > 0 ? job.heading.getClockWise()
+                    : job.heading.getCounterClockWise();
+            int remaining = Math.max(1, job.branchLength - job.branchBlocksDug);
+            planned = this.queueBranchRun(runDirection,
+                    Math.min(MAX_BRANCH_RUN_BLOCKS, remaining), false, problem);
+        } else {
+            runDirection = job.heading;
+            planned = this.queueBranchRun(runDirection,
+                    Math.min(MAX_BRANCH_RUN_BLOCKS, Math.max(1, job.nextBranchIn)), false, problem);
+        }
+
+        if (planned < 0) {
+            // A ravine, lava or somebody's cellar can close one heading without closing the level.
+            // Turn the corridor once before calling the trip over, and never loop on a dead heading.
+            String refusal = problem.isEmpty() ? "unknown terrain" : String.join("; ", problem);
+            if (job.headingTurns < 2) {
+                job.headingTurns++;
+                job.heading = job.heading.getClockWise();
+                job.nextBranchIn = Math.min(job.nextBranchIn, job.branchSpacing);
+                String turned = "branch mining cannot continue " + runDirection.getName() + " ("
+                        + refusal + "); turning the corridor to " + job.heading.getName();
+                LOG.info("Bot {} {}", this.bot.getName().getString(), turned);
+                this.actionReports.addLast(turned);
+                return true;
+            }
+            this.completeBranchMine(job, gained, "the level is blocked: " + refusal);
+            return false;
+        }
+
+        if (descending) {
+            job.resumeAt = this.branchRunEnd;
+        } else if (branching) {
+            job.branchBlocksDug += planned;
+            if (job.branchBlocksDug >= job.branchLength) {
+                job.branchesDug++;
+                job.nextBranchIn = job.branchSpacing;
+                job.resumeAt = job.branchJunction;
+                job.branchJunction = null;
+                job.branchSide = -job.branchSide;
+                job.headingTurns = 0;
+                LOG.info("Bot {} branch mining finished branch {}/{} ({} main block(s), {} ore job(s))",
+                        this.bot.getName().getString(), job.branchesDug, job.maxBranches,
+                        job.mainBlocksDug, job.resourcesStarted);
+            } else {
+                job.resumeAt = this.branchRunEnd;
+            }
+        } else {
+            job.mainBlocksDug += planned;
+            job.nextBranchIn -= planned;
+            job.resumeAt = this.branchRunEnd;
+            job.headingTurns = 0;
+        }
+        return true;
+    }
+
+    /** Walk home at the end of a branch-mining trip, the same way a resource trip does. */
+    private boolean returnFromBranchMine(BranchMineJob job, int gained) {
+        BlockPos home = this.homePosition();
+        if (home != null && this.bot.blockPosition().distSqr(home) <= 256.0D) {
+            this.completeBranchMine(job, gained, "arrived back near home");
+            return false;
+        }
+        if (!job.returnScheduled) {
+            String backtrack = this.scheduleJevBacktrack();
+            if (!backtrack.startsWith("failed:")) {
+                job.returnScheduled = true;
+                this.actionReports.addLast("branch mining return -> " + backtrack);
+                return true;
+            }
+        }
+        String returned = this.returnToSpawnNow();
+        this.completeBranchMine(job, gained, returned);
+        return false;
+    }
+
+    private void completeBranchMine(BranchMineJob job, int gained, String reason) {
+        if (this.branchMine != job) {
+            return;
+        }
+        long seconds = Math.max(0L, (this.bot.level().getGameTime() - job.startedAt) / 20L);
+        this.branchMine = null;
+        String outcome = "branch mining finished after " + seconds + "s at y=" + job.targetY + ": "
+                + job.branchesDug + "/" + job.maxBranches + " branch(es), " + job.mainBlocksDug
+                + " main block(s), " + job.resourcesStarted + " ore job(s), gained " + gained
+                + " item(s) matching " + job.primary + ", Jev asked " + job.interruptsAsked
+                + " time(s) and applied " + job.interruptsApplied + "; " + reason;
+        this.lastMiningGoalOutcome = outcome;
+        this.lastMiningGoalGained = gained;
+        this.recordMiningGoalYield(gained);
+        this.actionReports.addLast(outcome);
+        LOG.info("Bot {} {}", this.bot.getName().getString(), outcome);
+        this.cooldownTicks = 0;
+    }
+
+    /**
+     * Watch for the three things that interrupt a branch-mining trip, and let Jev decide about them.
+     *
+     * <p>Only the cases that are actually true are offered, and the candidates are legal by
+     * construction - the rule every typed question in this project follows, so an answer can never
+     * ask for something the bot may not do (a phantom is never offered "fight it"). With no adviser,
+     * or with the gate off, each case falls back to exactly what the runtime did before Jev existed,
+     * so the skill is never worse off for having asked.
+     *
+     * @return true when the trip should hold this tick
+     */
+    private boolean tickBranchInterrupt(BranchMineJob job) {
+        long now = this.bot.level().getGameTime();
+        if (job.interruptPending) {
+            return true;
+        }
+        if (now < job.interruptQuietUntil) {
+            return false;
+        }
+        net.minecraft.world.item.ItemStack tool = this.bot.getMainHandItem();
+        int usesLeft = tool.isEmpty() || !tool.isDamageableItem()
+                ? Integer.MAX_VALUE : tool.getMaxDamage() - tool.getDamageValue();
+        boolean toolWorn = usesLeft <= BRANCH_TOOL_DURABILITY_FLOOR;
+        boolean packFull = this.emptyInventorySlots() <= 2;
+        LivingEntity threat = this.nearestHostileWithin(BRANCH_THREAT_RADIUS);
+
+        String caseName;
+        String state;
+        Map<String, String> candidates = new LinkedHashMap<>();
+        boolean phantom = this.phantomThreatening();
+        if (threat != null) {
+            caseName = "mob_nearby";
+            state = "Branch mining interrupted. bot=" + this.bot.getName().getString()
+                    + "; dimension=" + this.currentDimension()
+                    + "; mob=" + threat.getName().getString()
+                    + "; distance=" + Math.round(Math.sqrt(this.bot.distanceToSqr(threat)))
+                    + "; under_attack=" + this.underAttack()
+                    + "; phantom=" + phantom
+                    + "; health=" + String.format(java.util.Locale.ROOT, "%.1f", this.bot.getHealth())
+                    + "; food=" + this.bot.getFoodData().getFoodLevel()
+                    + "; holding=" + (tool.isEmpty() ? "empty hand" : tool.getHoverName().getString())
+                    + "; tool_uses_left=" + (usesLeft == Integer.MAX_VALUE ? "n/a" : usesLeft)
+                    + "; empty_slots=" + this.emptyInventorySlots()
+                    + "; target=" + job.primary
+                    + "; branches_done=" + job.branchesDug + "/" + job.maxBranches;
+            candidates.put("KEEP_MINING", "The mob is not a threat yet; carry on with the pattern");
+            if (!phantom) {
+                candidates.put("SWAP_TO_WEAPON",
+                        "Hold the best weapon and fight it off before carrying on");
+            }
+            candidates.put("RETREAT_HOME", "Abandon the trip and get out of the mine");
+            candidates.put("ESCALATE_LLM", "None of these fit; ask the planning model");
+        } else if (toolWorn) {
+            caseName = "tool_worn";
+            state = "Branch mining interrupted. bot=" + this.bot.getName().getString()
+                    + "; holding=" + (tool.isEmpty() ? "empty hand" : tool.getHoverName().getString())
+                    + "; tool_uses_left=" + (usesLeft == Integer.MAX_VALUE ? "n/a" : usesLeft)
+                    + "; spare_tool=" + (this.hasSpareTool() ? "yes" : "no")
+                    + "; empty_slots=" + this.emptyInventorySlots()
+                    + "; target=" + job.primary
+                    + "; branches_done=" + job.branchesDug + "/" + job.maxBranches
+                    + "; main_blocks=" + job.mainBlocksDug;
+            if (this.hasSpareTool()) {
+                candidates.put("SWAP_TOOL", "Hold another pickaxe you are carrying and carry on");
+            }
+            candidates.put("KEEP_MINING", "Use this tool until it breaks; there is more to find");
+            candidates.put("RETURN_HOME", "End the trip now and bank what you have");
+            candidates.put("ESCALATE_LLM", "None of these fit; ask the planning model");
+        } else if (packFull) {
+            caseName = "pack_full";
+            state = "Branch mining interrupted. bot=" + this.bot.getName().getString()
+                    + "; empty_slots=" + this.emptyInventorySlots()
+                    + "; target=" + job.primary
+                    + "; branches_done=" + job.branchesDug + "/" + job.maxBranches
+                    + "; main_blocks=" + job.mainBlocksDug
+                    + "; carrying=" + this.matchingResourceCount(job.primary) + " matching item(s)";
+            candidates.put("RETURN_HOME", "End the trip and take the haul home");
+            candidates.put("KEEP_MINING", "Carry on; anything that will not fit can be dropped");
+            candidates.put("ESCALATE_LLM", "None of these fit; ask the planning model");
+        } else {
+            return false;
+        }
+
+        JevClient adviser = this.jevClient;
+        JevClient.GateMode mode = adviser == null ? JevClient.GateMode.OFF
+                : adviser.settings().interrupts();
+        LOG.info("Bot {} branch mining interrupt: case={} holding={} uses_left={} adviser={} gate={}",
+                this.bot.getName().getString(), caseName,
+                tool.isEmpty() ? "empty" : tool.getHoverName().getString(),
+                usesLeft == Integer.MAX_VALUE ? "n/a" : usesLeft,
+                adviser == null ? "none" : "present", mode);
+        if (adviser == null || !adviser.settings().isUsable() || mode == JevClient.GateMode.OFF) {
+            this.applyDefaultInterrupt(job, caseName);
+            return true;
+        }
+        job.interruptPending = true;
+        job.interruptsAsked++;
+        job.lastInterrupt = caseName;
+        String askedState = state;
+        String askedCase = caseName;
+        Map<String, String> askedCandidates = candidates;
+        CompletableFuture
+                .supplyAsync(() -> adviser.choose(askedState, "mining_interrupt",
+                        com.melody.mcagent.rt.llm.JevPrompts.MINING_INTERRUPT, askedCandidates),
+                        executor())
+                .thenAccept(choice -> this.bot.server.execute(
+                        () -> this.applyBranchInterrupt(job, adviser, mode, askedCase, choice)));
+        return true;
+    }
+
+    /** What the trip did about an interruption before Jev existed, used when nobody can be asked. */
+    private void applyDefaultInterrupt(BranchMineJob job, String caseName) {
+        job.interruptQuietUntil = this.bot.level().getGameTime() + BRANCH_INTERRUPT_QUIET_TICKS;
+        if ("pack_full".equals(caseName)) {
+            job.returning = true;
+            this.actionReports.addLast("branch mining is returning: the pack is full and no adviser "
+                    + "could be asked about it");
+        }
+    }
+
+    /** Apply a Jev answer on the server thread: only the whitelisted, bounded choices move the bot. */
+    private void applyBranchInterrupt(BranchMineJob job, JevClient adviser, JevClient.GateMode mode,
+                                      String caseName, JevClient.Choice choice) {
+        if (this.branchMine != job) {
+            return;
+        }
+        job.interruptPending = false;
+        long now = this.bot.level().getGameTime();
+        boolean failed = choice.failed();
+        boolean confident = !failed && choice.confidence() >= MIN_ACTIVE_JEV_CONFIDENCE;
+        boolean applied = mode == JevClient.GateMode.ACTIVE && confident;
+        LOG.info("JEV {} bot={} event=MINING_INTERRUPT case={} choice={} confidence={} applied={} "
+                        + "error={}",
+                mode == JevClient.GateMode.ACTIVE ? "ACTIVE" : "SHADOW",
+                this.bot.getName().getString(), caseName, choice.choice(),
+                String.format(java.util.Locale.ROOT, "%.3f", choice.confidence()), applied,
+                failed ? firstLine(choice.error()) : "-");
+        if (!applied) {
+            // Low confidence, an error or shadow mode: keep mining, and do not ask again for a while.
+            job.interruptQuietUntil = now + BRANCH_INTERRUPT_QUIET_TICKS;
+            if (failed) {
+                this.applyDefaultInterrupt(job, caseName);
+            }
+            return;
+        }
+        job.interruptsApplied++;
+        job.interruptQuietUntil = now + BRANCH_INTERRUPT_QUIET_TICKS;
+        switch (choice.choice()) {
+            case "KEEP_MINING" -> this.actionReports.addLast(
+                    "Jev judged the " + caseName.replace('_', ' ') + " not worth stopping for ("
+                            + String.format(java.util.Locale.ROOT, "%.2f", choice.confidence())
+                            + "); carrying on with the pattern");
+            case "SWAP_TOOL" -> {
+                String swapped = this.swapToBestTool(new String[] { "diamond_pickaxe",
+                        "iron_pickaxe", "stone_pickaxe", "wooden_pickaxe" });
+                this.actionReports.addLast("Jev said to change tools: " + swapped);
+            }
+            case "SWAP_TO_WEAPON" -> {
+                String swapped = this.swapToBestTool(new String[] { "diamond_sword", "iron_sword",
+                        "stone_sword", "wooden_sword", "diamond_axe", "iron_axe", "stone_axe" });
+                this.actionReports.addLast("Jev said to arm up: " + swapped);
+            }
+            case "RETURN_HOME" -> {
+                job.returning = true;
+                this.actionReports.addLast("Jev ended the branch-mining trip: returning home now");
+            }
+            case "RETREAT_HOME" -> {
+                job.returning = true;
+                this.breakOffForDanger("Jev read the " + caseName.replace('_', ' ') + " as dangerous");
+                this.headHome(true);
+                this.actionReports.addLast("Jev said to get out: heading home");
+            }
+            case "ESCALATE_LLM" -> this.handMiningBackToModel(job,
+                    "Jev could not decide about a " + caseName.replace('_', ' ')
+                            + " (confidence " + String.format(java.util.Locale.ROOT, "%.2f",
+                                    choice.confidence()) + ")");
+            default -> this.handMiningBackToModel(job,
+                    "Jev answered '" + choice.choice() + "', which was not offered");
+        }
+    }
+
+    /** Give the trip back to the planning model, with the reason in the next observation. */
+    private void handMiningBackToModel(BranchMineJob job, String why) {
+        if (this.branchMine != job) {
+            return;
+        }
+        this.branchMine = null;
+        String outcome = "branch mining handed back to the model: " + why;
+        this.lastMiningGoalOutcome = outcome;
+        this.actionReports.addLast(outcome + " - decide what to do about it now");
+        LOG.info("Bot {} {}", this.bot.getName().getString(), outcome);
+        this.cooldownTicks = 0;
+    }
+
+    /** Hold the first of these the bot has, preferring the order given. */
+    private String swapToBestTool(String[] preference) {
+        for (String query : preference) {
+            Actions.Result held = Actions.holdItem(this.bot, query);
+            if (held.success()) {
+                return held.message();
+            }
+        }
+        return "failed: nothing suitable to hold";
+    }
+
+    /** Whether the bot carries another pickaxe besides the one in its hand. */
+    private boolean hasSpareTool() {
+        var inventory = this.bot.getInventory();
+        for (int slot = 0; slot < inventory.getContainerSize(); slot++) {
+            if (slot == inventory.selected) {
+                continue;
+            }
+            if (Actions.isUsablePickaxe(inventory.getItem(slot))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    @Nullable
+    private LivingEntity nearestHostileWithin(double radius) {
+        List<net.minecraft.world.entity.monster.Monster> found = this.bot.level().getEntitiesOfClass(
+                net.minecraft.world.entity.monster.Monster.class,
+                this.bot.getBoundingBox().inflate(radius), mob -> mob.isAlive() && !mob.isRemoved());
+        LivingEntity nearest = null;
+        double best = Double.MAX_VALUE;
+        for (var mob : found) {
+            double distance = this.bot.distanceToSqr(mob);
+            if (distance < best) {
+                best = distance;
+                nearest = mob;
+            }
+        }
+        return nearest;
     }
 
     private void completeMiningGoal(MiningGoal goal, int gained, String reason) {
@@ -2038,7 +2798,8 @@ public final class AgentBrain {
         if (this.decisionGoalVersion != this.standingGoalVersion) {
             return "failed: the standing objective changed while this decision was in flight";
         }
-        if (this.isLongActionRunning() || !this.queue.isEmpty() || this.miningGoal != null) {
+        if (this.isLongActionRunning() || !this.queue.isEmpty() || this.miningGoal != null
+                || this.branchMine != null) {
             return "failed: work is still running; complete the standing objective after it finishes";
         }
         if (this.turnCalls != null && this.executingCallIndex >= 0) {
@@ -2298,6 +3059,129 @@ public final class AgentBrain {
         return this.digTunnel(directionName, modeName, requestedLength, requestedItem, false);
     }
 
+    /**
+     * Whether one cell of a straight run may be dug, and which blocks that cell has to clear.
+     *
+     * <p>{@code dig_tunnel} and the branch-mining controller both come through here, so the two can
+     * never disagree about fluid, falling blocks, unbreakable terrain, player-built structures or the
+     * protected home surface - the rules a branch would otherwise be free to ignore simply because it
+     * was not {@code dig_tunnel} that asked.
+     *
+     * @param feet     where the bot will stand for this cell
+     * @param levelRun true for a horizontal run, false for a descending one
+     * @param runStart where the run began, for the player-structure test
+     * @param clear    appended with the blocks this cell must break; empty on refusal
+     * @return the reason the cell may not be dug, or null when it is fine
+     */
+    @Nullable
+    private String checkRunCell(BlockPos feet, boolean levelRun, BlockPos runStart,
+                                List<BlockPos> clear) {
+        if (!(this.bot.level() instanceof net.minecraft.server.level.ServerLevel level)) {
+            return "your current dimension cannot be excavated";
+        }
+        List<BlockPos> clearance = levelRun
+                ? List.of(feet, feet.above())
+                : List.of(feet, feet.above(), feet.above(2));
+        for (BlockPos pos : clearance) {
+            if (com.melody.mcagent.rt.path.PathFinder.canPass(level, pos)) {
+                continue;
+            }
+            // A horizontal tunnel in the surface band is a trench. The one entrance may descend
+            // through this band, but branch/strip mining starts only after it is underground.
+            if (levelRun && this.isProtectedHomeSurface(pos)) {
+                return "the protected home surface at " + pos.toShortString()
+                        + "; descend through the established entrance before branch mining";
+            }
+            BlockState state = level.getBlockState(pos);
+            if (!state.getFluidState().isEmpty()
+                    || state.getBlock() instanceof FallingBlock
+                    || level.getBlockEntity(pos) != null
+                    || Actions.ticksToBreak(this.bot, pos) == Integer.MAX_VALUE) {
+                return "fluid, falling, protected or unbreakable terrain at " + pos.toShortString();
+            }
+            if (PlayerStructure.isProtected(level, runStart, pos)) {
+                return "the player-built structure at " + pos.toShortString();
+            }
+            clear.add(pos.immutable());
+        }
+        return null;
+    }
+
+    /**
+     * Queue one straight run of tunnel cells from where the bot stands, for a skill that owns its own
+     * path - the branch-mining controller. Unlike {@code dig_tunnel} this never walks back to a saved
+     * working face and never touches the single-entrance rule: the pattern it serves is the path.
+     *
+     * @return how many blocks of the run were queued, or -1 when nothing could be dug
+     */
+    private int queueBranchRun(Direction direction, int length, boolean descending,
+                               List<String> problem) {
+        if (!(this.bot.level() instanceof net.minecraft.server.level.ServerLevel level)) {
+            problem.add("your current dimension cannot be excavated");
+            return -1;
+        }
+        BlockPos start = this.bot.blockPosition();
+        List<TunnelStep> planned = new ArrayList<>();
+        for (int index = 1; index <= length; index++) {
+            BlockPos feet = start.relative(direction, index);
+            if (descending) {
+                feet = feet.below(index);
+            }
+            if (feet.getY() <= level.getMinBuildHeight()
+                    || !level.getWorldBorder().isWithinBounds(feet)) {
+                problem.add("the world boundary");
+                break;
+            }
+            BlockPos floor = feet.below();
+            BlockState floorState = level.getBlockState(floor);
+            if (floorState.getCollisionShape(level, floor).isEmpty()
+                    || !floorState.getFluidState().isEmpty()
+                    || floorState.getBlock() instanceof FallingBlock
+                    || isEscapeHazard(floorState)) {
+                problem.add("an unsafe or missing floor at " + floor.toShortString());
+                break;
+            }
+            List<BlockPos> clear = new ArrayList<>(descending ? 3 : 2);
+            String refusal = this.checkRunCell(feet, !descending, start, clear);
+            if (refusal != null) {
+                problem.add(refusal);
+                break;
+            }
+            if (ceilingWouldFall(level, feet, 2)) {
+                problem.add("the gravel or sand above " + feet.toShortString()
+                        + ", which would fall in on you");
+                break;
+            }
+            planned.add(new TunnelStep(feet.immutable(), List.copyOf(clear)));
+            if (planned.size() >= MAX_BRANCH_RUN_BLOCKS) {
+                break;
+            }
+        }
+        if (planned.isEmpty()) {
+            return -1;
+        }
+        int sequence = 0;
+        for (TunnelStep step : planned) {
+            for (BlockPos clear : step.clear()) {
+                this.authorisedTunnelClearance.add(clear.immutable());
+                JsonObject mine = new JsonObject();
+                mine.addProperty("x", clear.getX());
+                mine.addProperty("y", clear.getY());
+                mine.addProperty("z", clear.getZ());
+                this.queue.addLast(new QueuedCall(new LlmClient.ToolCall(
+                        "branch_mine_" + (++sequence), "mine", mine), -1, true));
+            }
+            JsonObject walk = new JsonObject();
+            walk.addProperty("x", step.feet().getX());
+            walk.addProperty("y", step.feet().getY());
+            walk.addProperty("z", step.feet().getZ());
+            this.queue.addLast(new QueuedCall(new LlmClient.ToolCall(
+                    "branch_walk_" + (++sequence), "goto", walk), -1, true));
+        }
+        this.branchRunEnd = planned.get(planned.size() - 1).feet();
+        return planned.size();
+    }
+
     public String digTunnel(String directionName, String modeName, int requestedLength,
                             String requestedItem, boolean newSite) {
         if (!this.policy.canBreakBlocks()) {
@@ -2445,43 +3329,12 @@ public final class AgentBrain {
             // lowered the player, its 1.8-block body still intersects that third block. The exact
             // same collision is why upward escape stairs clear three blocks.
             List<BlockPos> clear = new ArrayList<>("down".equals(mode) ? 3 : 2);
-            boolean safe = true;
-            List<BlockPos> clearance = "down".equals(mode)
-                    ? List.of(feet, feet.above(), feet.above(2))
-                    : List.of(feet, feet.above());
-            for (BlockPos pos : clearance) {
-                if (com.melody.mcagent.rt.path.PathFinder.canPass(level, pos)) {
-                    continue;
-                }
-                // A horizontal tunnel in the surface band is a trench. The one entrance may descend
-                // through this band, but branch/strip mining starts only after it is underground.
-                if ("level".equals(mode) && this.isProtectedHomeSurface(pos)) {
-                    safe = false;
-                    stoppedBy = "the protected home surface at " + pos.toShortString()
-                            + "; descend through the established entrance before branch mining";
-                    break;
-                }
-                BlockState state = level.getBlockState(pos);
-                if (!state.getFluidState().isEmpty()
-                        || state.getBlock() instanceof FallingBlock
-                        || level.getBlockEntity(pos) != null
-                        || Actions.ticksToBreak(this.bot, pos) == Integer.MAX_VALUE) {
-                    safe = false;
-                    stoppedBy = "fluid, falling, protected or unbreakable terrain at "
-                            + pos.toShortString();
-                    break;
-                }
-                if (PlayerStructure.isProtected(level, start, pos)) {
-                    safe = false;
-                    stoppedBy = "the player-built structure at " + pos.toShortString();
-                    break;
-                }
-                clear.add(pos.immutable());
-                blocks++;
-            }
-            if (!safe) {
+            String cellProblem = this.checkRunCell(feet, "level".equals(mode), start, clear);
+            if (cellProblem != null) {
+                stoppedBy = cellProblem;
                 break;
             }
+            blocks += clear.size();
             // Same rule as the escape stair: a tunnel whose ceiling is gravel drops it on the digger.
             if (ceilingWouldFall(level, feet, 2)) {
                 stoppedBy = "the gravel or sand above " + feet.toShortString()
@@ -2872,6 +3725,10 @@ public final class AgentBrain {
         // Advance whatever long-running thing owns the bot, and notice when a journey ends.
         this.tickDangerReflex();
 
+        // The field's ripeness is considered even while something else owns the bot: the answer is a
+        // scheduling decision, and its "later" lands on the todo list rather than on a model call.
+        this.tickFarmRipeness();
+
         boolean busy = this.tickCombatJob();
         busy = this.tickMineJob() || busy;
         busy = this.tickFarmBuildJob() || busy;
@@ -2968,6 +3825,29 @@ public final class AgentBrain {
         }
         if (!addressed && this.miningGoal != null) {
             return;
+        }
+
+        // A branch-mining trip owns the bot the same way, and for the same reason: it buys no
+        // planning turns while it runs. Its interruptions are checked here, every tick, so a worn
+        // tool or a full pack reaches Jev while the run is still going.
+        if (!addressed && this.branchMine != null && !this.thinking.get()) {
+            this.tickBranchInterrupt(this.branchMine);
+        }
+        if (!addressed && !busy && this.queue.isEmpty() && this.branchMine != null
+                && !this.thinking.get()) {
+            this.advanceBranchMine();
+            if (!this.queue.isEmpty()) {
+                this.runQueued();
+            }
+            busy = this.isLongActionRunning();
+        }
+        if (!addressed && this.branchMine != null) {
+            return;
+        }
+
+        // A todo item is work the bot already decided to do; picking it up must cost no model turn.
+        if (!addressed) {
+            this.tickTodo();
         }
 
         // A field being built owns the bot outright, the way the mining goal does. Merely being busy
@@ -5392,7 +6272,10 @@ public final class AgentBrain {
                     "Start one persistent mining trip and return immediately. Use this for player "
                     + "requests such as 'go mining' or 'bring back 32 iron': the runtime repeatedly "
                     + "finds priority ores, creates/reuses the one safe tunnel, mines, watches "
-                    + "inventory/health/hunger, and returns home without another planning call. Do "
+                    + "inventory/health/hunger, and returns home without another planning call. With "
+                    + "mode=branch it digs a fishbone at y instead: a main corridor with side "
+                    + "branches, diverting to any ore its scan sees through the rock, still with no "
+                    + "further planning calls. Do "
                     + "not also submit per-block mine/dig_tunnel/escape plans for the same trip.",
                     miningGoalSchema()));
 
@@ -5728,6 +6611,43 @@ public final class AgentBrain {
         amount.addProperty("description",
                 "optional new primary-resource items to obtain; 0 means a normal trip");
         properties.add("amount", amount);
+
+        JsonObject mode = new JsonObject();
+        mode.addProperty("type", "string");
+        mode.addProperty("description",
+                "resource (default): chase visible ores and dive for them; branch: one main corridor "
+                + "at y with side branches, scanning for ore through the rock the whole time");
+        properties.add("mode", mode);
+
+        JsonObject branchY = new JsonObject();
+        branchY.addProperty("type", "number");
+        branchY.addProperty("description",
+                "branch mode: the level to mine at (never above where you stand), e.g. -54 for "
+                + "diamonds at the deepslate layers");
+        properties.add("y", branchY);
+
+        JsonObject branchDirection = new JsonObject();
+        branchDirection.addProperty("type", "string");
+        branchDirection.addProperty("description",
+                "branch mode: heading of the main corridor: north, south, east or west");
+        properties.add("direction", branchDirection);
+
+        JsonObject branchSpacing = new JsonObject();
+        branchSpacing.addProperty("type", "number");
+        branchSpacing.addProperty("description",
+                "branch mode: main-corridor blocks between branches, default 6");
+        properties.add("branch_spacing", branchSpacing);
+
+        JsonObject branchLength = new JsonObject();
+        branchLength.addProperty("type", "number");
+        branchLength.addProperty("description", "branch mode: blocks per branch, default 16");
+        properties.add("branch_length", branchLength);
+
+        JsonObject branchMax = new JsonObject();
+        branchMax.addProperty("type", "number");
+        branchMax.addProperty("description",
+                "branch mode: how many branches before returning home, default 8");
+        properties.add("max_branches", branchMax);
 
         JsonObject chunks = new JsonObject();
         chunks.addProperty("type", "number");
@@ -8113,6 +9033,28 @@ public final class AgentBrain {
         out.put("uncachedPromptTokens", this.totalUncachedPromptTokens);
         out.put("tokenBudget", this.tokenBudget);
         out.put("standingGoal", this.standingGoal == null ? "(none)" : this.standingGoal);
+        out.put("todoSize", this.todo.size());
+        if (!this.todo.isEmpty()) {
+            out.put("todoNext", this.todo.peekFirst().description());
+        }
+        FarmGoal field = this.farmGoal;
+        if (field != null) {
+            out.put("farmRipePingPending", field.ripePingPending);
+            out.put("farmLastHarvestTick", field.lastHarvestTick);
+            out.put("farmHarvested", field.harvested);
+        }
+        BranchMineJob branch = this.branchMine;
+        out.put("branchMining", branch != null);
+        if (branch != null) {
+            out.put("branchTargetY", branch.targetY);
+            out.put("branchBranchesDug", branch.branchesDug);
+            out.put("branchMainBlocks", branch.mainBlocksDug);
+            out.put("branchOreJobs", branch.resourcesStarted);
+            out.put("branchInterruptsAsked", branch.interruptsAsked);
+            out.put("branchInterruptsApplied", branch.interruptsApplied);
+            out.put("branchLastInterrupt", branch.lastInterrupt);
+            out.put("branchReturning", branch.returning);
+        }
         out.put("paused", this.paused);
         // What the survival reflex is doing: whether the bot has broken off work to recover, and
         // what it last said about it. Read by the danger harness and by anyone debugging a bot that

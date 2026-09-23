@@ -39,6 +39,38 @@ public final class JevPrompts {
             + "situation is not covered by these options.";
 
     /**
+     * Mining interrupt: what to do when a branch-mining trip is interrupted.
+     *
+     * <p>The caller offers only the choices that are legal for the case it is asking about, so the
+     * instruction states the rule behind each candidate instead of listing them. The asymmetry is the
+     * same one the routing prompt encodes: an unnecessary trip home throws away a long walk, while
+     * ignoring a real threat loses the bot and everything it is carrying.
+     */
+    public static final String MINING_INTERRUPT =
+            "A Minecraft bot is branch-mining underground and something interrupted the trip. Decide "
+            + "what it does now, in one step. KEEP_MINING when the interruption is minor: a mob that "
+            + "is not attacking yet, a tool with wear left, or a pack that still has room. SWAP_TOOL "
+            + "when changing what the bot holds removes the problem by itself (a fresh pickaxe, or a "
+            + "weapon for a mob that is reachable). RETURN_HOME when the trip is effectively over: the "
+            + "pack is full, the last usable tool is about to break, or the bot has what it came for. "
+            + "RETREAT_HOME when there is real danger the bot cannot answer. ESCALATE_LLM only when "
+            + "none of the offered options fits.";
+
+    /**
+     * Farm ripeness: harvest now, remember it for an idle moment, or leave it alone.
+     *
+     * <p>A scheduling question rather than a survival one - harvesting costs a walk, and crops keep
+     * perfectly well in the ground. The three answers are deliberately about *when*: TODO_LATER is
+     * the one that lets a busy bot stay busy without forgetting the field.
+     */
+    public static final String FARM_RIPE =
+            "A Minecraft bot keeps a field and its crops are close to ripe. Decide when it should go "
+            + "and harvest. HARVEST_NOW when the field is ready and going there now is the best use of "
+            + "the bot\'s time. TODO_LATER when the bot is busy with something more important and the "
+            + "harvest can wait for an idle moment - say so and it is remembered. WAIT when the crops "
+            + "are not ready yet and asking again later is enough.";
+
+    /**
      * Whether an ordinary decision tick needs the planning model at all.
      *
      * <p>This is the cheapest decision in the system and the one that saves the most: a 12k-token

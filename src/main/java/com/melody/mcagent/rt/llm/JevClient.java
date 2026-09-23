@@ -83,12 +83,13 @@ public final class JevClient {
     /** Runtime-only configuration, so enabling Jev never requires a shared-server restart. */
     public record Settings(boolean enabled, String endpoint, String apiKey, String model,
                            int timeoutMillis, boolean shadowMode, GateMode speechGate,
-                           GateMode routing, Protocol protocol, int maxTokens) {
+                           GateMode routing, GateMode interrupts, Protocol protocol,
+                           int maxTokens) {
 
         public static Settings disabled() {
             return new Settings(false, "https://opencode.ai/zen/v1/systemone", "",
-                    "jev-1.13-free", 5000, true, GateMode.OFF, GateMode.OFF, Protocol.SYSTEM_ONE,
-                    1500);
+                    "jev-1.13-free", 5000, true, GateMode.OFF, GateMode.OFF, GateMode.OFF,
+                    Protocol.SYSTEM_ONE, 1500);
         }
 
         public boolean isUsable() {
@@ -123,6 +124,7 @@ public final class JevClient {
             boolean shadow = Boolean.parseBoolean(values.getProperty("shadowMode", "true").trim());
             GateMode gate = GateMode.parse(values.getProperty("speechGate", "shadow"));
             GateMode routing = GateMode.parse(values.getProperty("routing", "shadow"));
+            GateMode interrupts = GateMode.parse(values.getProperty("interrupts", "shadow"));
             Protocol protocol = Protocol.parse(values.getProperty("protocol", "systemone"));
             int maxTokens;
             try {
@@ -131,7 +133,7 @@ public final class JevClient {
                 maxTokens = 1500;
             }
             return new Settings(enabled, endpoint, apiKey, model,
-                    Math.max(500, Math.min(30000, timeout)), shadow, gate, routing, protocol,
+                    Math.max(500, Math.min(30000, timeout)), shadow, gate, routing, interrupts, protocol,
                     Math.max(64, Math.min(32000, maxTokens)));
         }
 
@@ -142,6 +144,7 @@ public final class JevClient {
                     + " mode=" + (this.shadowMode ? "shadow" : "active")
                     + " speech_gate=" + this.speechGate.name().toLowerCase(java.util.Locale.ROOT)
                     + " routing=" + this.routing.name().toLowerCase(java.util.Locale.ROOT)
+                    + " interrupts=" + this.interrupts.name().toLowerCase(java.util.Locale.ROOT)
                     + " protocol=" + this.protocol.name().toLowerCase(java.util.Locale.ROOT);
         }
     }

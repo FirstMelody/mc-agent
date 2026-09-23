@@ -20,6 +20,7 @@ import com.melody.mcagent.rt.bot.DangerReflexSmokeTest;
 import com.melody.mcagent.rt.bot.EscapeSmokeTest;
 import com.melody.mcagent.rt.bot.FarmBuildSmokeTest;
 import com.melody.mcagent.rt.bot.FarmSmokeTest;
+import com.melody.mcagent.rt.bot.BranchMineSmokeTest;
 import com.melody.mcagent.rt.bot.JevSpeechGateSmokeTest;
 import com.melody.mcagent.rt.bot.JevMiningRecoverySmokeTest;
 import com.melody.mcagent.rt.bot.JevRoutingSmokeTest;
@@ -265,6 +266,7 @@ public final class RuntimeEntry implements AgentRuntime {
         add(JevSpeechGateSmokeTest.arm(server));
         add(JevRoutingSmokeTest.arm(server));
         add(JevMiningRecoverySmokeTest.arm(server));
+        add(BranchMineSmokeTest.arm(server));
         add(CommandUxSmokeTest.arm(server));
     }
 

@@ -31,6 +31,7 @@ public final class Replay {
         double threshold = Double.parseDouble(System.getProperty("threshold", "0.6"));
         JevClient client = new JevClient(new JevClient.Settings(true, endpoint, key, model,
                 8000, true, JevClient.GateMode.ACTIVE, JevClient.GateMode.SHADOW,
+                JevClient.GateMode.SHADOW,
                 JevClient.Protocol.SYSTEM_ONE, 800));
 
         Map<String, String> speech = new LinkedHashMap<>();

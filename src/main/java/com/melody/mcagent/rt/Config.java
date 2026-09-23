@@ -75,7 +75,7 @@ public final class Config {
                 && newSettings.apiKey() != null && !newSettings.apiKey().isBlank()) {
             jev = new JevClient.Settings(true, jev.endpoint(), newSettings.apiKey(), jev.model(),
                     jev.timeoutMillis(), jev.shadowMode(), jev.speechGate(), jev.routing(),
-                    jev.protocol(), jev.maxTokens());
+                    jev.interrupts(), jev.protocol(), jev.maxTokens());
         }
         brains.applyJevSettings(jev);
         brains.setPolicy(policy());

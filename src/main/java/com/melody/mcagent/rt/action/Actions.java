@@ -756,6 +756,11 @@ public final class Actions {
         return Result.fail("you are not carrying any '" + rawQuery + "'");
     }
 
+    /** Whether this stack is a pickaxe, by tag, so modded pickaxes count too. */
+    public static boolean isUsablePickaxe(ItemStack stack) {
+        return !stack.isEmpty() && stack.is(net.minecraft.tags.ItemTags.PICKAXES);
+    }
+
     /** Does this stack answer to the requested id or name? Shared with {@link Stations}. */
     static boolean matchesItem(ItemStack stack, String wantedId, String rawQuery) {
         if (stack.isEmpty()) {
