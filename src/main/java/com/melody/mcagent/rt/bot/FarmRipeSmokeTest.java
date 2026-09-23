@@ -240,7 +240,7 @@ public final class FarmRipeSmokeTest implements TestHook {
         int count = 0;
         for (int dx = -FIELD_RADIUS; dx <= FIELD_RADIUS; dx++) {
             for (int dz = -FIELD_RADIUS; dz <= FIELD_RADIUS; dz++) {
-                BlockState state = this.level.getBlockState(this.centre.offset(dx, 1, dz));
+                BlockState state = this.level.getBlockState(this.centre.offset(dx, 0, dz));
                 if (state.is(Blocks.WHEAT) && state.getValue(BlockStateProperties.AGE_7) >= 7) {
                     count++;
                 }
@@ -253,7 +253,7 @@ public final class FarmRipeSmokeTest implements TestHook {
         int count = 0;
         for (int dx = -FIELD_RADIUS; dx <= FIELD_RADIUS; dx++) {
             for (int dz = -FIELD_RADIUS; dz <= FIELD_RADIUS; dz++) {
-                BlockState state = this.level.getBlockState(this.centre.offset(dx, 1, dz));
+                BlockState state = this.level.getBlockState(this.centre.offset(dx, 0, dz));
                 if (state.is(Blocks.WHEAT)) {
                     count++;
                 }
@@ -266,7 +266,7 @@ public final class FarmRipeSmokeTest implements TestHook {
         int ripened = 0;
         for (int dx = -FIELD_RADIUS; dx <= FIELD_RADIUS; dx++) {
             for (int dz = -FIELD_RADIUS; dz <= FIELD_RADIUS; dz++) {
-                BlockPos pos = this.centre.offset(dx, 1, dz);
+                BlockPos pos = this.centre.offset(dx, 0, dz);
                 BlockState state = this.level.getBlockState(pos);
                 if (state.is(Blocks.WHEAT)) {
                     this.level.setBlockAndUpdate(pos, state.setValue(BlockStateProperties.AGE_7, 7));
@@ -284,7 +284,11 @@ public final class FarmRipeSmokeTest implements TestHook {
         int z = spawn.getZ() + 120;
         int surface = this.level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
         this.centre = new BlockPos(x, surface, z);
-        this.busyTarget = this.centre.offset(4, 0, 0);
+        // Right beside the bot, standing on its own floor with headroom: the first cut aimed four
+        // blocks away in a half-cleared patch and the runtime answered NO_SAFE_MINING_ACCESS, so the
+        // bot was never busy and the farm skill harvested the field before the ripeness question
+        // could even be asked.
+        this.busyTarget = this.centre.offset(2, 0, 3);
         // Everything the bot and its busy-work target need: floor, headroom, and no leftover surface
         // blocks in the way. The first cut only cleared the field itself, so the mining job aimed at a
         // block with no walkable floor under it and came back NO_SAFE_MINING_ACCESS - the bot was
@@ -301,9 +305,9 @@ public final class FarmRipeSmokeTest implements TestHook {
         }
         for (int dx = -FIELD_RADIUS; dx <= FIELD_RADIUS; dx++) {
             for (int dz = -FIELD_RADIUS; dz <= FIELD_RADIUS; dz++) {
-                this.level.setBlockAndUpdate(this.centre.offset(dx, 0, dz),
+                this.level.setBlockAndUpdate(this.centre.offset(dx, -1, dz),
                         Blocks.FARMLAND.defaultBlockState());
-                this.level.setBlockAndUpdate(this.centre.offset(dx, 1, dz),
+                this.level.setBlockAndUpdate(this.centre.offset(dx, 0, dz),
                         Blocks.WHEAT.defaultBlockState().setValue(BlockStateProperties.AGE_7, 0));
             }
         }
@@ -312,6 +316,12 @@ public final class FarmRipeSmokeTest implements TestHook {
         this.level.setBlockAndUpdate(this.busyTarget, Blocks.STONE.defaultBlockState());
         this.level.setBlockAndUpdate(this.busyTarget.above(), Blocks.AIR.defaultBlockState());
         this.level.setBlockAndUpdate(this.busyTarget.below(), Blocks.DIRT.defaultBlockState());
+        // Walkable strip from the bot to the block it will mine.
+        for (int step = 0; step <= 2; step++) {
+            BlockPos foot = this.centre.offset(step, 0, 3);
+            this.level.setBlockAndUpdate(foot, Blocks.AIR.defaultBlockState());
+            this.level.setBlockAndUpdate(foot.below(), Blocks.DIRT.defaultBlockState());
+        }
 
         try {
             AtomicInteger turns = new AtomicInteger();
