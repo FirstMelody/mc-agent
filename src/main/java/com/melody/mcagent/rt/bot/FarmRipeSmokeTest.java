@@ -66,6 +66,7 @@ public final class FarmRipeSmokeTest implements TestHook {
     private boolean phaseStarted;
     private int ticks;
     private int requestsAtFieldAdoption = -1;
+    private AgentBrain adoptedBrain;
     private BlockPos busyTarget;
     private final List<String> failures = new java.util.ArrayList<>();
 
@@ -102,8 +103,9 @@ public final class FarmRipeSmokeTest implements TestHook {
             this.finish("the bot disappeared");
             return;
         }
-        if (!this.nudged && this.ticks > 20) {
+        if (!this.nudged && this.ticks > 20 && this.brain() != null) {
             this.nudged = true;
+            LOG.info("RIPETEST nudge        : brain present, asking for one decision");
             TestHook.nudge(handle.player());
         }
         if (this.ticks - this.phaseTick > PHASE_CAP_TICKS) {
@@ -135,6 +137,7 @@ public final class FarmRipeSmokeTest implements TestHook {
             return;
         }
         this.requestsAtFieldAdoption = this.model.requestCount();
+        this.adoptedBrain = this.brain();
         LOG.info("RIPETEST field        : adopted at {} radius {} with {} request(s)",
                 this.centre.toShortString(), FIELD_RADIUS, this.model.requestCount());
         this.nextPhase("crops ripen while the bot mines: Jev is asked and answers TODO_LATER");
@@ -161,9 +164,10 @@ public final class FarmRipeSmokeTest implements TestHook {
         if (this.ticks % 20 == 0) {
             Map<String, Object> seen = this.state();
             Object reflex = seen.get("lastReflexReport");
-            LOG.info("RIPETEST waiting      : jevAsked={} ripe={} crops={} farmGoal={} pingPending={} "
+            LOG.info("RIPETEST waiting      : sameBrain={} jevAsked={} ripe={} crops={} farmGoal={} pingPending={} "
                             + "harvested={} todo={} cooldown={}",
-                    this.jev.calls("farm_ripe"), this.ripeStanding(), this.cropsStanding(),
+                    this.brain() == this.adoptedBrain, this.jev.calls("farm_ripe"),
+                    this.ripeStanding(), this.cropsStanding(),
                     seen.get("farmLastHarvestTick") != null, seen.get("farmRipePingPending"),
                     seen.get("farmHarvested"), seen.get("todoSize"), seen.get("cooldownTicks"));
             if (reflex != null) {
@@ -319,10 +323,17 @@ public final class FarmRipeSmokeTest implements TestHook {
             this.finish("could not spawn the bot");
             return;
         }
+        // The join path does not attach a brain in a dev harness (proved: "none at spawn" and then no
+        // brain ever appeared), so the test attaches one itself, as the tunnel and branch harnesses
+        // do. The earlier "field goal vanished" was NOT two brains: sameBrain=true ruled the lookup
+        // instability out, and the log shows no interrupt call, no death and no low-health break, so
+        // the clearing path still has to be named by instrumenting the three sites rather than
+        // guessed at.
         if (!Agent.attachBrain(handle.player())) {
             this.finish("could not attach a brain to the bot");
             return;
         }
+        LOG.info("RIPETEST brain        : {} after attach", this.brain() == null ? "none" : "present");
         // Daylight and invulnerability: the first cut left the bot standing at the surface, where the
         // survival reflex took over - it broke off the mining job and the low-health path cleared the
         // field goal (the only three places that clear it are death, health below six, and the
