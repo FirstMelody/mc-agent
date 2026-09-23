@@ -1795,6 +1795,8 @@ public final class AgentBrain {
         }
         field.lastRipeCheckTick = now;
         if (now - field.lastRipePingTick < FARM_RIPE_PING_COOLDOWN_TICKS) {
+            LOG.info("FARMPING bot={} quiet: {}s of ping cooldown left", this.bot.getName().getString(),
+                    (FARM_RIPE_PING_COOLDOWN_TICKS - (now - field.lastRipePingTick)) / 20L);
             return;
         }
         List<Perception.SeenBlock> ripe = this.ripeCropsIn(field);
@@ -1807,6 +1809,9 @@ public final class AgentBrain {
                 ? ripe.size() >= Math.max(1, (int) Math.ceil(crops * FARM_RIPE_FRACTION))
                 : now - field.lastHarvestTick >= FARM_RIPE_ESTIMATE_TICKS;
         if (!roughlyReady) {
+            LOG.info("FARMPING bot={} not ready: ripe={} crops={} sinceHarvest={}s",
+                    this.bot.getName().getString(), ripe.size(), crops,
+                    (now - field.lastHarvestTick) / 20L);
             return;
         }
         String state = "Minecraft farm check. bot=" + this.bot.getName().getString()
@@ -1828,6 +1833,8 @@ public final class AgentBrain {
         JevClient.GateMode mode = adviser == null ? JevClient.GateMode.OFF
                 : adviser.settings().interrupts();
         if (adviser == null || !adviser.settings().isUsable() || mode == JevClient.GateMode.OFF) {
+            LOG.info("FARMPING bot={} adviser unusable: adviser={} gate={}",
+                    this.bot.getName().getString(), adviser == null ? "none" : "present", mode);
             field.lastRipePingTick = now;
             return;
         }

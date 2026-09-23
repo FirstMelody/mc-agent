@@ -109,6 +109,12 @@ public final class FarmRipeSmokeTest implements TestHook {
         handle.player().setHealth(20.0F);
         handle.player().resetFallDistance();
         handle.player().setInvulnerable(true);
+        // Standing beside the field, every tick. The join restores the position the bot logged out at,
+        // which is the previous run's deleted scene - so the first cut had the bot somewhere else
+        // entirely, and the runtime's own scan reported the field as ripe=0 crops=0 while the harness's
+        // direct world query counted a ripe crop three blocks from the centre.
+        handle.player().teleportTo(this.centre.getX() + 0.5D, this.centre.getY(),
+                this.centre.getZ() + 3.5D);
         if (!this.nudged && this.ticks > 20 && this.brain() != null) {
             this.nudged = true;
             LOG.info("RIPETEST nudge        : brain present, asking for one decision");
