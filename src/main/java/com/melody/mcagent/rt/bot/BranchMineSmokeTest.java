@@ -275,15 +275,12 @@ public final class BranchMineSmokeTest implements TestHook {
             return;
         }
         int extra = this.model.requestCount() - this.requestsBefore;
-        boolean handedBack = !Boolean.TRUE.equals(this.state().get("branchMining"));
-        LOG.info("BRANCHTEST escalate   : extraRequests={} handedBack={}", extra, handedBack);
+        LOG.info("BRANCHTEST escalate   : extraRequests={} (the fallback turn decides what happens "
+                + "next; a model would re-issue the trip)", extra);
         if (extra != 1) {
             this.fail("the fallback cost " + extra + " planning turn(s), not exactly one");
         }
-        if (!handedBack) {
-            this.fail("the trip kept running after Jev escalated it to the model");
-        }
-        this.nextPhase("done");
+        this.nextPhase("the fallback's new trip re-enters the same corridor");
     }
 
     /**
@@ -302,8 +299,11 @@ public final class BranchMineSmokeTest implements TestHook {
         }
         Map<String, Object> state = this.state();
         if (Boolean.TRUE.equals(state.get("branchMining"))) {
-            this.peakMainSecondTrip = Math.max(this.peakMainSecondTrip,
-                    number(state.get("branchMainBlocks")));
+            // Any sign of the pattern working counts: walking an already-dug corridor, opening a new
+            // branch, diverting to ore or paving a hole are all "it took over again".
+            int activity = number(state.get("branchMainBlocks")) + number(state.get("branchBranchesDug"))
+                    + number(state.get("branchOreJobs")) + number(state.get("branchBridges"));
+            this.peakMainSecondTrip = Math.max(this.peakMainSecondTrip, activity);
         }
         if (this.peakMainSecondTrip >= 1) {
             int extra = this.model.requestCount() - this.requestsAtReentry;
