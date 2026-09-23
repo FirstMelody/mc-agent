@@ -9157,6 +9157,7 @@ public final class AgentBrain {
             out.put("branchBranchesDug", branch.branchesDug);
             out.put("branchMainBlocks", branch.mainBlocksDug);
             out.put("branchOreJobs", branch.resourcesStarted);
+            out.put("branchBridges", this.branchBridges);
             out.put("branchInterruptsAsked", branch.interruptsAsked);
             out.put("branchInterruptsApplied", branch.interruptsApplied);
             out.put("branchLastInterrupt", branch.lastInterrupt);

@@ -82,6 +82,7 @@ public final class BranchMineSmokeTest implements TestHook {
     private int peakMain;
     private int peakOre;
     private int peakIron;
+    private int peakBridges;
     private final List<String> failures = new java.util.ArrayList<>();
 
     private BranchMineSmokeTest(MinecraftServer server) {
@@ -190,13 +191,14 @@ public final class BranchMineSmokeTest implements TestHook {
         this.peakMain = Math.max(this.peakMain, main);
         this.peakOre = Math.max(this.peakOre, ore);
         this.peakIron = Math.max(this.peakIron, iron);
+        this.peakBridges = Math.max(this.peakBridges, number(state.get("branchBridges")));
         if (!this.phaseStarted) {
             this.phaseStarted = true;
             LOG.info("BRANCHTEST pattern    : waiting for branches/ore; buried ore at {}",
                     this.buriedOre.toShortString());
         }
         if (this.peakBranches >= 1 && this.peakMain >= 2 && this.peakOre >= 1
-                && this.peakIron >= 1) {
+                && this.peakIron >= 1 && this.peakBridges >= 1) {
             branches = this.peakBranches;
             main = this.peakMain;
             ore = this.peakOre;
@@ -204,9 +206,9 @@ public final class BranchMineSmokeTest implements TestHook {
             int requests = this.model.requestCount() - this.requestsAtMiningStart;
             int asked = number(state.get("branchInterruptsAsked"));
             int applied = number(state.get("branchInterruptsApplied"));
-            LOG.info("BRANCHTEST pattern    : branches={} mainBlocks={} oreJobs={} iron={} "
+            LOG.info("BRANCHTEST pattern    : branches={} mainBlocks={} oreJobs={} iron={} bridges={} "
                             + "extraRequests={} jevAsked={} jevApplied={}",
-                    branches, main, ore, iron, requests, asked, applied);
+                    branches, main, ore, iron, this.peakBridges, requests, asked, applied);
             if (requests != 0) {
                 this.fail("the mining trip bought " + requests + " planning turn(s) after it started");
             }
@@ -220,7 +222,7 @@ public final class BranchMineSmokeTest implements TestHook {
         if (this.ticks - this.phaseTick > 3000) {
             this.fail("the pattern made no progress: peak branches=" + this.peakBranches
                     + " mainBlocks=" + this.peakMain + " oreJobs=" + this.peakOre
-                    + " iron=" + this.peakIron);
+                    + " iron=" + this.peakIron + " bridges=" + this.peakBridges);
             this.nextPhase("done");
         }
     }
@@ -303,6 +305,15 @@ public final class BranchMineSmokeTest implements TestHook {
                 }
             }
         }
+        // Open space right across the corridor's first run: two cells of floor missing, three deep.
+        // The pattern has to pave them and carry on, which is the difference between "open space is a
+        // reason to abandon the level" and "open space is one block to place".
+        for (int dx = 2; dx <= 3; dx++) {
+            for (int dy = -4; dy <= -1; dy++) {
+                this.level.setBlockAndUpdate(this.origin.offset(dx, dy, 0),
+                        Blocks.AIR.defaultBlockState());
+            }
+        }
         // Air for the bot to start in; the corridor is dug by the skill.
         this.level.setBlockAndUpdate(this.origin, Blocks.AIR.defaultBlockState());
         this.level.setBlockAndUpdate(this.origin.above(), Blocks.AIR.defaultBlockState());
@@ -348,6 +359,7 @@ public final class BranchMineSmokeTest implements TestHook {
         handle.player().getInventory().add(new ItemStack(Items.DIAMOND_PICKAXE));
         handle.player().getInventory().add(new ItemStack(Items.STONE_PICKAXE));
         handle.player().getInventory().add(new ItemStack(Items.BREAD, 16));
+        handle.player().getInventory().add(new ItemStack(Items.COBBLESTONE, 64));
         LOG.info("BRANCHTEST scene      : bot at {} in stone, buried iron ore at {} ({} blocks off "
                         + "the branch line)", handle.player().blockPosition().toShortString(),
                 this.buriedOre.toShortString(), 6 - 3);
