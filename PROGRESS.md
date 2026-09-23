@@ -34,8 +34,17 @@ BRANCHTEST requests   : 2 planning call(s) in total (1 to start, 1 fallback)
 harness 自身也踩了两个坑，都值得记：行程结束后 job 已清空，读 `branchBranchesDug` 只会得到 0，
 必须记峰值；15 耐久的镐在一两趟内就断，要触发第二次中断就得持续保持"磨损"状态。
 
-**当前状态（未部署）**：`build` + `checkRuntimeBoundary` 通过，生产仍是上一版。
-下一轮：补农场成熟度/todo 的 harness（`FARMRIPE_TEST`），然后热部署 + 报数字。
+**回归**：`TUNNELTEST` PASS（`dig_tunnel` 的逐格规则抽成 `checkRunCell` 后行为不变）、
+`FARMTEST` PASS（新的成熟度检查没有动到农场技能本身）。
+
+**生产热部署**：`23a01d7bc5636a72`（备份 `.bak.20260923-132523`），活的配置行
+`... routing=active interrupts=shadow ...` 证明新构建已加载，部署后 0 次调用。
+新问句默认 **shadow**：只记录不动手，所以在农场 harness 补齐之前，生产行为与上一版等价
+（todo 只会由 ACTIVE 的答案产生，shadow 下永远是空队列）。要真正启用需把
+`config/mcagent-jev.properties` 里的 `interrupts` 改成 `active` 并 `/mcagent reloadconfig`。
+
+**下一轮**：写 `MCAGENT_FARMRIPE_TEST`（真田 + 成熟作物 + Jev stub，断言"问句→TODO_LATER→
+todo 队列→空闲时段零规划调用完成收割"），绿了以后再决定是否把 `interrupts` 开到 active。
 
 ## 2026-09-23（中午四）：无解就取消并告知，不再一直 run
 
