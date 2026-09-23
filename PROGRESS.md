@@ -3093,3 +3093,14 @@ DANGERTEST VERDICT: PASS
 回归：`MCAGENT_ESCAPE_TEST` PASS、`MCAGENT_TUNNEL_TEST` PASS（先被我自己新测试遗留的附魔台+书架
 误伤过一次，现在所有新 harness 收尾时都会清理自己搭的东西）、`MCAGENT_ANVIL_TEST` PASS、
 `MCAGENT_FARM_TEST` PASS。
+
+### 农场 harness 的排除法（第五、六轮，未结案）
+
+白天 + 无敌场景下 `farmGoal=false` 依旧；`lastReflexReport` 从不打印（危险反射未介入）；日志里
+没有 `interrupt` 调用、没有死亡、没有掉血——而这三条正是全项目**仅有的**清空 `farmGoal` 的路径。
+`sameBrain=true` 排除了"两个 brain"（harness 查到的与 tick 驱动的不是同一个）。顺带得到一个有用的
+事实：dev harness 里 join 路径**根本不挂 brain**（`none at spawn` 之后再没出现），所以 harness 必须
+自己 `attachBrain`（已恢复）。
+
+结论：三条清理路径都没跑，`farmGoal` 仍然为空。下一步不是继续排除，而是**在三处各打一行日志**把
+调用者钉死。农场这一半在结案前仍算未验证；挖矿那一半已验证并在线。
