@@ -3144,3 +3144,18 @@ RIPETEST VERDICT  : PASS
 
 **尚未做**：同矿道重入找新路径、开放空间处理、"整趟仅 1 次调用"断言覆盖回程、摘除 `FARMDEBUG`/
 `FARMPING` 诊断、把 `interrupts` 开到 active。
+
+### 开放空间验证 + 生产启用（第 13/14 轮）
+
+`MCAGENT_BRANCHMINE_TEST` 新增沟壑断言并通过：场景在巷道第一趟正前方挖掉两格地板（深三格），
+行程把它**铺平后继续**——`paving the open space at 62,-57,-60 with minecraft:cobblestone (1/8)`、
+`(2/8)`，随后 `branches=3 mainBlocks=12 oreJobs=4 iron=1 bridges=2 extraRequests=0 jevAsked=1
+jevApplied=1`，开工后仍然 **0 次规划调用**。
+
+生产热部署 `18c551703495a2bc`（备份 `.bak.20260923-182944`），并把 `config/mcagent-jev.properties`
+的 `interrupts` 从 `shadow` 改为 **active**——活的配置行已确认
+`... routing=active interrupts=active ...`。也就是说从这一刻起，Jev 在**运行时自有的工作**里真的会
+动手：挖矿中耐久低/怪物靠近/背包满、以及机器人在忙时田地成熟。
+
+仍未完成：重入同一矿道的 harness 断言（控制器本就不读历史路线，需一期把它钉住）；"整趟仅 1 次调用"
+的断言覆盖回程；摘除 `FARMDEBUG`/`FARMPING` 诊断。
