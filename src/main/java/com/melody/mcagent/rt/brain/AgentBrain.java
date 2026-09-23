@@ -202,6 +202,8 @@ public final class AgentBrain {
     private static final int BRANCH_ORE_VEIN_RADIUS = 6;
     /** Remaining uses below which the tool counts as worn and Jev is asked about it. */
     private static final int BRANCH_TOOL_DURABILITY_FLOOR = 20;
+    /** Most open spaces one trip will pave over before turning the corridor instead. */
+    private static final int BRANCH_MAX_BRIDGES = 8;
     /** How close a monster has to be to interrupt the trip, and how far the bot can see one. */
     private static final double BRANCH_THREAT_RADIUS = 8.0D;
     /** After an answer, do not ask about the same kind of interruption again for a while. */
@@ -590,6 +592,11 @@ public final class AgentBrain {
     /** Where the last queued branch run ends, so the pattern can move its anchor. */
     @Nullable
     private BlockPos branchRunEnd;
+    /** The first cell of a run that had no floor: open space the controller can pave. */
+    @Nullable
+    private BlockPos branchRefusedFloor;
+    /** Open spaces paved since the current trip began. */
+    private int branchBridges;
 
     /**
      * Surface blocks which the deterministic tunnel macro, and only that macro, may remove.
@@ -1292,6 +1299,8 @@ public final class AgentBrain {
                 primary, priorities, amount, this.matchingResourceCount(primary),
                 this.bot.level().getGameTime());
         job.resumeAt = this.bot.blockPosition();
+        this.branchBridges = 0;
+        this.branchRefusedFloor = null;
         this.branchMine = job;
         this.miningGoal = null;
         this.cooldownTicks = 0;
@@ -2214,6 +2223,9 @@ public final class AgentBrain {
                     Math.min(MAX_BRANCH_RUN_BLOCKS, Math.max(1, job.nextBranchIn)), false, problem);
         }
 
+        if (planned < 0 && this.bridgeOpenSpace(job)) {
+            return true;
+        }
         if (planned < 0) {
             // A ravine, lava or somebody's cellar can close one heading without closing the level.
             // Turn the corridor once before calling the trip over, and never loop on a dead heading.
@@ -2256,6 +2268,77 @@ public final class AgentBrain {
             job.headingTurns = 0;
         }
         return true;
+    }
+
+    /**
+     * Answer open space the way a player does: pave it.
+     *
+     * <p>A hole in the floor of the corridor is not a reason to abandon a level - it is one block to
+     * place, and the pattern continues on the far side. The attachment is chosen as a player would:
+     * the solid block under the hole if there is one, otherwise the floor of the cell the bot stands
+     * on, clicked along the run. Bounded per trip and by what the bot carries: an endless cavern is a
+     * reason to turn the corridor, and an empty pack is a reason to go home.
+     *
+     * @return true when a place step was queued and the run should be retried next tick
+     */
+    private boolean bridgeOpenSpace(BranchMineJob job) {
+        BlockPos hole = this.branchRefusedFloor;
+        if (hole == null || this.branchBridges >= BRANCH_MAX_BRIDGES) {
+            return false;
+        }
+        String block = this.bridgeBlock();
+        if (block == null) {
+            this.actionReports.addLast("branch mining met open space at " + hole.toShortString()
+                    + " and is carrying nothing to pave it with");
+            return false;
+        }
+        JsonObject place = new JsonObject();
+        BlockPos below = hole.below();
+        if (!this.level.getBlockState(below).getCollisionShape(this.level, below).isEmpty()) {
+            place.addProperty("x", below.getX());
+            place.addProperty("y", below.getY());
+            place.addProperty("z", below.getZ());
+            place.addProperty("face", "up");
+        } else {
+            BlockPos behind = hole.relative(job.heading.getOpposite());
+            boolean solidBehind = !this.level.getBlockState(behind)
+                    .getCollisionShape(this.level, behind).isEmpty();
+            BlockPos clicked = solidBehind ? behind : hole.relative(job.heading);
+            place.addProperty("x", clicked.getX());
+            place.addProperty("y", clicked.getY());
+            place.addProperty("z", clicked.getZ());
+            place.addProperty("face", solidBehind ? job.heading.getName()
+                    : job.heading.getOpposite().getName());
+        }
+        place.addProperty("item", block);
+        this.branchBridges++;
+        this.branchRefusedFloor = null;
+        this.queue.addLast(new QueuedCall(new LlmClient.ToolCall(
+                "branch_bridge_" + this.branchBridges, "place", place), -1, true));
+        String message = "branch mining is paving the open space at " + hole.toShortString() + " with "
+                + block + " (" + this.branchBridges + "/" + BRANCH_MAX_BRIDGES + ")";
+        LOG.info("Bot {} {}", this.bot.getName().getString(), message);
+        this.actionReports.addLast(message);
+        return true;
+    }
+
+    /** The first carried building block worth making a floor out of, or null. */
+    @Nullable
+    private String bridgeBlock() {
+        var inventory = this.bot.getInventory();
+        for (int slot = 0; slot < inventory.getContainerSize(); slot++) {
+            ItemStack stack = inventory.getItem(slot);
+            if (stack.isEmpty() || !(stack.getItem() instanceof net.minecraft.world.item.BlockItem)) {
+                continue;
+            }
+            String id = net.minecraft.core.registries.BuiltInRegistries.ITEM
+                    .getKey(stack.getItem()).toString();
+            if (id.endsWith("cobblestone") || id.endsWith("_stone") || id.endsWith("deepslate")
+                    || id.endsWith("dirt") || id.endsWith("andesite") || id.endsWith("planks")) {
+                return id;
+            }
+        }
+        return null;
     }
 
     /** Walk home at the end of a branch-mining trip, the same way a resource trip does. */
@@ -3149,8 +3232,15 @@ public final class AgentBrain {
             }
             BlockPos floor = feet.below();
             BlockState floorState = level.getBlockState(floor);
-            if (floorState.getCollisionShape(level, floor).isEmpty()
-                    || !floorState.getFluidState().isEmpty()
+            if (floorState.getCollisionShape(level, floor).isEmpty()) {
+                // Open space under the line: a cave, a ravine or somebody's cellar. Remember the floor
+                // cell so the controller can pave it instead of turning the corridor away from a level
+                // that is perfectly good on the far side.
+                problem.add("a missing floor at " + floor.toShortString());
+                this.branchRefusedFloor = floor.immutable();
+                break;
+            }
+            if (!floorState.getFluidState().isEmpty()
                     || floorState.getBlock() instanceof FallingBlock
                     || isEscapeHazard(floorState)) {
                 problem.add("an unsafe or missing floor at " + floor.toShortString());
